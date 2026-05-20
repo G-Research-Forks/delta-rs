@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
+
 use datafusion::execution::context::{SessionContext, SessionState};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
@@ -56,11 +57,12 @@ use crate::delta_datafusion::{
 use crate::errors::{DeltaResult, DeltaTableError, unsupported_column_mapping_write};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, DEFAULT_RETRIES, PROTOCOL};
 use crate::kernel::{Action, Add, DataType, PartitionsExt, Remove, StructType, Version};
-use crate::kernel::{EagerSnapshot, resolve_snapshot};
+use crate::kernel::{EagerSnapshot, resolve_snapshot_with_config};
 use crate::logstore::{LogStore, LogStoreRef, ObjectStoreRef};
 use crate::parquet_utils::default_writer_properties;
 use crate::protocol::DeltaOperation;
 use crate::table::config::TablePropertiesExt as _;
+use crate::table::file_format_options::{IntoWriterPropertiesFactoryRef, WriterPropertiesFactoryRef};
 use crate::table::state::DeltaTableState;
 use crate::writer::utils::arrow_schema_without_partitions;
 use crate::{DeltaTable, ObjectMeta, PartitionFilter, to_kernel_predicate};
@@ -284,7 +286,7 @@ pub struct OptimizeBuilder<'a> {
     /// Desired file size after bin-packing files
     target_size: Option<NonZeroU64>,
     /// Properties passed to underlying parquet writer
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     /// Commit properties and configuration
     commit_properties: CommitProperties,
     /// Maximum number of concurrent tasks (default is number of cpus)
@@ -310,12 +312,22 @@ impl super::Operation for OptimizeBuilder<'_> {
 impl<'a> OptimizeBuilder<'a> {
     /// Create a new [`OptimizeBuilder`]
     pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
+        let writer_properties_factory = snapshot
+            .as_ref()
+            .and_then(|ss| ss.load_config().file_format_options.clone())
+            .map(|ffo| ffo.writer_properties_factory())
+            .or_else(|| {
+                Some(
+                    default_writer_properties(Compression::ZSTD(ZstdLevel::try_new(4).unwrap()))
+                        .into_factory_ref(),
+                )
+            });
         Self {
             snapshot,
             log_store,
             filters: &[],
             target_size: None,
-            writer_properties: None,
+            writer_properties_factory,
             commit_properties: CommitProperties::default(),
             max_concurrent_tasks: num_cpus::get(),
             optimize_type: OptimizeType::Compact,
@@ -346,7 +358,8 @@ impl<'a> OptimizeBuilder<'a> {
 
     /// Writer properties passed to parquet writer
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.writer_properties = Some(writer_properties);
+        let writer_properties_factory = writer_properties.into_factory_ref();
+        self.writer_properties_factory = Some(writer_properties_factory);
         self
     }
 
@@ -414,8 +427,15 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
         let this = self;
 
         Box::pin(async move {
-            let snapshot =
-                resolve_snapshot(&this.log_store, this.snapshot.clone(), true, None).await?;
+            let base_config = this.snapshot.as_ref().map(|s| s.load_config());
+            let snapshot = resolve_snapshot_with_config(
+                &this.log_store,
+                this.snapshot.clone(),
+                true,
+                None,
+                base_config,
+            )
+            .await?;
             if snapshot.table_configuration().column_mapping_mode() != ColumnMappingMode::None {
                 return Err(unsupported_column_mapping_write("OPTIMIZE"));
             }
@@ -424,9 +444,6 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
-            let writer_properties = this.writer_properties.unwrap_or_else(|| {
-                default_writer_properties(Compression::ZSTD(ZstdLevel::try_new(4).unwrap()))
-            });
             let (session, _) = resolve_session_state(
                 this.session.as_deref(),
                 this.session_fallback_policy,
@@ -443,7 +460,7 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
                 &snapshot,
                 this.filters,
                 this.target_size.to_owned(),
-                writer_properties,
+                this.writer_properties_factory,
                 session,
             )
             .await?;
@@ -595,7 +612,7 @@ pub struct MergeTaskParameters {
     /// Schema of written files
     file_schema: SchemaRef,
     /// Properties passed to parquet writer
-    writer_properties: WriterProperties,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     /// Input parameters for the optimize operation
     input_parameters: OptimizeInput,
     /// Num index cols to collect stats for
@@ -622,13 +639,21 @@ impl SelectedFileScanFactory {
         session: &dyn Session,
         read_operation_id: Option<Uuid>,
     ) -> Result<Self, DeltaTableError> {
+        // Mirror the caller's DataFusion session flags so rewrite scans keep
+        // the same parquet/view type behavior as the rest of optimize.
+        let mut scan_config = DeltaScanConfig::new_from_session(session)
+            .with_schema(snapshot.input_schema());
+        // Propagate encryption / file-format options so the scan can decrypt
+        // Parquet footers when the table was written with encryption enabled.
+        scan_config.table_parquet_options = snapshot
+            .load_config()
+            .file_format_options
+            .as_ref()
+            .map(|ffo| ffo.table_options().parquet);
         Ok(Self {
             snapshot: snapshot.clone(),
             log_store,
-            // Mirror the caller's DataFusion session flags so rewrite scans keep
-            // the same parquet/view type behavior as the rest of optimize.
-            scan_config: DeltaScanConfig::new_from_session(session)
-                .with_schema(snapshot.input_schema()),
+            scan_config,
             read_operation_id,
         })
     }
@@ -690,7 +715,7 @@ impl MergePlan {
         let writer_config = PartitionWriterConfig::try_new(
             task_parameters.file_schema.clone(),
             partition_values.clone(),
-            Some(task_parameters.writer_properties.clone()),
+            task_parameters.writer_properties_factory.clone(),
             // Since we know the total size of the bin, we can set the target file size to None.
             if ignore_target_size {
                 None
@@ -1008,7 +1033,7 @@ pub async fn create_merge_plan(
     snapshot: &EagerSnapshot,
     filters: &[PartitionFilter],
     target_size: Option<NonZeroU64>,
-    writer_properties: WriterProperties,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     session: SessionState,
 ) -> Result<MergePlan, DeltaTableError> {
     let target_size = target_size.unwrap_or_else(|| snapshot.table_properties().target_file_size());
@@ -1054,7 +1079,7 @@ pub async fn create_merge_plan(
         planner_stats,
         task_parameters: Arc::new(MergeTaskParameters {
             file_schema,
-            writer_properties,
+            writer_properties_factory,
             input_parameters,
             num_indexed_cols: snapshot.table_properties().num_indexed_cols(),
             stats_columns: snapshot

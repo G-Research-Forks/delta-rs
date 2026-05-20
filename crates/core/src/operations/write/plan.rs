@@ -19,7 +19,6 @@ use datafusion::prelude::col;
 use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
 use futures::TryStreamExt as _;
 use itertools::Itertools as _;
-use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::configs::WriterStatsConfig;
@@ -41,6 +40,7 @@ use crate::logstore::LogStoreRef;
 use crate::operations::cdc::{CDC_COLUMN_NAME, should_write_cdc};
 use crate::operations::{get_num_idx_cols_and_stats_columns, get_target_file_size};
 use crate::protocol::SaveMode;
+use crate::table::file_format_options::WriterPropertiesFactoryRef;
 
 /// Schema and protocol actions required before the sink executes the write.
 #[derive(Default)]
@@ -72,7 +72,7 @@ pub(super) struct WriteExecOptions {
     pub(super) partition_columns: Vec<String>,
     pub(super) target_file_size: Option<NonZeroU64>,
     pub(super) write_batch_size: Option<usize>,
-    pub(super) writer_properties: Option<WriterProperties>,
+    pub(super) writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     pub(super) writer_stats_config: WriterStatsConfig,
 }
 
@@ -97,7 +97,7 @@ pub(super) struct WritePreparationInput<'a> {
     pub(super) predicate: Option<Expression>,
     pub(super) target_file_size: Option<Option<NonZeroU64>>,
     pub(super) write_batch_size: Option<usize>,
-    pub(super) writer_properties: Option<WriterProperties>,
+    pub(super) writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     pub(super) configuration: &'a HashMap<String, Option<String>>,
 }
 
@@ -275,7 +275,7 @@ pub(super) fn prepare_write(input: WritePreparationInput<'_>) -> DeltaResult<Pre
         predicate,
         target_file_size,
         write_batch_size,
-        writer_properties,
+        writer_properties_factory,
         configuration,
     } = input;
 
@@ -412,7 +412,7 @@ pub(super) fn prepare_write(input: WritePreparationInput<'_>) -> DeltaResult<Pre
             partition_columns,
             target_file_size,
             write_batch_size,
-            writer_properties,
+            writer_properties_factory,
             configuration,
         ),
     })
@@ -676,7 +676,7 @@ fn build_exec_options(
     partition_columns: Vec<String>,
     target_file_size: Option<Option<NonZeroU64>>,
     write_batch_size: Option<usize>,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     configuration: &HashMap<String, Option<String>>,
 ) -> WriteExecOptions {
     let config = snapshot.map(|snapshot| snapshot.table_properties());
@@ -689,7 +689,7 @@ fn build_exec_options(
         partition_columns,
         target_file_size,
         write_batch_size,
-        writer_properties,
+        writer_properties_factory,
         writer_stats_config: WriterStatsConfig {
             num_indexed_cols,
             stats_columns,
@@ -894,7 +894,7 @@ mod tests {
             predicate: None,
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -936,7 +936,7 @@ mod tests {
             predicate: None,
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -961,7 +961,7 @@ mod tests {
             predicate: Some(col("id").eq(lit("A")).into()),
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -997,7 +997,7 @@ mod tests {
             predicate: Some(col("id").eq(lit("A")).into()),
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -1036,7 +1036,7 @@ mod tests {
             predicate: None,
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -1082,7 +1082,7 @@ mod tests {
             predicate: Some(col("id").eq(lit("missing")).into()),
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -1138,7 +1138,7 @@ mod tests {
             predicate: Some(col("id").eq(lit("A")).into()),
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -1204,7 +1204,7 @@ mod tests {
             predicate: None,
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();
@@ -1266,7 +1266,7 @@ mod tests {
             predicate: Some(col("value").eq(lit(3)).into()),
             target_file_size: None,
             write_batch_size: None,
-            writer_properties: None,
+            writer_properties_factory: None,
             configuration: &configuration,
         })
         .unwrap();

@@ -57,6 +57,7 @@ use crate::kernel::transaction::{PROTOCOL, TransactionError};
 use crate::kernel::{EagerSnapshot, SendableScanMetadataStream, Snapshot};
 use crate::logstore::LogStoreRef;
 use crate::protocol::SaveMode;
+use crate::table::builder::DeltaTableConfig;
 use crate::table::normalize_table_url;
 
 mod scan;
@@ -292,6 +293,13 @@ impl SnapshotWrapper {
             SnapshotWrapper::EagerSnapshot(esnap) => esnap.snapshot(),
         }
     }
+
+    pub(crate) fn load_config(&self) -> &DeltaTableConfig {
+        match self {
+            SnapshotWrapper::Snapshot(snap) => snap.load_config(),
+            SnapshotWrapper::EagerSnapshot(esnap) => esnap.load_config(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -501,6 +509,12 @@ impl TableProvider for DeltaScan {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.ensure_read_ready(session)?;
+
+        // Apply encryption settings to the session if configured
+        if let Some(format_options) = &self.snapshot.load_config().file_format_options {
+            format_options.update_session(session)?;
+        }
+
         let engine = DataFusionEngine::new_from_session(session);
         let contract = ProjectedScanContract::try_new(
             self.scan_schema.clone(),

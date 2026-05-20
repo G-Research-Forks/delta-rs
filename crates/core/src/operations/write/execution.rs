@@ -19,7 +19,6 @@ use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
 use delta_kernel::table_configuration::TableConfiguration;
 use futures::{StreamExt as _, TryStreamExt as _};
 use object_store::prefix::PrefixStore;
-use parquet::file::properties::WriterProperties;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::log::*;
@@ -35,6 +34,9 @@ use crate::kernel::{Action, Add, AddCDCFile, EagerSnapshot, StructType, StructTy
 use crate::logstore::{LogStore, ObjectStoreRef};
 use crate::operations::cdc::CDC_COLUMN_NAME;
 use crate::operations::write::WriterStatsConfig;
+use crate::table::file_format_options::{
+    IntoWriterPropertiesFactoryRef, WriterPropertiesFactoryRef,
+};
 
 const DEFAULT_WRITER_BATCH_CHANNEL_SIZE: usize = 10;
 const WRITER_TASK_CLOSED_UNEXPECTEDLY_MSG: &str = "Writer task closed unexpectedly";
@@ -275,7 +277,7 @@ struct WriteSinkConfig {
     object_store: ObjectStoreRef,
     target_file_size: Option<NonZeroU64>,
     write_batch_size: Option<usize>,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     writer_stats_config: WriterStatsConfig,
 }
 
@@ -295,7 +297,7 @@ pub(crate) async fn write_execution_plan_cdc(
     object_store: ObjectStoreRef,
     target_file_size: Option<NonZeroU64>,
     write_batch_size: Option<usize>,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     writer_stats_config: WriterStatsConfig,
 ) -> DeltaResult<Vec<Action>> {
     let cdc_store = Arc::new(PrefixStore::new(object_store, "_change_data"));
@@ -308,7 +310,7 @@ pub(crate) async fn write_execution_plan_cdc(
         cdc_store,
         target_file_size,
         write_batch_size,
-        writer_properties,
+        writer_properties_factory,
         writer_stats_config,
     )
     .await?
@@ -342,7 +344,7 @@ pub(crate) async fn write_execution_plan(
     object_store: ObjectStoreRef,
     target_file_size: Option<NonZeroU64>,
     write_batch_size: Option<usize>,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     writer_stats_config: WriterStatsConfig,
 ) -> DeltaResult<Vec<Action>> {
     let (actions, _) = write_execution_plan_v2(
@@ -353,7 +355,7 @@ pub(crate) async fn write_execution_plan(
         object_store,
         target_file_size,
         write_batch_size,
-        writer_properties,
+        writer_properties_factory,
         writer_stats_config,
         None,
         false,
@@ -372,7 +374,7 @@ pub(crate) async fn write_execution_plan_v2(
     object_store: ObjectStoreRef,
     target_file_size: Option<NonZeroU64>,
     write_batch_size: Option<usize>,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     writer_stats_config: WriterStatsConfig,
     predicate: Option<Expr>,
     contains_cdc: bool,
@@ -417,7 +419,7 @@ pub(crate) async fn write_execution_plan_v2(
         object_store,
         target_file_size,
         write_batch_size,
-        writer_properties,
+        writer_properties_factory,
         writer_stats_config,
     };
 
@@ -459,13 +461,20 @@ pub(crate) async fn write_exec_plan(
     operation_id: Option<Uuid>,
     target_file_size: Option<NonZeroU64>,
     write_as_cdc: bool,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
 ) -> DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)> {
-    let writer_properties = session
-        .config_options()
-        .execution
-        .parquet
-        .into_writer_properties_builder()?
-        .build();
+    let writer_properties_factory = match writer_properties_factory {
+        Some(factory) => factory,
+        None => {
+            let writer_properties = session
+                .config_options()
+                .execution
+                .parquet
+                .into_writer_properties_builder()?
+                .build();
+            writer_properties.into_factory_ref()
+        }
+    };
     let stats_config = WriterStatsConfig::from_config(table_config);
     let object_store = log_store.object_store(operation_id);
     let sink_config = WriteSinkConfig {
@@ -473,7 +482,7 @@ pub(crate) async fn write_exec_plan(
         object_store,
         target_file_size,
         write_batch_size: None,
-        writer_properties: Some(writer_properties),
+        writer_properties_factory: Some(writer_properties_factory),
         writer_stats_config: stats_config,
     };
 
@@ -662,13 +671,13 @@ async fn write_data_plan(
         object_store,
         target_file_size,
         write_batch_size,
-        writer_properties,
+        writer_properties_factory,
         writer_stats_config,
     } = sink_config;
     let config = WriterConfig::new(
         plan.schema().clone(),
         partition_columns.clone(),
-        writer_properties.clone(),
+        writer_properties_factory.clone(),
         target_file_size,
         write_batch_size,
         writer_stats_config.num_indexed_cols,
@@ -757,7 +766,7 @@ async fn write_cdc_plan(
         object_store,
         target_file_size,
         write_batch_size,
-        writer_properties,
+        writer_properties_factory,
         writer_stats_config,
     } = sink_config;
     let cdf_store = Arc::new(PrefixStore::new(object_store.clone(), "_change_data"));
@@ -781,7 +790,7 @@ async fn write_cdc_plan(
     let normal_config = WriterConfig::new(
         write_schema.clone(),
         partition_columns.clone(),
-        writer_properties.clone(),
+        writer_properties_factory.clone(),
         target_file_size,
         write_batch_size,
         writer_stats_config.num_indexed_cols,
@@ -791,7 +800,7 @@ async fn write_cdc_plan(
     let cdf_config = WriterConfig::new(
         cdf_schema.clone(),
         partition_columns.clone(),
-        writer_properties.clone(),
+        writer_properties_factory.clone(),
         target_file_size,
         write_batch_size,
         writer_stats_config.num_indexed_cols,

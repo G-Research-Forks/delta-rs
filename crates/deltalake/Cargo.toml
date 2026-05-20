@@ -46,6 +46,7 @@ datafusion-ext = ["datafusion"]
 gcs = ["deltalake-gcp"]
 glue = ["deltalake-catalog-glue"]
 hdfs = ["deltalake-hdfs"]
+integration-test = ["deltalake-core/integration_test"]
 json = ["deltalake-core/json"]
 nanosecond-timestamps = ["deltalake-core/nanosecond-timestamps"]
 python = ["deltalake-core/python"]
@@ -60,11 +61,16 @@ rustls = ["deltalake-core/rustls"]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 tracing = { workspace = true }
+tempfile = "3.21.0"
 url = { workspace = true }
 
 [[example]]
 name = "basic_operations"
 required-features = ["datafusion"]
+
+[[example]]
+name = "basic_operations_encryption"
+required-features = ["datafusion", "integration-test"]
 
 [[example]]
 name = "load_table"

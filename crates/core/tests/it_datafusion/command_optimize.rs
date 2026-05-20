@@ -693,7 +693,7 @@ async fn test_optimize_selected_file_scans_register_operation_scoped_log_store()
         tracked_table.snapshot()?.snapshot(),
         &[],
         Some(NonZeroU64::new(1_000_000).unwrap()),
-        WriterProperties::builder().build(),
+        None,
         df_context.state(),
     )
     .await?;
@@ -845,7 +845,7 @@ async fn test_conflict_for_remove_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?.snapshot(),
         &filter,
         None,
-        WriterProperties::builder().build(),
+        None,
         df_context.state(),
     )
     .await?;
@@ -912,7 +912,7 @@ async fn test_no_conflict_for_append_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?.snapshot(),
         &filter,
         None,
-        WriterProperties::builder().build(),
+        None,
         df_context.state(),
     )
     .await?;
@@ -976,7 +976,7 @@ async fn test_commit_interval() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?.snapshot(),
         &[],
         None,
-        WriterProperties::builder().build(),
+        None,
         context.state(),
     )
     .await?;

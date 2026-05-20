@@ -6,7 +6,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchemaRef, Result, Statistics};
-use datafusion::config::ConfigOptions;
+use datafusion::config::{ConfigOptions, TableParquetOptions};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::simplify::SimplifyContext;
@@ -151,11 +151,18 @@ impl DeltaScanConfigBuilder {
             None
         };
 
+        let table_parquet_options = snapshot
+            .load_config()
+            .file_format_options
+            .as_ref()
+            .map(|ffo| ffo.table_options().parquet);
+
         Ok(DeltaScanConfig {
             file_column_name,
             wrap_partition_values: self.wrap_partition_values.unwrap_or(true),
             enable_parquet_pushdown: self.enable_parquet_pushdown,
             schema: self.schema.clone(),
+            table_parquet_options,
             schema_force_view_types: true,
         })
     }
@@ -175,6 +182,9 @@ pub struct DeltaScanConfig {
     pub schema_force_view_types: bool,
     /// Schema to read as
     pub schema: Option<SchemaRef>,
+    /// Options that control how Parquet files are read
+    #[serde(skip)]
+    pub table_parquet_options: Option<TableParquetOptions>,
 }
 
 impl Default for DeltaScanConfig {
@@ -192,6 +202,7 @@ impl DeltaScanConfig {
             enable_parquet_pushdown: true,
             schema_force_view_types: true,
             schema: None,
+            table_parquet_options: None,
         }
     }
 
@@ -203,6 +214,7 @@ impl DeltaScanConfig {
             enable_parquet_pushdown: config_options.execution.parquet.pushdown_filters,
             schema_force_view_types: config_options.execution.parquet.schema_force_view_types,
             schema: None,
+            table_parquet_options: None,
         }
     }
 
@@ -403,6 +415,11 @@ impl TableProviderBuilder {
                     "Provided snapshot root ({snapshot_root_redacted}) does not match provided log store root ({log_store_root_redacted})"
                 )));
             }
+        }
+
+        // Set table_parquet_options from the snapshot's file_format_options
+        if let Some(file_format_options) = &snapshot.load_config().file_format_options {
+            config.table_parquet_options = Some(file_format_options.table_options().parquet);
         }
 
         let mut provider = next::DeltaScan::new(snapshot, config)?;
