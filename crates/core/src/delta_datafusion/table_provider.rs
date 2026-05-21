@@ -180,12 +180,22 @@ impl DeltaScanConfigBuilder {
             None
         };
 
+        // Derive TableParquetOptions from delta.encryption.* table properties so the
+        // parquet reader can look up the factory by factory_id in the RuntimeEnv.
+        // Use try_from_properties so partial configs (kms.id without footer.key) are
+        // detected at scan time rather than silently producing unencrypted reads.
+        let table_parquet_options = crate::table::config::EncryptionConfig::try_from_properties(
+            snapshot.table_configuration().table_properties(),
+        )?
+        .map(|enc| enc.to_table_parquet_options());
+
         Ok(DeltaScanConfig {
             file_column_name,
             wrap_partition_values: self.wrap_partition_values.unwrap_or(true),
             enable_parquet_pushdown: self.enable_parquet_pushdown,
             schema: self.schema.clone(),
             schema_force_view_types: true,
+            table_parquet_options,
         })
     }
 }
@@ -204,6 +214,11 @@ pub struct DeltaScanConfig {
     pub schema_force_view_types: bool,
     /// Schema to read as
     pub schema: Option<SchemaRef>,
+    /// Parquet scan options derived from `delta.encryption.*` table properties.
+    /// When set, the scan configures the parquet reader to look up the decryption
+    /// factory by `factory_id` in the DataFusion `RuntimeEnv`.
+    #[serde(skip)]
+    pub table_parquet_options: Option<TableParquetOptions>,
 }
 
 impl Default for DeltaScanConfig {
@@ -221,6 +236,7 @@ impl DeltaScanConfig {
             enable_parquet_pushdown: true,
             schema_force_view_types: true,
             schema: None,
+            table_parquet_options: None,
         }
     }
 
@@ -232,6 +248,7 @@ impl DeltaScanConfig {
             enable_parquet_pushdown: config_options.execution.parquet.pushdown_filters,
             schema_force_view_types: config_options.execution.parquet.schema_force_view_types,
             schema: None,
+            table_parquet_options: None,
         }
     }
 
@@ -518,17 +535,32 @@ impl<'a> DeltaScanBuilder<'a> {
             ));
         }
 
-        let parquet_options = TableParquetOptions {
-            global: self.session.config().options().execution.parquet.clone(),
-            ..Default::default()
+        // Start from the session's parquet options to preserve non-crypto settings
+        // (pushdown, schema coercion, etc.), then overlay encryption crypto settings only.
+        let parquet_options = {
+            let mut opts = TableParquetOptions {
+                global: self.session.config().options().execution.parquet.clone(),
+                ..Default::default()
+            };
+            if let Some(enc_opts) = &config.table_parquet_options {
+                opts.crypto = enc_opts.crypto.clone();
+            }
+            opts
         };
 
         let partition_fields: Vec<Arc<Field>> =
             table_partition_cols.into_iter().map(Arc::new).collect();
         let table_schema = TableSchema::new(file_schema, partition_fields);
 
+        let factory_id = parquet_options.crypto.factory_id.clone();
         let mut file_source =
             ParquetSource::new(table_schema).with_table_parquet_options(parquet_options);
+
+        if let Some(factory_id) = &factory_id {
+            use crate::operations::write::encryption::resolve_encryption_factory_or_err;
+            let encryption_factory = resolve_encryption_factory_or_err(factory_id, self.session)?;
+            file_source = file_source.with_encryption_factory(encryption_factory);
+        }
 
         // Sometimes (i.e Merge) we want to prune files that don't make the
         // filter and read the entire contents for files that do match the
@@ -683,6 +715,7 @@ impl TableProviderBuilder {
     }
 
     /// Limit scan planning to an explicit set of file identifiers.
+    #[allow(dead_code)]
     pub(crate) fn with_file_selection(mut self, file_selection: next::FileSelection) -> Self {
         self.file_selection = Some(file_selection);
         self
@@ -738,6 +771,20 @@ impl TableProviderBuilder {
                 return Err(DataFusionError::Plan(format!(
                     "Provided snapshot root ({snapshot_root_redacted}) does not match provided log store root ({log_store_root_redacted})"
                 )));
+            }
+        }
+
+        // Propagate encryption options from table properties into the scan config so the
+        // "next" scan provider can configure the parquet reader for decryption.
+        // Use try_from_properties so partial configs (kms.id without footer.key) are
+        // detected at scan time rather than silently producing unencrypted reads.
+        if let next::SnapshotWrapper::EagerSnapshot(eager) = &snapshot {
+            if let Some(enc) = crate::table::config::EncryptionConfig::try_from_properties(
+                eager.table_configuration().table_properties(),
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            {
+                config.table_parquet_options = Some(enc.to_table_parquet_options());
             }
         }
 

@@ -47,6 +47,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 use tracing::*;
 use uuid::Uuid;
 
+use super::write::encryption::{WriterPropertiesFactoryRef, factory_from_writer_properties};
 use super::write::writer::{PartitionWriter, PartitionWriterConfig};
 use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::{
@@ -346,12 +347,6 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
-            let writer_properties = this.writer_properties.unwrap_or_else(|| {
-                WriterProperties::builder()
-                    .set_compression(Compression::ZSTD(ZstdLevel::try_new(4).unwrap()))
-                    .set_created_by(format!("delta-rs version {}", crate_version()))
-                    .build()
-            });
             let (session, _) = resolve_session_state(
                 this.session.as_deref(),
                 this.session_fallback_policy,
@@ -362,14 +357,54 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
                     cdc: false,
                 },
             )?;
+
+            // Derive is_encrypted from table properties so that read_session is always set
+            // for encrypted tables, even when the caller supplies a writer_properties override.
+            // Without this, the compact path's raw parquet reader cannot decrypt footer pages.
+            let is_encrypted = {
+                use crate::table::config::EncryptionExt as _;
+                snapshot.table_properties().encryption_config().is_some()
+            };
+            let read_session = if is_encrypted {
+                Some(session.clone())
+            } else {
+                None
+            };
+
+            // Derive the writer factory: table encryption always wins to prevent
+            // accidental plaintext compact output; fall back to caller override or default.
+            let writer_factory: WriterPropertiesFactoryRef = {
+                use super::write::encryption::WriterEncryptionConfig;
+                match WriterEncryptionConfig::from_config(snapshot.table_configuration(), &session)
+                {
+                    Ok(enc) if enc.factory.is_some() => enc.factory.unwrap(),
+                    Ok(_) => {
+                        if let Some(wp) = this.writer_properties {
+                            factory_from_writer_properties(wp)
+                        } else {
+                            factory_from_writer_properties(
+                                WriterProperties::builder()
+                                    .set_compression(Compression::ZSTD(
+                                        ZstdLevel::try_new(4).unwrap(),
+                                    ))
+                                    .set_created_by(format!("delta-rs version {}", crate_version()))
+                                    .build(),
+                            )
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
             let plan = create_merge_plan(
                 &this.log_store,
                 this.optimize_type,
                 &snapshot,
                 this.filters,
                 this.target_size.to_owned(),
-                writer_properties,
+                writer_factory,
                 session,
+                read_session,
             )
             .await?;
 
@@ -485,6 +520,9 @@ pub struct MergePlan {
     task_parameters: Arc<MergeTaskParameters>,
     /// Version of the table at beginning of optimization. Used for conflict resolution.
     read_table_version: Version,
+    /// Session for DataFusion-based reads when the table has encryption configured.
+    /// Used by the compact path; the z-order path stores its own session in OptimizeOperations.
+    read_session: Option<SessionState>,
 }
 
 /// Parameters passed to individual merge tasks
@@ -492,8 +530,8 @@ pub struct MergePlan {
 pub struct MergeTaskParameters {
     /// Schema of written files
     file_schema: SchemaRef,
-    /// Properties passed to parquet writer
-    writer_properties: WriterProperties,
+    /// Factory for creating per-file WriterProperties (supports KMS encryption / AAD).
+    writer_properties_factory: WriterPropertiesFactoryRef,
     /// Input parameters for the optimize operation
     input_parameters: OptimizeInput,
     /// Num index cols to collect stats for
@@ -522,7 +560,6 @@ impl MergePlan {
         F: Future<Output = Result<ParquetReadStream, DeltaTableError>> + Send + 'static,
     {
         debug!("Rewriting files in partition: {partition_values:?}");
-        // First, initialize metrics
         let mut partial_actions = files
             .iter()
             .map(|file_meta| {
@@ -548,11 +585,10 @@ impl MergePlan {
             num_batches: 0,
         };
 
-        // Next, initialize the writer
         let writer_config = PartitionWriterConfig::try_new(
             task_parameters.file_schema.clone(),
             partition_values.clone(),
-            Some(task_parameters.writer_properties.clone()),
+            Some(task_parameters.writer_properties_factory.clone()),
             // Since we know the total size of the bin, we can set the target file size to None.
             if ignore_target_size {
                 None
@@ -602,6 +638,34 @@ impl MergePlan {
         debug!("Finished rewriting files in partition: {partition_values:?}");
 
         Ok((partial_actions, partial_metrics))
+    }
+
+    /// DataFusion-based compact read used when the table has encryption configured.
+    /// Uses `DeltaScanNext` so the registered `EncryptionFactory` can decrypt parquet footers.
+    async fn read_compact_encrypted(
+        files: MergeBin,
+        snapshot: EagerSnapshot,
+        ctx: Arc<datafusion::execution::context::SessionContext>,
+        log_store: LogStoreRef,
+        table_root: url::Url,
+    ) -> Result<ParquetReadStream, DeltaTableError> {
+        use crate::delta_datafusion::{DeltaScanConfigBuilder, DeltaScanNext, FileSelection};
+        let scan_config = DeltaScanConfigBuilder::default()
+            .with_file_column(false)
+            .build(&snapshot)?;
+        let selection = FileSelection::from_adds(files.files.iter().cloned(), &table_root)?;
+        let provider = Arc::new(
+            DeltaScanNext::new(snapshot, scan_config)?
+                .with_log_store(log_store)
+                .with_file_selection(selection),
+        ) as Arc<dyn datafusion::catalog::TableProvider>;
+        let stream = ctx
+            .read_table(provider)?
+            .execute_stream()
+            .await?
+            .map_err(|e| ParquetError::General(format!("Compact scan failed: {e}")))
+            .boxed();
+        Ok(stream)
     }
 
     /// Datafusion-based z-order read.
@@ -656,12 +720,20 @@ impl MergePlan {
         info!("starting optimize execution");
         let object_store = log_store.object_store(Some(operation_id));
 
+        let compact_read_session = self.read_session.take().map(|s| {
+            use datafusion::execution::context::SessionContext;
+            Arc::new(SessionContext::new_with_state(s))
+        });
+        let compact_table_root = snapshot.table_configuration().table_root().clone();
+        let compact_task_parameters = self.task_parameters.clone();
+        let log_store_for_compact = log_store.clone();
+
         let stream = match operations {
             OptimizeOperations::Compact(bins) => futures::stream::iter(bins)
                 .flat_map(|(_, (partition, bins))| {
                     futures::stream::iter(bins).map(move |bin| (partition.clone(), bin))
                 })
-                .map(|(partition, files)| {
+                .map(move |(partition, files)| {
                     debug!(
                         "merging a group of {} files in partition {partition:?}",
                         files.len(),
@@ -669,29 +741,49 @@ impl MergePlan {
                     for file in files.iter() {
                         debug!("  file {}", file.path);
                     }
-                    let object_store_ref = object_store.clone();
-                    let batch_stream = futures::stream::iter(files.clone())
-                        .then(move |file| {
-                            let object_store_ref = object_store_ref.clone();
-                            let meta = ObjectMeta::try_from(file).unwrap();
-                            async move {
-                                let file_reader =
-                                    ParquetObjectReader::new(object_store_ref, meta.location)
+
+                    let batch_stream: BoxFuture<
+                        'static,
+                        Result<ParquetReadStream, DeltaTableError>,
+                    > = if let Some(ctx) = compact_read_session.clone() {
+                        Box::pin(Self::read_compact_encrypted(
+                            files.clone(),
+                            snapshot.clone(),
+                            ctx,
+                            log_store_for_compact.clone(),
+                            compact_table_root.clone(),
+                        ))
+                    } else {
+                        let object_store_ref = object_store.clone();
+                        let files_for_stream = files.clone();
+                        Box::pin(async move {
+                            let stream: ParquetReadStream = futures::stream::iter(files_for_stream)
+                                .then(move |file| {
+                                    let object_store_ref = object_store_ref.clone();
+                                    let meta = ObjectMeta::try_from(file).unwrap();
+                                    async move {
+                                        let file_reader = ParquetObjectReader::new(
+                                            object_store_ref,
+                                            meta.location,
+                                        )
                                         .with_file_size(meta.size);
-                                ParquetRecordBatchStreamBuilder::new(file_reader)
-                                    .await?
-                                    .build()
-                            }
+                                        ParquetRecordBatchStreamBuilder::new(file_reader)
+                                            .await?
+                                            .build()
+                                    }
+                                })
+                                .try_flatten()
+                                .boxed();
+                            Ok(stream)
                         })
-                        .try_flatten()
-                        .boxed();
+                    };
 
                     let rewrite_result = tokio::task::spawn(Self::rewrite_files(
-                        self.task_parameters.clone(),
+                        compact_task_parameters.clone(),
                         partition,
                         files,
                         object_store.clone(),
-                        futures::future::ready(Ok(batch_stream)),
+                        batch_stream,
                         true,
                     ));
                     util::flatten_join_error(rewrite_result)
@@ -843,8 +935,9 @@ pub async fn create_merge_plan(
     snapshot: &EagerSnapshot,
     filters: &[PartitionFilter],
     target_size: Option<NonZeroU64>,
-    writer_properties: WriterProperties,
+    writer_factory: WriterPropertiesFactoryRef,
     session: SessionState,
+    read_session: Option<SessionState>,
 ) -> Result<MergePlan, DeltaTableError> {
     let target_size = target_size.unwrap_or_else(|| snapshot.table_properties().target_file_size());
     let partitions_keys = snapshot.metadata().partition_columns();
@@ -888,7 +981,7 @@ pub async fn create_merge_plan(
         metrics,
         task_parameters: Arc::new(MergeTaskParameters {
             file_schema,
-            writer_properties,
+            writer_properties_factory: writer_factory,
             input_parameters,
             num_indexed_cols: snapshot.table_properties().num_indexed_cols(),
             stats_columns: snapshot
@@ -898,6 +991,7 @@ pub async fn create_merge_plan(
                 .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
         }),
         read_table_version: snapshot.version(),
+        read_session,
     })
 }
 

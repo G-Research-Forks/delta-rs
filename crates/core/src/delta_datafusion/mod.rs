@@ -64,6 +64,7 @@ pub use self::session::{
     DeltaParserOptions, DeltaRuntimeEnvBuilder, DeltaSessionConfig, DeltaSessionContext,
     create_session, create_session_state_with_spill_config,
 };
+pub(crate) use self::table_provider::next::FileSelection;
 pub use self::table_provider::next::{DeletionVectorSelection, DeltaScan as DeltaScanNext};
 pub(crate) use self::utils::*;
 pub use cdf::scan::DeltaCdfTableProvider;
@@ -1467,8 +1468,8 @@ mod tests {
 
         let expected = vec![
             ObjectStoreOperation::Get(LocationType::Commit),
-            ObjectStoreOperation::GetRange(LocationType::Data, 957..965),
-            ObjectStoreOperation::GetRange(LocationType::Data, 326..957),
+            ObjectStoreOperation::GetRange(LocationType::Data, 943..951),
+            ObjectStoreOperation::GetRange(LocationType::Data, 312..943),
         ];
         let mut actual = Vec::new();
         operations.recv_many(&mut actual, 3).await;
