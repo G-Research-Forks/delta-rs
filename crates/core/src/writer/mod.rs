@@ -23,6 +23,8 @@ pub mod utils;
 #[cfg(test)]
 pub mod test_utils;
 
+pub use stats::create_add;
+
 pub(crate) fn ensure_legacy_writer_supports_table(
     table: &DeltaTable,
     operation: &str,

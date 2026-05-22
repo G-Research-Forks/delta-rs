@@ -25,7 +25,7 @@ use crate::kernel::{Add, scalars::ScalarExt};
 use crate::protocol::{ColumnValueStat, Stats};
 
 /// Creates an [`Add`] log action struct.
-pub(crate) fn create_add(
+pub fn create_add(
     partition_values: &IndexMap<String, Scalar>,
     path: String,
     size: i64,
