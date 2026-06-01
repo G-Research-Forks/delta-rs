@@ -3,6 +3,8 @@ from __future__ import annotations
 from arro3.core import DataType
 from arro3.core import Schema as Arro3Schema
 
+from deltalake._internal import _NANOSECOND_TIMESTAMPS
+
 
 def _convert_arro3_schema_to_delta(
     schema: Arro3Schema,
@@ -49,12 +51,16 @@ def _convert_arro3_schema_to_delta(
         elif DataType.is_struct(dtype):
             return struct_to_delta_dtype(dtype)
         elif DataType.is_timestamp(dtype):
-            if dtype.tz is None:
-                return DataType.timestamp("us")
-            elif dtype.time_unit == "ns":
-                return DataType.timestamp("ns", tz="UTC")
+            if dtype.time_unit == "ns" and _NANOSECOND_TIMESTAMPS:
+                if dtype.tz is None:
+                    return DataType.timestamp("ns")
+                else:
+                    return DataType.timestamp("ns", tz="UTC")
             else:
-                return DataType.timestamp("us", tz="UTC")
+                if dtype.tz is None:
+                    return DataType.timestamp("us")
+                else:
+                    return DataType.timestamp("us", tz="UTC")
         elif DataType.is_fixed_size_binary(dtype):
             return DataType.binary()
         elif DataType.is_unsigned_integer(dtype):

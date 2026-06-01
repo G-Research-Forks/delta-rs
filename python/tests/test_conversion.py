@@ -4,7 +4,13 @@ import pytest
 from arro3.core import DataType, Field, Schema
 
 from deltalake import DeltaTable, write_deltalake
+from deltalake._internal import _NANOSECOND_TIMESTAMPS
 from deltalake.writer._conversion import _convert_arro3_schema_to_delta
+
+if _NANOSECOND_TIMESTAMPS:
+    _ns_converted_unit = "ns"
+else:
+    _ns_converted_unit = "us"
 
 
 @pytest.mark.parametrize(
@@ -55,7 +61,13 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
             Schema(
                 fields=[Field("foo", DataType.timestamp("ns", tz="Europe/Amsterdam"))]
             ),
-            Schema(fields=[Field("foo", DataType.timestamp("ns", tz="UTC"))]),
+            Schema(
+                fields=[Field("foo", DataType.timestamp(_ns_converted_unit, tz="UTC"))]
+            ),
+        ),
+        (
+            Schema(fields=[Field("foo", DataType.timestamp("ns"))]),
+            Schema(fields=[Field("foo", DataType.timestamp(_ns_converted_unit))]),
         ),
         # Nullability variations
         (
@@ -64,7 +76,11 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
         ),
         (
             Schema(fields=[Field("foo", DataType.timestamp("ns"), nullable=True)]),
-            Schema(fields=[Field("foo", DataType.timestamp("us"), nullable=True)]),
+            Schema(
+                fields=[
+                    Field("foo", DataType.timestamp(_ns_converted_unit), nullable=True)
+                ]
+            ),
         ),
         # List of unsigned ints
         (
@@ -194,7 +210,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                         DataType.struct(
                             [
                                 Field("a", DataType.int64()),
-                                Field("b", DataType.timestamp("us")),
+                                Field("b", DataType.timestamp(_ns_converted_unit)),
                                 Field("c", DataType.int32()),
                             ]
                         ),
@@ -301,7 +317,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                 fields=[
                     Field(
                         "bar",
-                        DataType.timestamp("us"),
+                        DataType.timestamp(_ns_converted_unit),
                         nullable=True,
                         metadata={"origin": "sensor_7"},
                     )
@@ -549,7 +565,9 @@ def test_null_conversion_without_existing_schema():
 
     assert converted.field("id").type == DataType.int64()
     assert DataType.is_null(converted.field("null_field").type)
-    assert converted.field("timestamp_field").type == DataType.timestamp("us")
+    assert converted.field("timestamp_field").type == DataType.timestamp(
+        _ns_converted_unit
+    )
 
 
 @pytest.mark.pandas

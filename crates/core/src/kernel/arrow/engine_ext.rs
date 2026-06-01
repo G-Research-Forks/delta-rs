@@ -474,7 +474,10 @@ fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) 
 fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
     let matches_nanos = false;
     #[cfg(feature = "nanosecond-timestamps")]
-    let matches_nanos = matches!(data_type, &PrimitiveType::TimestampNanos);
+    let matches_nanos = matches!(
+        data_type,
+        &PrimitiveType::TimestampNanos | &PrimitiveType::TimestampNanosNtz
+    );
     matches!(
         data_type,
         &PrimitiveType::Byte
