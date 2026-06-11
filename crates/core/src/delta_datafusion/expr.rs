@@ -655,6 +655,8 @@ impl fmt::Display for ScalarValueFormat<'_> {
                 }
             )?,
             ScalarValue::Boolean(e) => format_option!(f, e)?,
+            #[cfg(feature = "float16")]
+            ScalarValue::Float16(e) => format_option!(f, e)?,
             ScalarValue::Float32(e) => format_option!(f, e)?,
             ScalarValue::Float64(e) => format_option!(f, e)?,
             ScalarValue::Int8(e) => format_option!(f, e)?,

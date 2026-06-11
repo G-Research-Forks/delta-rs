@@ -456,12 +456,19 @@ fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) 
 /// Checks if a data type is eligible for min/max file skipping.
 /// https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61
 fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
+    #[cfg(not(feature = "nanosecond-timestamps"))]
     let matches_nanos = false;
     #[cfg(feature = "nanosecond-timestamps")]
     let matches_nanos = matches!(
         data_type,
         &PrimitiveType::TimestampNanos | &PrimitiveType::TimestampNanosNtz
     );
+
+    #[cfg(not(feature = "float16"))]
+    let matches_f16 = false;
+    #[cfg(feature = "float16")]
+    let matches_f16 = matches!(data_type, &PrimitiveType::Float16);
+
     matches!(
         data_type,
         &PrimitiveType::Byte
@@ -478,6 +485,7 @@ fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
             // | &PrimitiveType::Boolean
             | PrimitiveType::Decimal(_)
     ) || matches_nanos
+        || matches_f16
 }
 
 pub(crate) fn rb_from_scan_meta(metadata: ScanMetadata) -> DeltaResult<RecordBatch> {

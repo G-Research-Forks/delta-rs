@@ -194,6 +194,8 @@ mod tests {
             Field::new("int64_col", ArrowDataType::Int64, true),
             Field::new("string_col", ArrowDataType::Utf8, true),
             Field::new("bool_col", ArrowDataType::Boolean, true),
+            #[cfg(feature = "float16")]
+            Field::new("float16_col", ArrowDataType::Float16, true),
             Field::new("float32_col", ArrowDataType::Float32, true),
             Field::new("float64_col", ArrowDataType::Float64, true),
         ]);
@@ -458,6 +460,26 @@ mod tests {
             Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
                 Expr::Literal(val, _) => {
                     assert_eq!(val.data_type(), ArrowDataType::Float32);
+                }
+                _ => panic!("Expected Literal"),
+            },
+            _ => panic!("Expected BinaryExpr"),
+        }
+    }
+
+    #[cfg(feature = "float16")]
+    #[test]
+    fn test_float16_coercion() {
+        let schema = setup_test_schema();
+
+        // Float64 literal with Float16 column should coerce
+        let expr = col("float16_col").eq(lit(3.15_f64));
+        let result = coerce_predicate_literals(expr, &schema).unwrap();
+
+        match result {
+            Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                Expr::Literal(val, _) => {
+                    assert_eq!(val.data_type(), ArrowDataType::Float16);
                 }
                 _ => panic!("Expected Literal"),
             },

@@ -6,6 +6,8 @@ use std::{collections::HashMap, ops::AddAssign};
 
 use delta_kernel::expressions::Scalar;
 use delta_kernel::table_properties::DataSkippingNumIndexedCols;
+#[cfg(feature = "float16")]
+use half::f16;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use parquet::basic::LogicalType;
@@ -234,6 +236,8 @@ enum StatsScalar {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
+    #[cfg(feature = "float16")]
+    Float16(f16),
     Float32(f32),
     Float64(f64),
     Date(chrono::NaiveDate),
@@ -342,6 +346,25 @@ impl StatsScalar {
                     }),
                 }
             }
+            #[cfg(feature = "float16")]
+            (Statistics::FixedLenByteArray(v), Some(LogicalType::Float16)) => {
+                let bytes = if use_min {
+                    v.min_bytes_opt()
+                } else {
+                    v.max_bytes_opt()
+                }
+                .unwrap_or_default();
+
+                let bytes: Result<[u8; 2], _> = bytes.try_into();
+                if let Ok(bytes) = bytes {
+                    Ok(Self::Float16(f16::from_le_bytes(bytes)))
+                } else {
+                    Err(DeltaWriterError::StatsParsingFailed {
+                        debug_value: format!("{bytes:?}"),
+                        logical_type: Some(LogicalType::Float16),
+                    })
+                }
+            }
             (Statistics::FixedLenByteArray(v), Some(LogicalType::Decimal { scale, precision })) => {
                 let val = if use_min {
                     v.min_bytes_opt()
@@ -425,6 +448,8 @@ impl From<StatsScalar> for serde_json::Value {
             StatsScalar::Boolean(v) => serde_json::Value::Bool(v),
             StatsScalar::Int32(v) => serde_json::Value::from(v),
             StatsScalar::Int64(v) => serde_json::Value::from(v),
+            #[cfg(feature = "float16")]
+            StatsScalar::Float16(v) => serde_json::Value::from(v.to_f32()),
             StatsScalar::Float32(v) => serde_json::Value::from(v),
             StatsScalar::Float64(v) => serde_json::Value::from(v),
             StatsScalar::Date(v) => serde_json::Value::from(v.format("%Y-%m-%d").to_string()),

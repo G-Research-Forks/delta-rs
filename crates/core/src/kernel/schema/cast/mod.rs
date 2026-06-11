@@ -258,8 +258,10 @@ fn normalize_datatype(dt: &DataType) -> Option<DataType> {
             changed.then(|| DataType::Struct(new_fields.into()))
         }
         DataType::List(inner) => normalize_field(inner).map(DataType::List),
-        DataType::FixedSizeList(inner, size) => {
-            normalize_field(inner).map(|normalized| DataType::FixedSizeList(normalized, *size))
+        // Delta has no fixed size list type, so normalize it to a variable size list
+        DataType::FixedSizeList(inner, _) => {
+            let normalized = normalize_field(inner).unwrap_or_else(|| Arc::clone(inner));
+            Some(DataType::List(normalized))
         }
         DataType::Map(entries, sorted) => {
             normalize_field(entries).map(|normalized| DataType::Map(normalized, *sorted))

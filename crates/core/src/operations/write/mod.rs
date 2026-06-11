@@ -431,6 +431,8 @@ impl WriteBuilder {
                     PROTOCOL.check_can_write_timestamp_ntz(snapshot, &schema)?;
                     #[cfg(feature = "nanosecond-timestamps")]
                     PROTOCOL.check_can_write_timestamp_nanos(snapshot, &schema)?;
+                    #[cfg(feature = "float16")]
+                    PROTOCOL.check_can_write_float16(snapshot, &schema)?;
                 }
                 match self.mode {
                     SaveMode::ErrorIfExists => {
@@ -669,6 +671,8 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::schema::MetadataValue;
     use futures::TryStreamExt;
+    #[cfg(feature = "float16")]
+    use half::f16;
     use itertools::Itertools;
     use serde_json::{Value, json};
 
@@ -3788,6 +3792,113 @@ mod tests {
         assert_eq!(
             result_field.data_type(),
             &DataType::Timestamp(unit, tz.clone()),
+        );
+    }
+
+    #[cfg(feature = "float16")]
+    #[tokio::test]
+    async fn test_write_float16() {
+        use arrow_array::Float16Array;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("x", DataType::Float16, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float16Array::from(vec![
+                    f16::from_f32(1.0),
+                    f16::from_f32(2.5),
+                    f16::INFINITY,
+                    f16::NAN,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let schema = batches[0].schema();
+        let result_field = schema.field_with_name("x").unwrap();
+        assert_eq!(result_field.data_type(), &DataType::Float16,);
+    }
+
+    #[cfg(feature = "float16")]
+    #[tokio::test]
+    async fn test_write_float16_array() {
+        use arrow::datatypes::Float16Type;
+        use arrow_array::ListArray;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("xs", DataType::new_list(DataType::Float16, true), true),
+        ]));
+
+        let data = vec![
+            Some(vec![
+                Some(f16::from_f32(0.0)),
+                Some(f16::from_f32(2.5)),
+                Some(f16::from_f32(0.25)),
+            ]),
+            None,
+            Some(vec![]),
+            Some(vec![Some(f16::from_f32(0.125))]),
+        ];
+        let list_array = Arc::new(ListArray::from_iter_primitive::<Float16Type, _, _>(data));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])), list_array],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let schema = batches[0].schema();
+        let result_field = schema.field_with_name("xs").unwrap();
+        assert!(
+            matches!(result_field.data_type(), DataType::List(inner) if inner.data_type() == &DataType::Float16)
         );
     }
 

@@ -14,7 +14,7 @@ from arro3.core import Array, DataType, Field, Schema, Table
 from azure.storage import blob
 
 from deltalake import DeltaTable, WriterProperties, write_deltalake
-from deltalake._internal import _NANOSECOND_TIMESTAMPS
+from deltalake._internal import _FLOAT16, _NANOSECOND_TIMESTAMPS
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -245,6 +245,8 @@ def sample_data_pyarrow() -> "pa.Table":
         extras["timestamp_ns_ntz"] = pa.array(
             [pa.scalar(i, type=pa.timestamp("ns", None)) for i in range(nrows)]
         )
+    if _FLOAT16:
+        extras["float16"] = pa.array([float(x) for x in range(nrows)], pa.float16())
 
     return pa.table(
         {

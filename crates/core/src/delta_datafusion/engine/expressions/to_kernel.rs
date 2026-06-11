@@ -237,6 +237,11 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
             Some(value) => Ok(Scalar::Long(*value)),
             None => Ok(Scalar::Null(DataType::LONG)),
         },
+        #[cfg(feature = "float16")]
+        ScalarValue::Float16(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Float16(*value)),
+            None => Ok(Scalar::Null(DataType::FLOAT16)),
+        },
         ScalarValue::Float32(maybe_value) => match maybe_value {
             Some(value) => Ok(Scalar::Float(*value)),
             None => Ok(Scalar::Null(DataType::FLOAT)),

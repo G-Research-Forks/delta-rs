@@ -24,6 +24,7 @@ from arro3.core.types import (
 )
 
 from deltalake._internal import (
+    _FLOAT16,
     _NANOSECOND_TIMESTAMPS,
     DeltaError,
     PyMergeBuilder,
@@ -66,6 +67,9 @@ FSCK_METRICS_FILES_REMOVED_LABEL = "files_removed"
 if _NANOSECOND_TIMESTAMPS:
     SUPPORTED_WRITER_FEATURES.add("timestampNanos")
     SUPPORTED_READER_FEATURES.add("timestampNanos")
+if _FLOAT16:
+    SUPPORTED_WRITER_FEATURES.add("float16")
+    SUPPORTED_READER_FEATURES.add("float16")
 
 FilterLiteralType = tuple[str, str, Any]
 FilterConjunctionType = list[FilterLiteralType]
