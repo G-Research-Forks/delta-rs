@@ -490,6 +490,16 @@ fn primitive_partition_values_to_array(
                 _ => None,
             },
         )?)) as ArrayRef,
+        #[cfg(feature = "float16")]
+        PrimitiveType::Float16 => Arc::new(Float16Array::from_iter(typed_partition_values(
+            field_name,
+            expected_data_type,
+            values,
+            |value| match value {
+                Scalar::Float16(value) => Some(*value),
+                _ => None,
+            },
+        )?)) as ArrayRef,
         PrimitiveType::Float => Arc::new(Float32Array::from_iter(typed_partition_values(
             field_name,
             expected_data_type,
@@ -636,6 +646,8 @@ fn scalar_type_name(value: &Scalar) -> &'static str {
         Scalar::Short(_) => "Short",
         Scalar::Integer(_) => "Integer",
         Scalar::Long(_) => "Long",
+        #[cfg(feature = "float16")]
+        Scalar::Float16(_) => "Float16",
         Scalar::Float(_) => "Float",
         Scalar::Double(_) => "Double",
         Scalar::String(_) => "String",

@@ -76,6 +76,8 @@ pub(crate) fn to_datafusion_scalar(scalar: &Scalar) -> DFResult<ScalarValue> {
         Scalar::Short(value) => ScalarValue::Int16(Some(*value)),
         Scalar::Integer(value) => ScalarValue::Int32(Some(*value)),
         Scalar::Long(value) => ScalarValue::Int64(Some(*value)),
+        #[cfg(feature = "float16")]
+        Scalar::Float16(value) => ScalarValue::Float16(Some(*value)),
         Scalar::Float(value) => ScalarValue::Float32(Some(*value)),
         Scalar::Double(value) => ScalarValue::Float64(Some(*value)),
         Scalar::Timestamp(value) => {
@@ -240,6 +242,8 @@ mod tests {
     use delta_kernel::expressions::ColumnName;
     use delta_kernel::expressions::{ArrayData, BinaryExpression, MapData, Scalar, StructData};
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    #[cfg(feature = "float16")]
+    use half::f16;
 
     use super::*;
 
@@ -254,6 +258,11 @@ mod tests {
             ),
             (Scalar::Integer(42), ScalarValue::Int32(Some(42))),
             (Scalar::Long(42), ScalarValue::Int64(Some(42))),
+            #[cfg(feature = "float16")]
+            (
+                Scalar::Float16(f16::from_f32(42.0)),
+                ScalarValue::Float16(Some(f16::from_f32(42.0))),
+            ),
             (Scalar::Float(42.0), ScalarValue::Float32(Some(42.0))),
             (Scalar::Double(42.0), ScalarValue::Float64(Some(42.0))),
             (Scalar::Byte(42), ScalarValue::Int8(Some(42))),

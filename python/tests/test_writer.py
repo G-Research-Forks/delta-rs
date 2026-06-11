@@ -14,6 +14,7 @@ from arro3.core import Schema as ArrowSchema
 
 from deltalake import CommitProperties, DeltaTable, Transaction, write_deltalake
 from deltalake._internal import (
+    _FLOAT16,
     _NANOSECOND_TIMESTAMPS,
     CommitFailedError,
     Field,
@@ -630,7 +631,8 @@ def test_roundtrip_metadata(tmp_path: pathlib.Path, sample_table: Table):
         # "binary",
         "date32",
         "timestamp",
-    ],
+    ]
+    + (["float16"] if _FLOAT16 else []),
 )
 def test_roundtrip_partitioned(
     tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Table", column: str
@@ -1031,6 +1033,9 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
         expected_mins["timestamp_ns"] = "1970-01-01T00:00:00Z"
         expected_mins["timestamp_ns_ntz"] = "1970-01-01 00:00:00"
 
+    if _FLOAT16:
+        expected_mins["float16"] = -0.0
+
     assert stats["minValues"] == expected_mins
 
     expected_maxs = {
@@ -1052,6 +1057,9 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
     if _NANOSECOND_TIMESTAMPS:
         expected_maxs["timestamp_ns"] = "1970-01-01T00:00:00.000000004Z"
         expected_maxs["timestamp_ns_ntz"] = "1970-01-01 00:00:00.000000004"
+
+    if _FLOAT16:
+        expected_maxs["float16"] = 4.0
 
     assert stats["maxValues"] == expected_maxs
 

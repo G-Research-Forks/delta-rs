@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "float16")]
+use half::f16;
+
 use arrow_arith::aggregate::{max as arrow_max, max_string, min as arrow_min, min_string};
 use arrow_array::*;
 use arrow_schema::DataType as ArrowDataType;
@@ -117,6 +120,27 @@ pub fn generate_random_array(
             );
             Ok(Arc::new(arr))
         }
+        #[cfg(feature = "float16")]
+        Primitive(Float16) => {
+            let min_val = min_val
+                .and_then(|min| Float16.parse_scalar(&min).ok())
+                .unwrap_or(Scalar::Float16(f16::from_f32(-10.1)));
+            let max_val = max_val
+                .and_then(|max| Float16.parse_scalar(&max).ok())
+                .unwrap_or(Scalar::Float16(f16::from_f32(10.1)));
+            let between = match (min_val, max_val) {
+                (Scalar::Float16(min), Scalar::Float16(max)) => {
+                    Uniform::try_from(min.to_f32()..=max.to_f32())?
+                }
+                _ => unreachable!(),
+            };
+            let arr = Float16Array::from(
+                (0..length)
+                    .map(|_| f16::from_f32(between.sample(&mut rng)))
+                    .collect::<Vec<_>>(),
+            );
+            Ok(Arc::new(arr))
+        }
         Primitive(Float) => {
             let min_val = min_val
                 .and_then(|min| Float.parse_scalar(&min).ok())
@@ -197,6 +221,14 @@ fn get_stats(batch: &RecordBatch) -> TestResult<FileStats> {
                 let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
                 let min = Scalar::Long(arrow_min(array).unwrap());
                 let max = Scalar::Long(arrow_max(array).unwrap());
+                let null_count = Scalar::Long(array.null_count() as i64);
+                Some((null_count, min, max))
+            }
+            #[cfg(feature = "float16")]
+            Float16 => {
+                let array = array.as_any().downcast_ref::<Float16Array>().unwrap();
+                let min = Scalar::Float16(arrow_min(array).unwrap());
+                let max = Scalar::Float16(arrow_max(array).unwrap());
                 let null_count = Scalar::Long(array.null_count() as i64);
                 Some((null_count, min, max))
             }

@@ -191,6 +191,12 @@ pub(crate) fn contains_variant<'a>(mut fields: impl Iterator<Item = &'a StructFi
     fields.any(|f| _check_type(f.data_type()))
 }
 
+#[cfg(feature = "float16")]
+/// checks if table contains float16 in any field including nested fields.
+pub fn contains_float16<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
+    fields.any(|f| matches_datatype(f.data_type(), &DataType::FLOAT16))
+}
+
 /// Extension trait for delta-kernel Protocol action.
 ///
 /// Allows us to extend the Protocol struct with additional methods
@@ -458,6 +464,11 @@ impl ProtocolInner {
             self = self.enable_variant_type()
         }
 
+        #[cfg(feature = "float16")]
+        if self.contains_float16(schema.fields()) {
+            self = self.enable_float16();
+        }
+
         if !generated_cols.is_empty() {
             self = self.enable_generated_columns()
         }
@@ -637,6 +648,20 @@ impl ProtocolInner {
         self
     }
 
+    #[cfg(feature = "float16")]
+    /// checks if table contains float16 in any field including nested fields.
+    fn contains_float16<'a>(&self, fields: impl Iterator<Item = &'a StructField>) -> bool {
+        contains_float16(fields)
+    }
+
+    #[cfg(feature = "float16")]
+    /// Enable float16 in the protocol
+    fn enable_float16(mut self) -> Self {
+        self = self.append_reader_features([TableFeature::Float16]);
+        self = self.append_writer_features([TableFeature::Float16]);
+        self
+    }
+
     /// Enabled generated columns
     fn enable_generated_columns(mut self) -> Self {
         if self.min_writer_version < 4 {
@@ -672,6 +697,8 @@ pub enum TableFeatures {
     #[serde(rename = "timestampNanos")]
     /// Timestamps that are nanosecond resolution
     TimestampNanos,
+    #[cfg(feature = "float16")]
+    Float16,
     /// version 2 of checkpointing
     V2Checkpoint,
     /// Append Only Tables
@@ -711,6 +738,8 @@ impl FromStr for TableFeatures {
             "timestampNtz" => Ok(TableFeatures::TimestampWithoutTimezone),
             #[cfg(feature = "nanosecond-timestamps")]
             "timestampNanos" => Ok(TableFeatures::TimestampNanos),
+            #[cfg(feature = "float16")]
+            "float16" => Ok(TableFeatures::Float16),
             "v2Checkpoint" => Ok(TableFeatures::V2Checkpoint),
             "appendOnly" => Ok(TableFeatures::AppendOnly),
             "invariants" => Ok(TableFeatures::Invariants),
@@ -738,6 +767,8 @@ impl AsRef<str> for TableFeatures {
             TableFeatures::TimestampWithoutTimezone => "timestampNtz",
             #[cfg(feature = "nanosecond-timestamps")]
             TableFeatures::TimestampNanos => "timestampNanos",
+            #[cfg(feature = "float16")]
+            TableFeatures::Float16 => "float16",
             TableFeatures::V2Checkpoint => "v2Checkpoint",
             TableFeatures::AppendOnly => "appendOnly",
             TableFeatures::Invariants => "invariants",
@@ -812,6 +843,8 @@ impl TableFeatures {
                     // Optional ReaderWriter features
                     #[cfg(feature = "nanosecond-timestamps")]
                     TableFeature::TimestampNanos => (Some(feature.clone()), Some(feature)),
+                    #[cfg(feature = "float16")]
+                    TableFeature::Float16 => (Some(feature.clone()), Some(feature)),
 
                     // Unknown features
                     TableFeature::Unknown(_) => (None, None),

@@ -95,6 +95,8 @@ mod local {
     use deltalake_core::{
         delta_datafusion::DeltaLogicalCodec, logstore::default_logstore, writer::JsonWriter,
     };
+    #[cfg(feature = "float16")]
+    use half::f16;
     use object_store::local::LocalFileSystem;
 
     #[tokio::test]
@@ -903,6 +905,12 @@ mod local {
                     .map(|x| Some((x + offset) as f32))
                     .chain((0..null_rows).map(|_| None)),
             )),
+            #[cfg(feature = "float16")]
+            Arc::new(Float16Array::from_iter(
+                (0..not_null_rows)
+                    .map(|x| Some(f16::from_f32((x + offset) as f32)))
+                    .chain((0..null_rows).map(|_| None)),
+            )),
             Arc::new(BooleanArray::from_iter(
                 (0..not_null_rows)
                     .map(|x| Some((x + offset).is_multiple_of(2)))
@@ -941,6 +949,8 @@ mod local {
             ArrowField::new("int8", ArrowDataType::Int8, true),
             ArrowField::new("float64", ArrowDataType::Float64, true),
             ArrowField::new("float32", ArrowDataType::Float32, true),
+            #[cfg(feature = "float16")]
+            ArrowField::new("float16", ArrowDataType::Float16, true),
             ArrowField::new("boolean", ArrowDataType::Boolean, true),
             ArrowField::new("binary", ArrowDataType::Binary, true),
             ArrowField::new("decimal", ArrowDataType::Decimal128(10, 2), true),
@@ -1047,6 +1057,10 @@ mod local {
             TestCase::new("int8", |value| lit(value as i8)),
             TestCase::new("float64", |value| lit(value as f64)),
             TestCase::new("float32", |value| lit(value as f32)),
+            #[cfg(feature = "float16")]
+            TestCase::new("float16", |value| {
+                lit(Float16(Some(f16::from_f32(value as f32))))
+            }),
             TestCase::new("timestamp", |value| {
                 lit(TimestampMicrosecond(Some(value * 1_000_000), None))
             }),
@@ -1143,6 +1157,10 @@ mod local {
             TestCase::new_wrapped("int8", |value| lit(value as i8)),
             TestCase::new_wrapped("float64", |value| lit(value as f64)),
             TestCase::new_wrapped("float32", |value| lit(value as f32)),
+            #[cfg(feature = "float16")]
+            TestCase::new_wrapped("float16", |value| {
+                lit(Float16(Some(f16::from_f32(value as f32))))
+            }),
             TestCase::new_wrapped("timestamp", |value| {
                 lit(TimestampMicrosecond(Some(value * 1_000_000), None))
             }),
@@ -1185,6 +1203,7 @@ mod local {
                 || column == "timestamp"
                 || column == "date"
                 || (cfg!(feature = "nanosecond-timestamps") && column == "timestamp_nanos")
+                || (cfg!(feature = "float16") && column == "float16")
             {
                 continue;
             }
