@@ -74,3 +74,56 @@ cargo install samply --locked
 cargo build --profile profiling -p delta-benchmarks
 samply record ./target/profiling/delta-benchmarks upsert
 ```
+
+## Sorted streaming reads (sort-order evaluation)
+
+Two subcommands evaluate the sort-order work on the DataFusion table provider
+(`with_file_sort_order`): `sort-gen` generates a Delta table whose files are
+all sorted by a `timestamp` column, and `sort-bench` measures
+`ORDER BY timestamp` streaming queries over it with different provider
+configurations.
+
+### Generating test data
+
+```bash
+cargo run --release -p delta-benchmarks -- sort-gen --table-path ./data/sorted_table
+```
+
+Writes one commit per day, each containing a single batch sorted by
+`timestamp`; day ranges do not overlap and every file carries parquet
+`sorting_columns` metadata. Knobs:
+
+- `--days <n>`: number of days to write (default 100)
+- `--rows-per-day <n>`: rows per day (default 1,000,000)
+- `--extra-columns <n>`: extra float32 data columns (default 20)
+
+Note the defaults produce roughly 12 GB of parquet. The generator writes
+through a single-partition DataFusion session: with the default multi-partition
+session, the delta-rs write plan repartitions batches across concurrent writer
+tasks and row order within the produced files is not preserved. Every file is
+re-read after writing to verify it is internally sorted and that no file
+ranges overlap, so generation fails loudly if that ever regresses.
+
+### Benchmarking sorted reads
+
+```bash
+cargo run --release -p delta-benchmarks -- sort-bench --table-path ./data/sorted_table
+```
+
+For each mode the query `SELECT ... FROM t ORDER BY timestamp` is planned and
+streamed to completion, reporting plan shape (`sort_exec`, `spm` =
+SortPreservingMergeExec), planning time, time to first batch, total time, and
+whether the streamed rows were actually in order (`sorted`).
+
+- `--modes <baseline,declared>`: provider configurations to compare
+  (default both). `baseline` declares no ordering and needs a full
+  `SortExec`; `declared` uses `with_file_sort_order`.
+- `--select-columns <n>`: number of extra float32 columns in the SELECT
+  (default: all)
+- `--limit <n>`: add a LIMIT to exercise TopK / early termination
+- `--iterations <n>`: runs per mode (default 3)
+- `--memory-limit-gb <n>`: memory budget backed by a spill pool, so the
+  baseline full sort spills instead of exhausting memory (default 8; 0
+  disables the limit)
+- `--target-partitions <n>`: override `datafusion.execution.target_partitions`
+- `--show-plan`: print the physical plan for the first iteration of each mode
