@@ -3,7 +3,9 @@
 //! Evaluates the sort-order support on the table provider: tables whose
 //! parquet files are all sorted by a timestamp column can be scanned with a
 //! `SortPreservingMergeExec` instead of a full `SortExec` when the ordering is
-//! declared (`with_file_sort_order`).
+//! declared (`with_file_sort_order`). When the file ranges are additionally
+//! mutually non-overlapping, the merge is replaced by a `ProgressiveEvalExec`
+//! that plainly concatenates the range-ordered scan partitions.
 //!
 //! The generated table writes one commit per day, each containing a single
 //! record batch sorted by `timestamp`. Day ranges never overlap, so file
@@ -280,6 +282,10 @@ pub struct SortBenchParams {
     /// Override `datafusion.execution.target_partitions` (defaults to the
     /// number of CPU cores).
     pub target_partitions: Option<usize>,
+    /// Override `delta.progressive_eval_num_prefetch_input_streams`: how many
+    /// scan partitions `ProgressiveEvalExec` executes ahead of the one being
+    /// streamed, that one included (default 2).
+    pub prefetch_streams: Option<usize>,
     /// Verify that the streamed timestamps are globally non-decreasing. Off by
     /// default because the per-row check adds time to the measured run.
     pub check_order: bool,
@@ -291,6 +297,7 @@ pub struct SortBenchReport {
     pub plan: String,
     pub has_sort_exec: bool,
     pub has_sort_preserving_merge: bool,
+    pub has_progressive_eval: bool,
     /// Time to build the table provider.
     pub provider: Duration,
     /// Time to plan the query.
@@ -522,6 +529,7 @@ async fn run_sequential_read(
         ),
         has_sort_exec: false,
         has_sort_preserving_merge: false,
+        has_progressive_eval: false,
         provider: provider_elapsed,
         planning: Duration::ZERO,
         first_batch: state.first_batch,
@@ -566,6 +574,14 @@ pub async fn run_sort_bench_once(
     if let Some(partitions) = params.target_partitions {
         ctx.sql(&format!(
             "SET datafusion.execution.target_partitions = {partitions}"
+        ))
+        .await?
+        .collect()
+        .await?;
+    }
+    if let Some(streams) = params.prefetch_streams {
+        ctx.sql(&format!(
+            "SET delta.progressive_eval_num_prefetch_input_streams = {streams}"
         ))
         .await?
         .collect()
@@ -637,6 +653,7 @@ pub async fn run_sort_bench_once(
     Ok(SortBenchReport {
         has_sort_exec: rendered.contains("SortExec"),
         has_sort_preserving_merge: rendered.contains("SortPreservingMergeExec"),
+        has_progressive_eval: rendered.contains("ProgressiveEvalExec"),
         plan: rendered,
         provider: provider_elapsed,
         planning: planning_elapsed,
