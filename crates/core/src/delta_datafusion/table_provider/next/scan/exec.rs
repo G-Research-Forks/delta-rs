@@ -349,6 +349,13 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // Partitioning the input further is not desirable as this loses exact statistics
+        // and ordering information, which can prevent certain optimizations such as using
+        // a sort-preserving merge or progressive evaluation to handle sorted reads.
+        vec![false]
+    }
+
     // TODO: setting this will fail certain tests, but why
     // fn maintains_input_order(&self) -> Vec<bool> {
     //     vec![true]

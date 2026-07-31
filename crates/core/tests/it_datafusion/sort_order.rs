@@ -718,11 +718,26 @@ async fn query_sorted_with_target_partitions(
     table: &DeltaTable,
     target_partitions: usize,
 ) -> TestResult<(String, Vec<i64>)> {
+    query_sorted_with_session_options(
+        table,
+        &[(
+            "datafusion.execution.target_partitions",
+            &target_partitions.to_string(),
+        )],
+    )
+    .await
+}
+
+/// Run `ORDER BY timestamp` with the given session options applied and return
+/// the rendered plan and the collected timestamps.
+async fn query_sorted_with_session_options(
+    table: &DeltaTable,
+    options: &[(&str, &str)],
+) -> TestResult<(String, Vec<i64>)> {
     let ctx = create_session().into_inner();
-    ctx.sql(&format!(
-        "SET datafusion.execution.target_partitions = {target_partitions}"
-    ))
-    .await?;
+    for (key, value) in options {
+        ctx.sql(&format!("SET {key} = {value}")).await?;
+    }
     let provider = table
         .table_provider()
         .with_file_sort_order([FileSortColumn::asc("timestamp")])
@@ -844,6 +859,102 @@ async fn delta_table_overlapping_files_beyond_group_cap_fall_back() -> TestResul
         "expected the grouping to fall back below one group per file:\n{rendered}"
     );
     assert_eq!(timestamps.len(), 130);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+// --- More target partitions than files ---
+//
+// With fewer files than target partitions, `EnforceDistribution` has two
+// independent mechanisms for raising the scan's partition count to the
+// target, and each one would defeat the `ProgressiveEvalExec` optimization:
+//
+// - `enable_round_robin_repartition` inserts a round-robin `RepartitionExec`
+//   above a scan that benefits from input partitioning.
+//   `RepartitionExec::partition_statistics` marks all column statistics
+//   inexact, so `ProgressiveEvalRule` bails.
+//   `DeltaScanExec::benefits_from_input_partitioning` opts out of this.
+// - `repartition_file_scans` splits single-file groups into byte ranges at
+//   the source. Each range carries the whole file's statistics, so
+//   partitions reading ranges of the same file have overlapping min/max and
+//   `ProgressiveEvalRule` bails. Keeping the `ProgressiveEvalExec`
+//   optimization requires disabling this option.
+
+/// Session options simulating large production workloads on a many-core machine:
+/// more target partitions than the table has files, and a batch size small enough
+/// that the row-count statistics make repartitioning look beneficial.
+const MANY_CORE_OPTIONS: &[(&str, &str)] = &[
+    ("datafusion.execution.target_partitions", "8"),
+    ("datafusion.execution.batch_size", "10"),
+];
+
+/// Two non-overlapping sorted files of 100 rows each.
+fn two_non_overlapping_files() -> Vec<Vec<i64>> {
+    vec![(0..100).collect(), (100..200).collect()]
+}
+
+/// With default optimizer options, `repartition_file_scans` splits the
+/// scan's single-file groups into byte ranges to reach the target partition
+/// count, and the `SortPreservingMergeExec` remains.
+#[tokio::test]
+async fn delta_table_more_target_partitions_than_files_file_split_defeats_progressive_eval()
+-> TestResult<()> {
+    let table = overlapping_delta_table(two_non_overlapping_files()).await?;
+    let (rendered, timestamps) =
+        query_sorted_with_session_options(&table, MANY_CORE_OPTIONS).await?;
+
+    assert!(
+        rendered.contains("8 groups"),
+        "expected the files to be split into 8 byte-range groups:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 200);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// With `repartition_file_scans` disabled, the scan keeps fewer partitions
+/// than the target: no round-robin `RepartitionExec` is inserted above it
+/// (the scan does not benefit from input partitioning), the scan partitions
+/// stay non-overlapping, and the merge is replaced by `ProgressiveEvalExec`.
+#[tokio::test]
+async fn delta_table_more_target_partitions_than_files_uses_progressive_eval() -> TestResult<()> {
+    let table = overlapping_delta_table(two_non_overlapping_files()).await?;
+    let options: Vec<(&str, &str)> = MANY_CORE_OPTIONS
+        .iter()
+        .copied()
+        .chain([("datafusion.optimizer.repartition_file_scans", "false")])
+        .collect();
+    let (rendered, timestamps) = query_sorted_with_session_options(&table, &options).await?;
+
+    assert!(
+        !rendered.contains("RepartitionExec"),
+        "expected no RepartitionExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("2 groups"),
+        "expected the file groups to stay intact:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 200);
     assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
     Ok(())
 }

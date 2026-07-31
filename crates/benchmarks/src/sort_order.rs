@@ -19,9 +19,12 @@ use deltalake_core::arrow::array::{ArrayRef, Float32Array, TimestampMicrosecondA
 use deltalake_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use deltalake_core::arrow::record_batch::RecordBatch;
 use deltalake_core::datafusion::catalog::Session;
+use deltalake_core::datafusion::execution::SessionStateBuilder;
 use deltalake_core::datafusion::physical_plan::{displayable, execute_stream};
+use deltalake_core::datafusion::prelude::{SessionConfig, SessionContext};
+use deltalake_core::delta_datafusion::planner::DeltaPlanner;
 use deltalake_core::delta_datafusion::{
-    create_session, DeltaRuntimeEnvBuilder, DeltaSessionContext, FileSortColumn,
+    create_session, DeltaRuntimeEnvBuilder, DeltaSessionConfig, FileSortColumn, ProgressiveEvalRule,
 };
 use deltalake_core::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use deltalake_core::parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -564,15 +567,27 @@ pub async fn run_sort_bench_once(
     let extra_columns = extra_column_names(&table)?;
     let sql = build_query(&extra_columns, params);
 
-    let ctx = match params.memory_limit_bytes {
-        Some(bytes) => DeltaSessionContext::with_runtime_env(
-            DeltaRuntimeEnvBuilder::new()
-                .with_max_spill_size(bytes)
-                .build(),
-        ),
-        None => create_session(),
-    }
-    .into_inner();
+    let mut config: SessionConfig = DeltaSessionConfig::default().into();
+    config
+        .options_mut()
+        .set("datafusion.optimizer.repartition_file_scans", "false")?;
+    let planner = DeltaPlanner::new();
+    let runtime_env = match params.memory_limit_bytes {
+        Some(bytes) => DeltaRuntimeEnvBuilder::new()
+            .with_max_spill_size(bytes)
+            .build(),
+        None => DeltaRuntimeEnvBuilder::new().build(),
+    };
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(config)
+        .with_runtime_env(runtime_env)
+        .with_query_planner(planner)
+        .with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()))
+        .build();
+
+    let ctx = SessionContext::new_with_state(state);
+
     if let Some(partitions) = params.target_partitions {
         ctx.sql(&format!(
             "SET datafusion.execution.target_partitions = {partitions}"
