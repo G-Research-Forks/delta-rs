@@ -16,6 +16,7 @@ use datafusion::{
 use url::Url;
 use uuid::Uuid;
 
+use crate::delta_datafusion::ProgressiveEvalRule;
 use crate::delta_datafusion::engine::AsObjectStoreUrl;
 use crate::delta_datafusion::planner::DeltaPlanner;
 use crate::errors::{DeltaResult, DeltaTableError};
@@ -271,6 +272,7 @@ fn derive_session_state_from_trait(
         .with_aggregate_functions(aggregate_fns)
         .with_window_functions(window_fns)
         .with_query_planner(DeltaPlanner::new())
+        .with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()))
         .build()
 }
 
@@ -385,6 +387,7 @@ impl DeltaSessionContext {
             .with_config(config)
             .with_runtime_env(runtime_env)
             .with_query_planner(planner)
+            .with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()))
             .build();
 
         let inner = SessionContext::new_with_state(state);

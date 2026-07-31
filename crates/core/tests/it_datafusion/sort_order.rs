@@ -408,7 +408,9 @@ async fn multi_sorted_delta_table() -> TestResult<DeltaTable> {
 /// A multi-column sort order declared on the provider satisfies an ORDER BY
 /// over the same columns without a `SortExec`, and the streamed rows are in
 /// (timestamp, object_id) order — the secondary column ordering is exercised
-/// by the repeated timestamps within each file.
+/// by the repeated timestamps within each file. The files are mutually
+/// non-overlapping, so the merge is replaced by a `ProgressiveEvalExec`
+/// concatenation.
 #[tokio::test]
 async fn delta_table_multi_column_sort_order_avoids_sort() -> TestResult<()> {
     let table = multi_sorted_delta_table().await?;
@@ -438,8 +440,12 @@ async fn delta_table_multi_column_sort_order_avoids_sort() -> TestResult<()> {
         "expected no SortExec in plan:\n{rendered}"
     );
     assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected SortPreservingMergeExec in plan:\n{rendered}"
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
     );
 
     let mut keys: Vec<(i64, i64)> = Vec::new();
@@ -460,7 +466,8 @@ async fn delta_table_multi_column_sort_order_avoids_sort() -> TestResult<()> {
 }
 
 /// An ORDER BY over a prefix of the declared multi-column sort order is
-/// satisfied by the declared ordering without a `SortExec`.
+/// satisfied by the declared ordering without a `SortExec`, and the
+/// non-overlapping files allow the `ProgressiveEvalExec` concatenation.
 #[tokio::test]
 async fn delta_table_sort_order_prefix_query_avoids_sort() -> TestResult<()> {
     let table = multi_sorted_delta_table().await?;
@@ -487,8 +494,12 @@ async fn delta_table_sort_order_prefix_query_avoids_sort() -> TestResult<()> {
         "expected no SortExec in plan:\n{rendered}"
     );
     assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected SortPreservingMergeExec in plan:\n{rendered}"
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
     );
     let timestamps = collect_timestamps(&batches);
     assert_eq!(timestamps.len(), (4 * 50 * OBJECTS_PER_TIMESTAMP) as usize);
@@ -570,7 +581,9 @@ fn collect_timestamps(batches: &[RecordBatch]) -> Vec<i64> {
 }
 
 /// A descending sort order declared on the provider satisfies a matching
-/// `ORDER BY ... DESC` without a `SortExec`.
+/// `ORDER BY ... DESC` without a `SortExec`. The files are mutually
+/// non-overlapping, so the merge is further replaced by a
+/// `ProgressiveEvalExec` concatenation.
 #[tokio::test]
 async fn delta_table_descending_sort_order_avoids_sort() -> TestResult<()> {
     let table = desc_sorted_delta_table().await?;
@@ -594,8 +607,12 @@ async fn delta_table_descending_sort_order_avoids_sort() -> TestResult<()> {
         "expected no SortExec in plan:\n{rendered}"
     );
     assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected SortPreservingMergeExec in plan:\n{rendered}"
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
     );
     let timestamps = collect_timestamps(&batches);
     assert_eq!(timestamps.len(), 400);
@@ -1083,7 +1100,9 @@ fn create_column_mapped_table(root: &std::path::Path) -> TestResult<()> {
 
 /// A sort order declared with logical column names works on a column-mapped
 /// table: the ordering is translated to physical parquet column names for the
-/// scan, and back to logical names on the scan output.
+/// scan, and back to logical names on the scan output. The files are
+/// non-overlapping, so the merge is replaced by a `ProgressiveEvalExec`
+/// concatenation.
 #[tokio::test]
 async fn delta_table_column_mapped_sort_order_avoids_sort() -> TestResult<()> {
     let temp_dir = tempfile::tempdir()?;
@@ -1110,8 +1129,12 @@ async fn delta_table_column_mapped_sort_order_avoids_sort() -> TestResult<()> {
         "expected no SortExec in plan:\n{rendered}"
     );
     assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected SortPreservingMergeExec in plan:\n{rendered}"
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
     );
 
     let mut rows: Vec<(i64, i64)> = Vec::new();
@@ -1127,5 +1150,281 @@ async fn delta_table_column_mapped_sort_order_avoids_sort() -> TestResult<()> {
     );
     // Both columns must have been mapped correctly from physical names.
     assert!(rows.iter().all(|(ts, value)| *value == ts * 10));
+    Ok(())
+}
+
+// --- ProgressiveEval concatenation of non-overlapping partitions ---
+
+/// Sum a named metric across a named node type in an executed plan tree.
+fn sum_metric(
+    plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    node: &str,
+    metric: &str,
+) -> Option<usize> {
+    if plan.name() == node {
+        return plan
+            .metrics()?
+            .sum_by_name(metric)
+            .map(|value| value.as_usize());
+    }
+    plan.children()
+        .into_iter()
+        .find_map(|child| sum_metric(child.as_ref(), node, metric))
+}
+
+/// Four mutually non-overlapping files: [0, 100), [100, 200), [200, 300),
+/// [300, 400).
+fn disjoint_files() -> Vec<Vec<i64>> {
+    [0i64, 100, 200, 300]
+        .into_iter()
+        .map(|start| (start..start + 100).collect())
+        .collect()
+}
+
+/// With mutually non-overlapping files, the scan partitions are contiguous
+/// range-ordered chunks of the ordered file list and the merge is replaced by
+/// a `ProgressiveEvalExec` that concatenates them, reporting the partition
+/// ranges in the plan.
+#[tokio::test]
+async fn delta_table_non_overlapping_files_use_progressive_eval() -> TestResult<()> {
+    let table = overlapping_delta_table(disjoint_files()).await?;
+    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 2).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec: input_ranges="),
+        "expected ProgressiveEvalExec with input ranges in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("2 groups"),
+        "expected two contiguous file groups:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 400);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// The contiguous chunking must produce exactly the target partition count
+/// even when the file count does not divide evenly (here 6 files into 4
+/// groups): a shortfall makes DataFusion repartition the scan for
+/// parallelism, splitting files across partitions and losing both the
+/// declared ordering (full-sort fallback) and the concatenation.
+#[tokio::test]
+async fn delta_table_progressive_eval_with_uneven_file_count() -> TestResult<()> {
+    let files: Vec<Vec<i64>> = (0i64..6)
+        .map(|file| (file * 100..file * 100 + 100).collect())
+        .collect();
+    let table = overlapping_delta_table(files).await?;
+    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 4).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("4 groups"),
+        "expected exactly the target partition count of file groups:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 600);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// Touching boundaries count as overlap for the concatenation: a shared value
+/// on the group boundary is not provably ordered by min/max statistics alone,
+/// so the merge is kept.
+#[tokio::test]
+async fn delta_table_touching_files_keep_merge() -> TestResult<()> {
+    // File boundaries share the values 99, 199 and 299.
+    let files: Vec<Vec<i64>> = [0i64, 99, 199, 299]
+        .into_iter()
+        .map(|start| (start..start + 100).collect())
+        .collect();
+    let table = overlapping_delta_table(files).await?;
+    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 2).await?;
+
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 400);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// A LIMIT over the concatenated partitions is pushed into
+/// `ProgressiveEvalExec` as a fetch and terminates the query after the first
+/// partition: the later partitions' files are never read.
+#[tokio::test]
+async fn delta_table_progressive_eval_limit_reads_only_needed_partitions() -> TestResult<()> {
+    let table = overlapping_delta_table(disjoint_files()).await?;
+
+    let ctx = create_session().into_inner();
+    ctx.sql("SET datafusion.execution.target_partitions = 4")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" LIMIT 10")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        rendered.contains("ProgressiveEvalExec: fetch=10"),
+        "expected ProgressiveEvalExec with fetch=10 in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+    let timestamps = collect_timestamps(&batches);
+    let expected: Vec<i64> = (0..10).map(|s| s * 1_000_000).collect();
+    assert_eq!(timestamps, expected);
+
+    // Ten rows fit in the first of the four partitions; only it and the
+    // prefetched next partition may have been executed.
+    let num_read = sum_metric(plan.as_ref(), "ProgressiveEvalExec", "num_read_inputs")
+        .expect("expected num_read_inputs metric on ProgressiveEvalExec");
+    assert!(
+        num_read <= 2,
+        "expected at most 2 of 4 partitions to be executed, got {num_read}"
+    );
+    Ok(())
+}
+
+/// `SET delta.progressive_eval_num_prefetch_input_streams` reaches the
+/// operator: with prefetch reduced to 1 (no read-ahead), a LIMIT satisfied by
+/// the first partition executes exactly one of the four partitions, where the
+/// default of 2 also starts the second.
+#[tokio::test]
+async fn delta_table_progressive_eval_prefetch_streams_setting() -> TestResult<()> {
+    let table = overlapping_delta_table(disjoint_files()).await?;
+
+    let ctx = create_session().into_inner();
+    ctx.sql("SET datafusion.execution.target_partitions = 4")
+        .await?;
+    ctx.sql("SET delta.progressive_eval_num_prefetch_input_streams = 1")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" LIMIT 10")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+    let timestamps = collect_timestamps(&batches);
+    let expected: Vec<i64> = (0..10).map(|s| s * 1_000_000).collect();
+    assert_eq!(timestamps, expected);
+
+    let num_read = sum_metric(plan.as_ref(), "ProgressiveEvalExec", "num_read_inputs")
+        .expect("expected num_read_inputs metric on ProgressiveEvalExec");
+    assert_eq!(
+        num_read, 1,
+        "expected exactly 1 of 4 partitions to be executed with prefetch=1"
+    );
+    Ok(())
+}
+
+/// A filtered ordered query still uses the concatenation, and the filter is
+/// applied within it.
+///
+/// The target partition count is kept at the file-group count: with a
+/// pushed-down filter and spare target partitions, DataFusion otherwise
+/// splits or round-robins the scan input for parallelism, which invalidates
+/// the non-overlapping-partitions claim and (correctly) keeps a merge or sort
+/// instead.
+#[tokio::test]
+async fn delta_table_progressive_eval_with_filter() -> TestResult<()> {
+    let table = overlapping_delta_table(disjoint_files()).await?;
+
+    let ctx = create_session().into_inner();
+    // The predicate prunes one of the four files at planning time.
+    ctx.sql("SET datafusion.execution.target_partitions = 3")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql(
+            "SELECT \"timestamp\", value FROM test_table \
+             WHERE value >= 150 ORDER BY \"timestamp\"",
+        )
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    let timestamps = collect_timestamps(&batches);
+    let expected: Vec<i64> = (150..400).map(|s| s * 1_000_000).collect();
+    assert_eq!(timestamps, expected);
+    Ok(())
+}
+
+/// The concatenated results match the plain full-sort baseline (provider
+/// without a declared sort order) exactly.
+#[tokio::test]
+async fn delta_table_progressive_eval_matches_sort_baseline() -> TestResult<()> {
+    let table = overlapping_delta_table(disjoint_files()).await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("optimized", provider)?;
+    let baseline_provider = table.table_provider().await?;
+    ctx.register_table("baseline", baseline_provider)?;
+
+    let query =
+        |name: &str| format!("SELECT \"timestamp\", value FROM {name} ORDER BY \"timestamp\"");
+    let optimized = ctx.sql(&query("optimized")).await?;
+    let optimized_plan = optimized.create_physical_plan().await?;
+    let rendered = displayable(optimized_plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in optimized plan:\n{rendered}"
+    );
+    let optimized_batches =
+        datafusion::physical_plan::collect(optimized_plan, ctx.task_ctx()).await?;
+
+    let baseline_batches = ctx.sql(&query("baseline")).await?.collect().await?;
+
+    let optimized_rows = collect_timestamps(&optimized_batches);
+    let baseline_rows = collect_timestamps(&baseline_batches);
+    assert_eq!(optimized_rows, baseline_rows);
     Ok(())
 }

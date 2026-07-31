@@ -448,6 +448,14 @@ impl TableProviderBuilder {
     /// the declared order.
     /// The number of groups is bounded, however, so if the reordering requires
     /// too many groups, DataFusion will fall back to a regular sort.
+    ///
+    /// When no files overlap at all, the groups themselves are arranged as
+    /// contiguous non-overlapping ranges and even the sort-preserving merge is
+    /// avoided: sessions with the
+    /// [`ProgressiveEvalRule`](crate::delta_datafusion::ProgressiveEvalRule)
+    /// physical optimizer rule registered (the default for
+    /// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext)
+    /// sessions) concatenate the scan partitions in range order instead.
     pub fn with_file_sort_order(
         mut self,
         columns: impl IntoIterator<Item = FileSortColumn>,

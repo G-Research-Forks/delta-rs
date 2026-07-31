@@ -60,7 +60,10 @@ use crate::table::builder::DeltaTableConfig;
 use crate::table::normalize_table_url;
 
 mod progressive_eval;
+mod progressive_eval_rule;
 mod scan;
+
+pub use self::progressive_eval_rule::ProgressiveEvalRule;
 
 mod serde_file_id_set {
     use std::collections::HashSet;

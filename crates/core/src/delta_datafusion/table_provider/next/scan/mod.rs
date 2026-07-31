@@ -215,14 +215,46 @@ fn null_free_ordering_prefix(
     LexOrdering::new(sort_exprs)
 }
 
+/// Cut a globally ordered, mutually non-overlapping file list into contiguous
+/// groups. Group boundaries follow the ordering, so the groups themselves are
+/// non-overlapping and range-ordered.
+///
+/// Produces exactly `target_partitions` groups (fewer only when there are not
+/// enough files, more only to stay within the file-id dictionary key space),
+/// with group sizes differing by at most one file. Falling short of the
+/// target partition count would make DataFusion repartition the scan for
+/// parallelism, splitting and interleaving the files across partitions and
+/// invalidating both the declared ordering and the range-ordered-partitions
+/// claim.
+fn chunk_ordered_files(files: Vec<PartitionedFile>, target_partitions: usize) -> Vec<FileGroup> {
+    let num_files = files.len().max(1);
+    let num_groups = target_partitions
+        .clamp(1, num_files)
+        .max(num_files.div_ceil(MAX_PARTITION_DICT_CARDINALITY));
+    let base_size = num_files / num_groups;
+    let leftover = num_files % num_groups;
+    let mut files = files.into_iter();
+    (0..num_groups)
+        .map(|group| {
+            // The first `leftover` groups take one extra file.
+            let size = base_size + usize::from(group < leftover);
+            files.by_ref().take(size).collect::<FileGroup>()
+        })
+        .collect()
+}
+
 /// Build scan file groups such that the files within each group are mutually
 /// non-overlapping and ordered on the declared file sort order, so reading a
 /// group sequentially preserves that order.
 ///
-/// The statistics-based grouping creates additional groups beyond the target
-/// partition count when file ranges overlap; with heavily overlapping files
-/// this degrades to one group per file. To bound the number of scan
-/// partitions, the result is only used when it stays within
+/// When every file is non-overlapping with every other file, the ordered file
+/// list is cut into contiguous groups that are also non-overlapping *between*
+/// each other.
+///
+/// Otherwise, the statistics-based grouping creates additional groups beyond
+/// the target partition count when file ranges overlap; with heavily
+/// overlapping files this degrades to one group per file. To bound the number
+/// of scan partitions, the result is only used when it stays within
 /// `max(64, 2 * target_partitions)` groups.
 ///
 /// Falls back to the default grouping when that cap is exceeded, when
@@ -238,6 +270,23 @@ fn split_file_groups_for_ordering(
 ) -> Vec<FileGroup> {
     let max_groups = usize::max(64, target_partitions.saturating_mul(2));
     let flat = vec![FileGroup::new(files.clone())];
+
+    // First-fit bin packing yields a single group exactly when all files are
+    // mutually non-overlapping on the sort order.
+    match FileScanConfig::split_groups_by_statistics(table_schema, &flat, ordering) {
+        Ok(mut groups) if groups.len() == 1 => {
+            let ordered_files = groups.remove(0).into_inner();
+            let groups = chunk_ordered_files(ordered_files, target_partitions);
+            return groups;
+        }
+        // Overlapping files: fall through to the balanced target-partitions
+        // grouping below.
+        Ok(_) => {}
+        // Missing/unusable statistics: the grouping below fails the same way
+        // and takes its default-grouping fallback.
+        Err(_) => {}
+    }
+
     match FileScanConfig::split_groups_by_statistics_with_target_partitions(
         table_schema,
         &flat,
@@ -709,6 +758,7 @@ async fn get_read_plan(
                 let files = files.collect_vec();
                 let null_free_prefix =
                     null_free_ordering_prefix(ordering, parquet_read_schema, &files);
+                let null_free_len = null_free_prefix.as_ref().map_or(0, |prefix| prefix.len());
                 let file_groups = split_file_groups_for_ordering(
                     files,
                     ordering,
@@ -722,7 +772,7 @@ async fn get_read_plan(
                 let store_sort_order = if file_groups.iter().all(|group| group.len() <= 1) {
                     Some(ordering.clone())
                 } else {
-                    if null_free_prefix.as_ref().map_or(0, |prefix| prefix.len()) < ordering.len() {
+                    if null_free_len < ordering.len() {
                         debug!(
                             "file sort order columns may contain nulls; declaring only the null-free prefix of the ordering"
                         );
@@ -850,6 +900,7 @@ mod tests {
     };
     use arrow_schema::{ArrowError, DataType, Field, Fields, Schema};
     use datafusion::{
+        common::ScalarValue,
         error::DataFusionError,
         physical_plan::collect,
         prelude::{col, lit},
@@ -876,6 +927,142 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), MAX_PARTITION_DICT_CARDINALITY);
         assert_eq!(groups[1].len(), 1);
+    }
+
+    /// A `PartitionedFile` with exact min/max/null-count statistics for one
+    /// Int64 sort column.
+    fn stats_file(path: &str, min: i64, max: i64) -> PartitionedFile {
+        let mut file = PartitionedFile::new(format!("{path}.parquet"), 100);
+        file.statistics = Some(Arc::new(Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(min))),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(max))),
+                ..Default::default()
+            }],
+        }));
+        file
+    }
+
+    fn int64_sort_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]))
+    }
+
+    fn int64_asc_ordering() -> LexOrdering {
+        LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("t", 0)),
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )])
+        .unwrap()
+    }
+
+    fn group_paths(group: &FileGroup) -> Vec<String> {
+        group
+            .iter()
+            .map(|file| file.object_meta.location.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_split_file_groups_non_overlapping_files_form_contiguous_ranges() {
+        // Non-overlapping ranges, deliberately out of order.
+        let files = vec![
+            stats_file("c", 200, 299),
+            stats_file("a", 0, 99),
+            stats_file("d", 300, 399),
+            stats_file("b", 100, 199),
+        ];
+
+        let groups =
+            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "b.parquet"]);
+        assert_eq!(group_paths(&groups[1]), vec!["c.parquet", "d.parquet"]);
+    }
+
+    #[test]
+    fn test_split_file_groups_more_targets_than_files() {
+        let files = vec![stats_file("a", 0, 99), stats_file("b", 100, 199)];
+
+        let groups =
+            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 8);
+
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn test_split_file_groups_overlapping_files() {
+        // b overlaps a; the balanced grouping applies.
+        let files = vec![
+            stats_file("a", 0, 150),
+            stats_file("b", 100, 199),
+            stats_file("c", 200, 299),
+        ];
+
+        let groups =
+            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+
+        // Files within each group must still be non-overlapping.
+        assert!(groups.len() >= 2);
+    }
+
+    #[test]
+    fn test_split_file_groups_missing_statistics_fall_back_to_default_grouping() {
+        let files = vec![
+            PartitionedFile::new("memory:///a.parquet", 100),
+            PartitionedFile::new("memory:///b.parquet", 100),
+        ];
+
+        let groups =
+            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_ordered_files_hits_target_partition_count_exactly() {
+        // A shortfall (e.g. ceil(100 / 24) = 5 → only 20 groups) makes
+        // DataFusion repartition the scan, destroying the ordering claims.
+        let files = (0..100)
+            .map(|i| PartitionedFile::new(format!("f{i}.parquet"), 0))
+            .collect_vec();
+
+        let groups = chunk_ordered_files(files, 24);
+        assert_eq!(groups.len(), 24);
+        assert!(groups.iter().all(|group| (4..=5).contains(&group.len())));
+        assert_eq!(groups.iter().map(FileGroup::len).sum::<usize>(), 100);
+        // Contiguity: files stay in their original order across the groups.
+        let flattened = groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|file| file.object_meta.location.to_string())
+            .collect_vec();
+        assert_eq!(
+            flattened,
+            (0..100).map(|i| format!("f{i}.parquet")).collect_vec()
+        );
+    }
+
+    #[test]
+    fn test_chunk_ordered_files_respects_dictionary_cardinality_limit() {
+        let files = (0..=MAX_PARTITION_DICT_CARDINALITY)
+            .map(|i| PartitionedFile::new(format!("memory:///f{i}.parquet"), 0))
+            .collect_vec();
+
+        let groups = chunk_ordered_files(files, 1);
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups
+                .iter()
+                .all(|group| group.len() <= MAX_PARTITION_DICT_CARDINALITY)
+        );
     }
 
     #[cfg(debug_assertions)]
