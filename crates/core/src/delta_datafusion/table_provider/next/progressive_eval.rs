@@ -16,40 +16,6 @@
 // under the License.
 
 //! Defines the progressive eval plan
-//!
-//! # Vendoring note
-//!
-//! This operator is vendored from the proposed (closed, unmerged) DataFusion
-//! PR <https://github.com/apache/datafusion/pull/10490>, head commit
-//! `71efd8ff56246f88c77139f5e0d2a62831d602c6`
-//! (`datafusion/physical-plan/src/sorts/progressive_eval.rs`). A production
-//! implementation lives in InfluxData's `influxdb3_core`. The goal is to
-//! delete this copy once the operator is upstreamed
-//! (<https://github.com/apache/datafusion/issues/15191>).
-//!
-//! Local deviations from the PR:
-//!
-//! - Ported to the current `ExecutionPlan` trait: `name()`,
-//!   `properties() -> &Arc<PlanProperties>`, four-argument
-//!   `PlanProperties::new` (`EmissionType::Incremental` + the input's
-//!   boundedness), `children() -> Vec<&Arc<...>>`, `partition_statistics`
-//!   instead of `statistics`, and `OrderingRequirements` for
-//!   `required_input_ordering`.
-//! - The PR prefetched *all* input streams when no fetch limit was set. That
-//!   is removed: prefetch is always bounded by the configured count. In
-//!   delta-rs the inputs are per-batch `SortExec`s whose `execute()` triggers
-//!   reading and sorting a whole batch of files, so lazy execution of input
-//!   partitions is the entire point of the operator (memory bounded by the
-//!   largest batch, first rows after the first batch).
-//! - `fetch()`/`with_fetch()` are implemented so the `PushdownSort` rule can
-//!   forward the LIMIT of an eliminated `SortExec` for early termination.
-//! - The stream truncates the record batch that crosses the fetch boundary,
-//!   emitting exactly `fetch` rows. The PR returned whole "covering" batches
-//!   (possibly more than `fetch` rows), which is only safe with a limit
-//!   operator above; DataFusion's `with_fetch` contract expects the node to
-//!   enforce the limit itself.
-//! - Unit tests use `MemorySourceConfig` (the PR's `MemoryExec` is gone) and
-//!   local stand-ins for DataFusion-internal test helpers.
 
 use std::borrow::Cow::Borrowed;
 use std::pin::Pin;
@@ -73,11 +39,11 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt, ready};
 use tracing::{debug, trace, warn};
 
-/// ProgressiveEval return a stream of record batches in the order of its inputs.
-/// It will stop when the number of output rows reach the given limit.
+/// ProgressiveEval returns a stream of record batches in the order of its inputs.
+/// It will stop when the number of output rows reaches the given limit.
 ///
-/// This takes an input execution plan and a number n, and provided each partition of
-/// the input plan is in an expected order, this operator will return the top n rows
+/// This takes an input execution plan and an optional limit N, and provided each partition of
+/// the input plan is in the expected order, this operator will return the top N rows
 /// in the order of the input plan (truncating the record batch that crosses the limit).
 ///
 /// ```text
@@ -92,7 +58,7 @@ use tracing::{debug, trace, warn};
 /// ┌─────────────────────────┐  │  └───────────────────┘    └─┬─────┴───────────────────────┘
 /// │ ╔═══╦═══╗               │  │
 /// │ ║ M ║ N ║               │──┘                             │
-/// │ ╚═══╩═══╝               │                Output only include top record batches that cover top N rows
+/// │ ╚═══╩═══╝               │        Output only includes the top record batches that cover top N rows
 /// └─────────────────────────┘
 ///   Stream 2
 ///
@@ -105,8 +71,8 @@ pub(crate) struct ProgressiveEvalExec {
     /// Input plan
     input: Arc<dyn ExecutionPlan>,
 
-    /// Corresponding value ranges of the input plan
-    /// None if the value ranges are not available
+    /// Corresponding value ranges of the input plan.
+    /// None if the value ranges are not available.
     value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
 
     /// Execution metrics
@@ -120,7 +86,7 @@ pub(crate) struct ProgressiveEvalExec {
 }
 
 impl ProgressiveEvalExec {
-    /// Create a new progressive execution plan
+    /// Create a new progressive-evaluation execution plan
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
@@ -141,9 +107,9 @@ impl ProgressiveEvalExec {
         &self.input
     }
 
-    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    /// Creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
     fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
-        // progressive eval does not change the equivalence properties of its input
+        // Progressive eval does not change the equivalence properties of its input
         let eq_properties = input.equivalence_properties().clone();
 
         // This node serializes all the data to a single partition
@@ -161,9 +127,7 @@ impl ProgressiveEvalExec {
 impl DisplayAs for ProgressiveEvalExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default
-            | DisplayFormatType::Verbose
-            | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "ProgressiveEvalExec: ")?;
                 if let Some(fetch) = self.fetch {
                     write!(f, "fetch={fetch}, ")?;
@@ -171,10 +135,15 @@ impl DisplayAs for ProgressiveEvalExec {
                 if let Some(value_ranges) = &self.value_ranges {
                     write!(f, "input_ranges={value_ranges:?}")?;
                 };
-
-                Ok(())
+            }
+            DisplayFormatType::TreeRender => {
+                writeln!(f, "ProgressiveEvalExec")?;
+                if let Some(fetch) = self.fetch {
+                    writeln!(f, "fetch={fetch}")?;
+                };
             }
         }
+        Ok(())
     }
 }
 
@@ -195,10 +164,6 @@ impl ExecutionPlan for ProgressiveEvalExec {
         vec![Distribution::UnspecifiedDistribution]
     }
 
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         let input_ordering = self
             .input()
@@ -216,6 +181,10 @@ impl ExecutionPlan for ProgressiveEvalExec {
         vec![true]
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -229,16 +198,6 @@ impl ExecutionPlan for ProgressiveEvalExec {
             self.value_ranges.clone(),
             self.fetch,
         )))
-    }
-
-    fn fetch(&self) -> Option<usize> {
-        self.fetch
-    }
-
-    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        let mut new_plan = self.clone();
-        new_plan.fetch = limit;
-        Some(Arc::new(new_plan))
     }
 
     fn execute(
@@ -272,7 +231,7 @@ impl ExecutionPlan for ProgressiveEvalExec {
         // Add a metric to record the number of inputs that are actually read which is <= num_inputs
         let num_read_inputs_counter =
             MetricBuilder::new(&self.metrics).global_counter("num_read_inputs");
-        // Add other base line metrics
+        // Add other baseline metrics
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
 
         let result = ProgressiveEvalStream::new(
@@ -301,6 +260,16 @@ impl ExecutionPlan for ProgressiveEvalExec {
         }
         // The single output partition carries the input's combined statistics.
         self.input.partition_statistics(None)
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let mut new_plan = self.clone();
+        new_plan.fetch = limit;
+        Some(Arc::new(new_plan))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
     }
 }
 
@@ -393,7 +362,7 @@ impl InputStreams {
             // all input streams must have been consumed already
             if !self.prefetched_input_streams.is_empty() {
                 return internal_err!(
-                    "Internal error in ProgressiveEvalStream: There should not have input streams left to read"
+                    "Internal error in ProgressiveEvalStream: Expected no input streams left to read"
                 );
             }
 
@@ -587,12 +556,14 @@ mod tests {
     async fn test_no_input_stream() {
         let task_ctx = Arc::new(TaskContext::default());
 
+        let empty_table_result = ["++", "++"];
+
         // no fetch limit --> return all rows
         _test_progressive_eval(
             &[],
             None,
             None,
-            &["++", "++"],
+            &empty_table_result,
             0, // 0 input stream
             0, // 0 input stream is prefetched and polled
             Arc::clone(&task_ctx),
@@ -604,7 +575,7 @@ mod tests {
             &[],
             None,
             Some(0),
-            &["++", "++"],
+            &empty_table_result,
             0, // 0 input stream
             0, // 0 input stream is prefetched and polled
             Arc::clone(&task_ctx),
@@ -616,7 +587,7 @@ mod tests {
             &[],
             None,
             Some(1),
-            &["++", "++"],
+            &empty_table_result,
             0, // 0 input stream
             0, // 0 input stream is prefetched and polled
             task_ctx,
@@ -638,22 +609,24 @@ mod tests {
         let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![8, 7, 6, 5, 8]));
         let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
+        let all_rows = [
+            "+---+---+-------------------------------+",
+            "| a | b | c                             |",
+            "+---+---+-------------------------------+",
+            "| 1 | a | 1970-01-01T00:00:00.000000008 |",
+            "| 2 | c | 1970-01-01T00:00:00.000000007 |",
+            "| 7 | e | 1970-01-01T00:00:00.000000006 |",
+            "| 9 | g | 1970-01-01T00:00:00.000000005 |",
+            "| 3 | j | 1970-01-01T00:00:00.000000008 |",
+            "+---+---+-------------------------------+",
+        ];
+
         // return all
         _test_progressive_eval(
             &[vec![b1.clone()]],
             None,
             None, // no fetch limit --> return all rows
-            &[
-                "+---+---+-------------------------------+",
-                "| a | b | c                             |",
-                "+---+---+-------------------------------+",
-                "| 1 | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2 | c | 1970-01-01T00:00:00.000000007 |",
-                "| 7 | e | 1970-01-01T00:00:00.000000006 |",
-                "| 9 | g | 1970-01-01T00:00:00.000000005 |",
-                "| 3 | j | 1970-01-01T00:00:00.000000008 |",
-                "+---+---+-------------------------------+",
-            ],
+            &all_rows,
             1, // 1 input stream
             1, // 1 input stream is prefetched and polled
             Arc::clone(&task_ctx),
@@ -697,17 +670,7 @@ mod tests {
             &[vec![b1.clone()]],
             None,
             Some(7),
-            &[
-                "+---+---+-------------------------------+",
-                "| a | b | c                             |",
-                "+---+---+-------------------------------+",
-                "| 1 | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2 | c | 1970-01-01T00:00:00.000000007 |",
-                "| 7 | e | 1970-01-01T00:00:00.000000006 |",
-                "| 9 | g | 1970-01-01T00:00:00.000000005 |",
-                "| 3 | j | 1970-01-01T00:00:00.000000008 |",
-                "+---+---+-------------------------------+",
-            ],
+            &all_rows,
             1, // 1 input stream
             1, // 1 input stream is prefetched and polled
             Arc::clone(&task_ctx),
@@ -740,28 +703,47 @@ mod tests {
         let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![4, 6, 2, 2, 6]));
         let b2 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
+        let b1_b2 = [
+            "+----+---+-------------------------------+",
+            "| a  | b | c                             |",
+            "+----+---+-------------------------------+",
+            "| 1  | a | 1970-01-01T00:00:00.000000008 |",
+            "| 2  | c | 1970-01-01T00:00:00.000000007 |",
+            "| 7  | e | 1970-01-01T00:00:00.000000006 |",
+            "| 9  | g | 1970-01-01T00:00:00.000000005 |",
+            "| 3  | j | 1970-01-01T00:00:00.000000008 |",
+            "| 10 | b | 1970-01-01T00:00:00.000000004 |",
+            "| 20 | d | 1970-01-01T00:00:00.000000006 |",
+            "| 70 | f | 1970-01-01T00:00:00.000000002 |",
+            "| 90 | h | 1970-01-01T00:00:00.000000002 |",
+            "| 30 | j | 1970-01-01T00:00:00.000000006 |",
+            "+----+---+-------------------------------+",
+        ];
+
+        let b2_b1 = [
+            "+----+---+-------------------------------+",
+            "| a  | b | c                             |",
+            "+----+---+-------------------------------+",
+            "| 10 | b | 1970-01-01T00:00:00.000000004 |",
+            "| 20 | d | 1970-01-01T00:00:00.000000006 |",
+            "| 70 | f | 1970-01-01T00:00:00.000000002 |",
+            "| 90 | h | 1970-01-01T00:00:00.000000002 |",
+            "| 30 | j | 1970-01-01T00:00:00.000000006 |",
+            "| 1  | a | 1970-01-01T00:00:00.000000008 |",
+            "| 2  | c | 1970-01-01T00:00:00.000000007 |",
+            "| 7  | e | 1970-01-01T00:00:00.000000006 |",
+            "| 9  | g | 1970-01-01T00:00:00.000000005 |",
+            "| 3  | j | 1970-01-01T00:00:00.000000008 |",
+            "+----+---+-------------------------------+",
+        ];
+
         // [b1, b2]
         // return all by not specifying fetch limit
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
             None, // no fetch limit --> return all rows
-            &[
-                "+----+---+-------------------------------+",
-                "| a  | b | c                             |",
-                "+----+---+-------------------------------+",
-                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2  | c | 1970-01-01T00:00:00.000000007 |",
-                "| 7  | e | 1970-01-01T00:00:00.000000006 |",
-                "| 9  | g | 1970-01-01T00:00:00.000000005 |",
-                "| 3  | j | 1970-01-01T00:00:00.000000008 |",
-                "| 10 | b | 1970-01-01T00:00:00.000000004 |",
-                "| 20 | d | 1970-01-01T00:00:00.000000006 |",
-                "| 70 | f | 1970-01-01T00:00:00.000000002 |",
-                "| 90 | h | 1970-01-01T00:00:00.000000002 |",
-                "| 30 | j | 1970-01-01T00:00:00.000000006 |",
-                "+----+---+-------------------------------+",
-            ],
+            &b1_b2,
             2, // 2 input streams
             2, // all 2 input streams are prefetched and polled
             Arc::clone(&task_ctx),
@@ -774,22 +756,7 @@ mod tests {
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
             Some(10), // limit = max num rows --> return all rows
-            &[
-                "+----+---+-------------------------------+",
-                "| a  | b | c                             |",
-                "+----+---+-------------------------------+",
-                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2  | c | 1970-01-01T00:00:00.000000007 |",
-                "| 7  | e | 1970-01-01T00:00:00.000000006 |",
-                "| 9  | g | 1970-01-01T00:00:00.000000005 |",
-                "| 3  | j | 1970-01-01T00:00:00.000000008 |",
-                "| 10 | b | 1970-01-01T00:00:00.000000004 |",
-                "| 20 | d | 1970-01-01T00:00:00.000000006 |",
-                "| 70 | f | 1970-01-01T00:00:00.000000002 |",
-                "| 90 | h | 1970-01-01T00:00:00.000000002 |",
-                "| 30 | j | 1970-01-01T00:00:00.000000006 |",
-                "+----+---+-------------------------------+",
-            ],
+            &b1_b2,
             2, // 2 input streams
             2, // all 2 input streams are prefetched and polled
             Arc::clone(&task_ctx),
@@ -802,22 +769,7 @@ mod tests {
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
             None,
-            &[
-                "+----+---+-------------------------------+",
-                "| a  | b | c                             |",
-                "+----+---+-------------------------------+",
-                "| 10 | b | 1970-01-01T00:00:00.000000004 |",
-                "| 20 | d | 1970-01-01T00:00:00.000000006 |",
-                "| 70 | f | 1970-01-01T00:00:00.000000002 |",
-                "| 90 | h | 1970-01-01T00:00:00.000000002 |",
-                "| 30 | j | 1970-01-01T00:00:00.000000006 |",
-                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2  | c | 1970-01-01T00:00:00.000000007 |",
-                "| 7  | e | 1970-01-01T00:00:00.000000006 |",
-                "| 9  | g | 1970-01-01T00:00:00.000000005 |",
-                "| 3  | j | 1970-01-01T00:00:00.000000008 |",
-                "+----+---+-------------------------------+",
-            ],
+            &b2_b1,
             2, // 2 input streams
             2, // all 2 input streams are prefetched and polled
             Arc::clone(&task_ctx),
@@ -830,22 +782,7 @@ mod tests {
             &[vec![b2], vec![b1]],
             None,
             Some(20),
-            &[
-                "+----+---+-------------------------------+",
-                "| a  | b | c                             |",
-                "+----+---+-------------------------------+",
-                "| 10 | b | 1970-01-01T00:00:00.000000004 |",
-                "| 20 | d | 1970-01-01T00:00:00.000000006 |",
-                "| 70 | f | 1970-01-01T00:00:00.000000002 |",
-                "| 90 | h | 1970-01-01T00:00:00.000000002 |",
-                "| 30 | j | 1970-01-01T00:00:00.000000006 |",
-                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2  | c | 1970-01-01T00:00:00.000000007 |",
-                "| 7  | e | 1970-01-01T00:00:00.000000006 |",
-                "| 9  | g | 1970-01-01T00:00:00.000000005 |",
-                "| 3  | j | 1970-01-01T00:00:00.000000008 |",
-                "+----+---+-------------------------------+",
-            ],
+            &b2_b1,
             2, // 2 input streams
             2, // all 2 input streams are prefetched and polled
             task_ctx,
@@ -965,7 +902,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actally polled
+            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -985,7 +922,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actally polled
+            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
             task_ctx,
         )
         .await;
@@ -1031,7 +968,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actally polled
+            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1055,7 +992,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actally polled
+            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
             task_ctx,
         )
         .await;
@@ -1523,7 +1460,7 @@ mod tests {
         context: Arc<TaskContext>,
     ) {
         let schema = if partitions.is_empty() {
-            // just whatever schema
+            // Schema is arbitrary
             let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
             let batch = RecordBatch::try_from_iter(vec![("a", a)]).unwrap();
             batch.schema()
