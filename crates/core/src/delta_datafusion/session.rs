@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use datafusion::common::extensions_options;
+use datafusion::config::ConfigExtension;
 use datafusion::{
     catalog::Session as DataFusionSession,
     execution::{
@@ -18,6 +20,30 @@ use crate::delta_datafusion::engine::AsObjectStoreUrl;
 use crate::delta_datafusion::planner::DeltaPlanner;
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::logstore::LogStore;
+
+extensions_options! {
+    /// Delta-specific DataFusion session options, registered under the
+    /// `delta.` prefix (e.g. `SET delta.progressive_eval_num_prefetch_input_streams = 4`).
+    ///
+    /// Registered by default on sessions created through
+    /// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext);
+    /// other sessions can register it via
+    /// `SessionConfig::with_option_extension(DeltaConfigOptions::default())`.
+    pub struct DeltaConfigOptions {
+        /// Number of input streams to prefetch for ProgressiveEvalExec.
+        /// Since ProgressiveEvalExec only polls one stream at a time in their stream order,
+        /// we do not need to prefetch all streams at once to save resources. However, if the
+        /// streams' IO time is much greater than their CPU/procesing time, prefetching them will help
+        /// improve the performance.
+        /// Default is 2 which means we will prefetch one extra stream before polling the current one.
+        /// Increase this value if IO time to read a stream is often much more than CPU time to process its previous one.
+        pub progressive_eval_num_prefetch_input_streams: usize, default = 2
+    }
+}
+
+impl ConfigExtension for DeltaConfigOptions {
+    const PREFIX: &'static str = "delta";
+}
 
 pub fn create_session() -> DeltaSessionContext {
     DeltaSessionContext::default()
@@ -277,6 +303,7 @@ impl Default for DeltaSessionConfig {
     fn default() -> Self {
         DeltaSessionConfig {
             inner: SessionConfig::default()
+                .with_option_extension(DeltaConfigOptions::default())
                 .set_bool("datafusion.sql_parser.enable_ident_normalization", false)
                 .set_bool("datafusion.execution.parquet.schema_force_view_types", true)
                 // Workaround: hash-join dynamic filtering (IN-list pushdown) can panic when join

@@ -59,6 +59,7 @@ use crate::protocol::SaveMode;
 use crate::table::builder::DeltaTableConfig;
 use crate::table::normalize_table_url;
 
+mod progressive_eval;
 mod scan;
 
 mod serde_file_id_set {
