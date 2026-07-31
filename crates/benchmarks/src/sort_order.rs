@@ -150,6 +150,8 @@ pub async fn generate_sorted_table(table_url: &Url, params: &SortDataParams) -> 
             .with_save_mode(mode)
             .with_session_state(write_session.clone())
             .with_writer_properties(writer_properties())
+            // Increase target file size to avoid writes being split
+            .with_target_file_size(Some((10_000 * 1024 * 1024).try_into().unwrap()))
             .await?;
         println!(
             "day={day} rows={} gen_ms={} write_ms={}",
