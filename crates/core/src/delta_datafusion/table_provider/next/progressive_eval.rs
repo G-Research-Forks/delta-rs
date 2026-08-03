@@ -175,8 +175,6 @@ impl ExecutionPlan for ProgressiveEvalExec {
         vec![input_ordering]
     }
 
-    /// ProgressiveEvalExec will only accept sorted input
-    /// and will maintain the input order
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }
@@ -193,6 +191,12 @@ impl ExecutionPlan for ProgressiveEvalExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return internal_err!(
+                "ProgressiveEvalExec expected 1 child, got {}",
+                children.len()
+            );
+        }
         Ok(Arc::new(Self::new(
             Arc::<dyn ExecutionPlan>::clone(&children[0]),
             self.value_ranges.clone(),
@@ -1227,7 +1231,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 0 --> return nothing.
-        // Prefetch minum 2 input streams
+        // Prefetches the minimum of 2 input streams
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1247,7 +1251,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 3 --> return the first 3 rows of b1
-        // Prefetch minum 2 input streams
+        // Prefetches the minimum of 2 input streams
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1275,7 +1279,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 5 --> return all 5 rows of b1
-        // Prefetch minum 2 input streams
+        // Prefetches the minimum of 2 input streams
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
