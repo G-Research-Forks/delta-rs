@@ -37,7 +37,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::{Stream, StreamExt, ready};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 /// ProgressiveEval returns a stream of record batches in the order of its inputs.
 /// It will stop when the number of output rows reaches the given limit.
@@ -288,7 +288,7 @@ struct InputStreams {
     /// Total input streams
     input_stream_count: usize,
 
-    /// Number of input streams to prefetch
+    /// Number of input streams to prefetch ahead of time
     num_input_streams_to_prefetch: usize,
 
     /// Index of current stream
@@ -318,17 +318,11 @@ impl InputStreams {
 
         let current_stream_idx = 0;
         let mut current_input_stream = None;
-        let mut capacity = 0;
-        if num_input_streams_to_prefetch > 1 {
-            capacity = num_input_streams_to_prefetch - 1;
-        } else {
-            warn!(
-                "num_input_streams_to_prefetch is {num_input_streams_to_prefetch} and not greater than 1"
-            );
-        }
-        let mut prefetched_input_streams = Vec::with_capacity(capacity);
+        let mut prefetched_input_streams = Vec::with_capacity(num_input_streams_to_prefetch);
 
-        for i in 0..num_input_streams_to_prefetch {
+        // Always start fetching the first input stream, and also start
+        // fetching an additional `num_input_streams_to_prefetch` inputs.
+        for i in 0..=num_input_streams_to_prefetch {
             if i >= input_stream_count {
                 break;
             }
@@ -373,15 +367,13 @@ impl InputStreams {
             self.current_input_stream = None;
         } else {
             // prefetch one more input stream before setting next stream to the current input stream
-            if self.current_stream_idx + self.num_input_streams_to_prefetch
-                < self.input_stream_count
-            {
+            let next_prefetch_idx =
+                self.current_stream_idx + self.num_input_streams_to_prefetch + 1;
+            if next_prefetch_idx < self.input_stream_count {
                 self.num_read_inputs_counter.add(1);
                 self.prefetched_input_streams.push(spawn_buffered(
-                    self.input_plan.execute(
-                        self.current_stream_idx + self.num_input_streams_to_prefetch,
-                        Arc::<TaskContext>::clone(&self.context),
-                    )?,
+                    self.input_plan
+                        .execute(next_prefetch_idx, Arc::<TaskContext>::clone(&self.context))?,
                     1,
                 ));
             }
@@ -568,8 +560,8 @@ mod tests {
             None,
             None,
             &empty_table_result,
-            0, // 0 input stream
-            0, // 0 input stream is prefetched and polled
+            0, // 0 input streams
+            0, // 0 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -580,8 +572,8 @@ mod tests {
             None,
             Some(0),
             &empty_table_result,
-            0, // 0 input stream
-            0, // 0 input stream is prefetched and polled
+            0, // 0 input streams
+            0, // 0 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -592,8 +584,8 @@ mod tests {
             None,
             Some(1),
             &empty_table_result,
-            0, // 0 input stream
-            0, // 0 input stream is prefetched and polled
+            0, // 0 input streams
+            0, // 0 input streams are fetched and polled
             task_ctx,
         )
         .await;
@@ -632,7 +624,7 @@ mod tests {
             None, // no fetch limit --> return all rows
             &all_rows,
             1, // 1 input stream
-            1, // 1 input stream is prefetched and polled
+            1, // 1 input stream is fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -664,7 +656,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             1, // 1 input stream
-            1, // 1 input stream is prefetched and polled
+            1, // 1 input stream is fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -676,7 +668,7 @@ mod tests {
             Some(7),
             &all_rows,
             1, // 1 input stream
-            1, // 1 input stream is prefetched and polled
+            1, // 1 input stream is fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -749,7 +741,7 @@ mod tests {
             None, // no fetch limit --> return all rows
             &b1_b2,
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -762,7 +754,7 @@ mod tests {
             Some(10), // limit = max num rows --> return all rows
             &b1_b2,
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -775,7 +767,7 @@ mod tests {
             None,
             &b2_b1,
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -788,7 +780,7 @@ mod tests {
             Some(20),
             &b2_b1,
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             task_ctx,
         )
         .await;
@@ -837,7 +829,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -862,7 +854,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             task_ctx,
         )
         .await;
@@ -906,7 +898,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
+            2, // all 2 input streams are fetched by default even though only the first one is actually polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -926,7 +918,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
+            2, // all 2 input streams are fetched by default even though only the first one is actually polled
             task_ctx,
         )
         .await;
@@ -972,7 +964,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
+            2, // all 2 input streams are fetched by default even though only the first one is actually polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -996,7 +988,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched by default even though only the first one is actually polled
+            2, // all 2 input streams are fetched by default even though only the first one is actually polled
             task_ctx,
         )
         .await;
@@ -1043,7 +1035,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1068,7 +1060,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
-            2, // all 2 input streams are prefetched and polled
+            2, // all 2 input streams are fetched and polled
             task_ctx,
         )
         .await;
@@ -1122,7 +1114,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             3, // 3 input streams
-            2, // 2 input streams are prefetched by default even though only the first one is polled
+            2, // 2 input streams are fetched by default even though only the first one is polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1148,7 +1140,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             3, // 3 input streams
-            3, // since we need to poll 2 input streams, 3 streams are prefetched. Always one extra stream is prefetched
+            3, // since we need to poll 2 input streams, 1 extra stream is prefetched
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1179,7 +1171,7 @@ mod tests {
                 "+-----+---+-------------------------------+",
             ],
             3, // 3 input streams
-            3, // 3 input streams are prefetched and polled
+            3, // 3 input streams are fetched and polled
             task_ctx,
         )
         .await;
@@ -1231,7 +1223,6 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 0 --> return nothing.
-        // Prefetches the minimum of 2 input streams
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1243,7 +1234,7 @@ mod tests {
             Some(0),
             &["++", "++"],
             4, // 4 input streams
-            2, // 2 input streams are prefetched by default even though nothing is polled
+            2, // 2 input streams are fetched by default even though nothing is polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1251,7 +1242,6 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 3 --> return the first 3 rows of b1
-        // Prefetches the minimum of 2 input streams
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1271,7 +1261,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             4, // 4 input streams
-            2, // 2 input streams are prefetched and one stream is polled
+            2, // 2 input streams are fetched and one stream is polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1279,7 +1269,6 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 5 --> return all 5 rows of b1
-        // Prefetches the minimum of 2 input streams
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1301,7 +1290,7 @@ mod tests {
                 "+---+---+-------------------------------+",
             ],
             4, // 4 input streams
-            2, // 2 input streams are prefetched and one stream is polled
+            2, // 2 input streams are fetched and one stream is polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1309,7 +1298,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 8 --> return all 8 rows of b1 and b2
-        // Prefetched 3 input streams since we will always prefetch one extra one
+        // Fetched 3 input streams since we will always prefetch one extra one
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1334,7 +1323,7 @@ mod tests {
                 "+----+---+-------------------------------+",
             ],
             4, // 4 input streams
-            3, // 3 input streams are prefetched and 2 streams are polled
+            3, // 3 input streams are fetched and 2 streams are polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1342,7 +1331,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 12 --> return all 12 rows of b1, b2 and b3
-        // Prefetch 4 input streams since we will always prefetch one extra one
+        // Fetches 4 input streams since we will always prefetch one extra one
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1371,7 +1360,7 @@ mod tests {
                 "+-----+---+-------------------------------+",
             ],
             4, // 4 input streams
-            4, // 4 input streams are prefetched and 3 streams are polled
+            4, // 4 input streams are fetched and 3 streams are polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -1379,7 +1368,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 15 --> return all 15 rows of b1, b2, b3 and b4
-        // Prefetched all 4 input streams
+        // Fetches all 4 input streams
         _test_progressive_eval(
             &[
                 vec![b1.clone()],
@@ -1410,7 +1399,7 @@ mod tests {
                 "+------+---+-------------------------------+",
             ],
             4, // 4 input streams
-            4, // 4 input streams are prefetched and polled
+            4, // 4 input streams are fetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
