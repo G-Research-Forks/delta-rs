@@ -544,7 +544,7 @@ mod tests {
         let empty_table_result = ["++", "++"];
 
         // no fetch limit --> return all rows
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[],
             None,
             None,
@@ -556,7 +556,7 @@ mod tests {
         .await;
 
         // limit = 0 means select nothing
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[],
             None,
             Some(0),
@@ -568,7 +568,7 @@ mod tests {
         .await;
 
         // limit = 1 on no data
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[],
             None,
             Some(1),
@@ -607,7 +607,7 @@ mod tests {
         ];
 
         // return all
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()]],
             None,
             None, // no fetch limit --> return all rows
@@ -619,7 +619,7 @@ mod tests {
         .await;
 
         // fetch no rows
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()]],
             None,
             Some(0),
@@ -631,7 +631,7 @@ mod tests {
         .await;
 
         // return exactly 3 rows: the first record batch is truncated at the limit
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()]],
             None,
             Some(3),
@@ -651,7 +651,7 @@ mod tests {
         .await;
 
         // return all because fetch limit is larger
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()]],
             None,
             Some(7),
@@ -724,7 +724,7 @@ mod tests {
 
         // [b1, b2]
         // return all by not specifying fetch limit
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
             None, // no fetch limit --> return all rows
@@ -737,7 +737,7 @@ mod tests {
 
         // [b1, b2]
         // return all by specifying large limit
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
             Some(10), // limit = max num rows --> return all rows
@@ -750,7 +750,7 @@ mod tests {
 
         // [b2, b1]
         // return all by not specifying fetch limit
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
             None,
@@ -763,7 +763,7 @@ mod tests {
 
         // [b2, b1]
         // return all by specifying large limit
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b2], vec![b1]],
             None,
             Some(20),
@@ -799,7 +799,7 @@ mod tests {
         let b2 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
         // [b1, b2]
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
             None,
@@ -824,7 +824,7 @@ mod tests {
         .await;
 
         // [b2, b1]
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b2], vec![b1]],
             None,
             None,
@@ -875,7 +875,7 @@ mod tests {
         // [b2, b1]
         // b2 has 3 rows. b1 has 5 rows
         // Fetch limit is 1 --> return the first row of the first batch (b2)
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
             Some(1),
@@ -895,7 +895,7 @@ mod tests {
         // [b1, b2]
         // b1 has 5 rows. b2 has 3 rows
         // Fetch limit is 1 --> return the first row of the first batch (b1)
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1], vec![b2]],
             None,
             Some(1),
@@ -939,7 +939,7 @@ mod tests {
         // [b2, b1]
         // b2 has 3 rows. b1 has 5 rows
         // Fetch limit is 3 --> return all 3 rows of the first batch (b2) that covers that limit
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
             Some(3),
@@ -961,7 +961,7 @@ mod tests {
         // [b1, b2]
         // b1 has 5 rows. b2 has 3 rows
         // Fetch limit is 5 --> return all 5 rows of first batch (b1) that covers that limit
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1], vec![b2]],
             None,
             Some(5),
@@ -1009,7 +1009,7 @@ mod tests {
         // [b2, b1]
         // b2 has 3 rows. b1 has 5 rows
         // Fetch limit is 4 --> return all of b2 plus the first row of b1
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
             Some(4),
@@ -1032,7 +1032,7 @@ mod tests {
         // [b1, b2]
         // b1 has 5 rows. b2 has 3 rows
         // Fetch limit is 6 --> return all of b1 plus the first row of b2
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1], vec![b2]],
             None,
             Some(6),
@@ -1091,7 +1091,7 @@ mod tests {
         // [b1, b2, b3]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows
         // Fetch limit is 1 --> return the first row of b1
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()], vec![b2.clone()], vec![b3.clone()]],
             None,
             Some(1),
@@ -1111,7 +1111,7 @@ mod tests {
         // [b1, b2, b3]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows
         // Fetch limit is 7 --> return all rows of b1 plus the first 2 rows of b2
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1.clone()], vec![b2.clone()], vec![b3.clone()]],
             None,
             Some(7),
@@ -1137,7 +1137,7 @@ mod tests {
         // [b1, b2, b3]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows
         // Fetch limit is 50 --> return all rows of all batches in the order of b1, b2, b3
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[vec![b1], vec![b2], vec![b3]],
             None,
             Some(50),
@@ -1212,7 +1212,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 0 --> return nothing.
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[
                 vec![b1.clone()],
                 vec![b2.clone()],
@@ -1231,7 +1231,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 3 --> return the first 3 rows of b1
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[
                 vec![b1.clone()],
                 vec![b2.clone()],
@@ -1258,7 +1258,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 5 --> return all 5 rows of b1
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[
                 vec![b1.clone()],
                 vec![b2.clone()],
@@ -1288,7 +1288,7 @@ mod tests {
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 8 --> return all 8 rows of b1 and b2
         // Fetched 3 input streams since we will always prefetch one extra one
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[
                 vec![b1.clone()],
                 vec![b2.clone()],
@@ -1321,7 +1321,7 @@ mod tests {
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 12 --> return all 12 rows of b1, b2 and b3
         // Fetches 4 input streams since we will always prefetch one extra one
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[
                 vec![b1.clone()],
                 vec![b2.clone()],
@@ -1358,7 +1358,7 @@ mod tests {
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // Fetch limit is 15 --> return all 15 rows of b1, b2, b3 and b4
         // Fetches all 4 input streams
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[
                 vec![b1.clone()],
                 vec![b2.clone()],
@@ -1396,7 +1396,7 @@ mod tests {
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
         // No fetch limit--> return all 15 rows of b1, b2, b3 and b4
-        _test_progressive_eval(
+        run_progressive_eval_test(
             &[
                 vec![b1.clone()],
                 vec![b2.clone()],
@@ -1432,7 +1432,7 @@ mod tests {
         .await;
     }
 
-    async fn _test_progressive_eval(
+    async fn run_progressive_eval_test(
         partitions: &[Vec<RecordBatch>],
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
