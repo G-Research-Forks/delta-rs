@@ -73,7 +73,10 @@ pub(crate) struct ProgressiveEvalExec {
 }
 
 impl ProgressiveEvalExec {
-    /// Create a new progressive-evaluation execution plan
+    /// Create a new progressive-evaluation execution plan.
+    ///
+    // Requires that the input partitions are in order with respect to the input ordering,
+    // and non-overlapping.
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
@@ -96,7 +99,9 @@ impl ProgressiveEvalExec {
 
     /// Creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
     fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
-        // Progressive eval does not change the equivalence properties of its input
+        // Progressive eval does not change the equivalence properties of its input.
+        // This assumes that if the input is ordered, then the input partitions are non-overlapping
+        // with respect to the ordering and in-order.
         let eq_properties = input.equivalence_properties().clone();
 
         // This node serializes all the data to a single partition
