@@ -858,6 +858,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_multiple_batches_per_partition() {
+        let task_ctx = Arc::new(TaskContext::default());
+        let make_batch = |values: Vec<i32>| {
+            let a: ArrayRef = Arc::new(Int32Array::from(values));
+            RecordBatch::try_from_iter(vec![("a", a)]).unwrap()
+        };
+        let partitions = [
+            vec![make_batch(vec![1, 2]), make_batch(vec![3, 4])],
+            vec![make_batch(vec![5, 6]), make_batch(vec![7, 8])],
+        ];
+
+        // No fetch limit: all batches of all partitions are returned in
+        // partition order
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            None,
+            &[
+                "+---+", "| a |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "| 6 |",
+                "| 7 |", "| 8 |", "+---+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are fetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // Fetch limit in the middle of the first partition's second batch:
+        // that batch is truncated
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(3),
+            &[
+                "+---+", "| a |", "+---+", "| 1 |", "| 2 |", "| 3 |", "+---+",
+            ],
+            2, // 2 input streams
+            2, // the second stream is prefetched even though it is never polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // Fetch limit exactly at the end of the first partition: both of its
+        // batches are returned untruncated and nothing from the second
+        // partition is emitted
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(4),
+            &[
+                "+---+", "| a |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "+---+",
+            ],
+            2, // 2 input streams
+            2, // the second stream is prefetched even though it is never polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // Fetch limit in the middle of the second partition's first batch:
+        // all of the first partition plus a truncated batch from the second
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(5),
+            &[
+                "+---+", "| a |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are fetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // With prefetch disabled, a fetch limit satisfied part-way through
+        // the first partition's batches never starts the second stream
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(3),
+            &[
+                "+---+", "| a |", "+---+", "| 1 |", "| 2 |", "| 3 |", "+---+",
+            ],
+            2, // 2 input streams
+            1, // only the first stream is started
+            task_ctx_with_prefetch_depth(0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_fetch_limit_1() {
         let task_ctx = Arc::new(TaskContext::default());
         let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 7, 9, 3]));
