@@ -18,6 +18,7 @@
 //! Defines the progressive eval plan
 
 use std::borrow::Cow::Borrowed;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -298,7 +299,7 @@ struct InputStreams {
     current_input_stream: Option<SendableRecordBatchStream>,
 
     /// Prefetched Input streams
-    prefetched_input_streams: Vec<SendableRecordBatchStream>,
+    prefetched_input_streams: VecDeque<SendableRecordBatchStream>,
 
     /// Used to record number of actually read input streams
     num_read_inputs_counter: Count,
@@ -321,9 +322,10 @@ impl InputStreams {
         // The capacity required for prefetched streams is 1 more than the number of streams to
         // prefetch, because we push a new stream before popping the new current stream. It is
         // also bounded by the total number of inputs, excluding the current stream.
-        let prefetch_capacity =
-            num_input_streams_to_prefetch.saturating_add(1).min(input_stream_count.saturating_sub(1));
-        let mut prefetched_input_streams = Vec::with_capacity(prefetch_capacity);
+        let prefetch_capacity = num_input_streams_to_prefetch
+            .saturating_add(1)
+            .min(input_stream_count.saturating_sub(1));
+        let mut prefetched_input_streams = VecDeque::with_capacity(prefetch_capacity);
 
         // Always start fetching the first input stream, and also start
         // fetching an additional `num_input_streams_to_prefetch` inputs.
@@ -341,7 +343,7 @@ impl InputStreams {
             if i == 0 {
                 current_input_stream = Some(input_stream);
             } else {
-                prefetched_input_streams.push(input_stream);
+                prefetched_input_streams.push_back(input_stream);
             }
         }
 
@@ -376,7 +378,7 @@ impl InputStreams {
                 self.current_stream_idx + self.num_input_streams_to_prefetch + 1;
             if next_prefetch_idx < self.input_stream_count {
                 self.num_read_inputs_counter.add(1);
-                self.prefetched_input_streams.push(spawn_buffered(
+                self.prefetched_input_streams.push_back(spawn_buffered(
                     self.input_plan
                         .execute(next_prefetch_idx, Arc::<TaskContext>::clone(&self.context))?,
                     1,
@@ -384,11 +386,7 @@ impl InputStreams {
             }
 
             self.current_stream_idx += 1;
-            if self.prefetched_input_streams.is_empty() {
-                self.current_input_stream = None;
-            } else {
-                self.current_input_stream = Some(self.prefetched_input_streams.remove(0));
-            }
+            self.current_input_stream = self.prefetched_input_streams.pop_front();
         }
         Ok(())
     }
