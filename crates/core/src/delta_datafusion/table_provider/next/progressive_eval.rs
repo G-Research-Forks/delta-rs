@@ -530,8 +530,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
+    use datafusion::common::DataFusionError;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::metrics::Timestamp;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionConfig;
     use datafusion_datasource::memory::MemorySourceConfig;
     use futures::FutureExt;
 
@@ -1432,6 +1435,101 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn test_prefetch_depth_config() {
+        let make_partition = |values: Vec<i32>| {
+            let a: ArrayRef = Arc::new(Int32Array::from(values));
+            vec![RecordBatch::try_from_iter(vec![("a", a)]).unwrap()]
+        };
+        let partitions = [
+            make_partition(vec![1, 2]),
+            make_partition(vec![3, 4]),
+            make_partition(vec![5, 6]),
+            make_partition(vec![7, 8]),
+        ];
+
+        let first_row = ["+---+", "| a |", "+---+", "| 1 |", "+---+"];
+        let first_batch = ["+---+", "| a |", "+---+", "| 1 |", "| 2 |", "+---+"];
+        let all_rows = [
+            "+---+", "| a |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "| 6 |",
+            "| 7 |", "| 8 |", "+---+",
+        ];
+
+        // Prefetch depth 0: only the stream being polled is started, so a
+        // fetch limit satisfied by the first stream reads nothing else
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(1),
+            &first_row,
+            4, // 4 input streams
+            1, // only the first stream is started
+            task_ctx_with_prefetch_depth(0),
+        )
+        .await;
+
+        // Prefetch depth 0 without a fetch limit: streams are started one at
+        // a time until all of them have been read
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            None,
+            &all_rows,
+            4, // 4 input streams
+            4, // all streams are eventually read
+            task_ctx_with_prefetch_depth(0),
+        )
+        .await;
+
+        // Prefetch depth 2: the current stream plus two more are started up
+        // front. The fetch limit is satisfied by the first stream, so no
+        // further streams are started
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(2),
+            &first_batch,
+            4, // 4 input streams
+            3, // the current stream plus 2 prefetched streams are started
+            task_ctx_with_prefetch_depth(2),
+        )
+        .await;
+
+        // Prefetch depth 3: all four streams are started up front even
+        // though only the first one is polled
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(1),
+            &first_row,
+            4, // 4 input streams
+            4, // all streams are started up front
+            task_ctx_with_prefetch_depth(3),
+        )
+        .await;
+
+        // A prefetch depth larger than the number of streams is capped
+        run_progressive_eval_test(
+            &partitions,
+            None,
+            Some(1),
+            &first_row,
+            4, // 4 input streams
+            4, // all streams are started up front
+            task_ctx_with_prefetch_depth(10),
+        )
+        .await;
+    }
+
+    /// Create a task context whose session config sets
+    /// `delta.progressive_eval_num_prefetch_input_streams` to `depth`
+    fn task_ctx_with_prefetch_depth(depth: usize) -> Arc<TaskContext> {
+        let mut options = DeltaConfigOptions::default();
+        options.progressive_eval_num_prefetch_input_streams = depth;
+        let config = SessionConfig::new().with_option_extension(options);
+        Arc::new(TaskContext::default().with_session_config(config))
+    }
+
     async fn run_progressive_eval_test(
         partitions: &[Vec<RecordBatch>],
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
@@ -1685,6 +1783,128 @@ mod tests {
     impl RecordBatchStream for BlockingStream {
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_in_first_stream_aborts_output() {
+        let task_ctx = Arc::new(TaskContext::default());
+        let exec = Arc::new(ErrorExec::new(2, 0));
+        let progressive = ProgressiveEvalExec::new(exec, None, None);
+
+        let mut stream = progressive.execute(0, task_ctx).unwrap();
+
+        let batch = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("error in partition 0"), "{err}");
+
+        // The error aborts the output stream: the second input stream still
+        // holds valid data, but it must not be emitted
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_error_in_later_stream_propagates() {
+        let task_ctx = Arc::new(TaskContext::default());
+        let exec = Arc::new(ErrorExec::new(3, 1));
+        let progressive = ProgressiveEvalExec::new(exec, None, None);
+
+        let mut stream = progressive.execute(0, task_ctx).unwrap();
+
+        // Data before the error arrives intact: all of partition 0
+        // and the first batch of partition 1
+        let batch = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let batch = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("error in partition 1"), "{err}");
+
+        // Partition 2 is not emitted after the error
+        assert!(stream.next().await.is_none());
+    }
+
+    /// An execution plan whose partitions each yield one two-row batch, with
+    /// the `err_partition` stream yielding an error after its batch. Used to
+    /// verify error propagation.
+    #[derive(Debug)]
+    struct ErrorExec {
+        schema: SchemaRef,
+        cache: Arc<PlanProperties>,
+        err_partition: usize,
+    }
+
+    impl ErrorExec {
+        fn new(n_partitions: usize, err_partition: usize) -> Self {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            let cache = Arc::new(PlanProperties::new(
+                datafusion::physical_expr::EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(n_partitions),
+                EmissionType::Incremental,
+                datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+            ));
+            Self {
+                schema,
+                cache,
+                err_partition,
+            }
+        }
+    }
+
+    impl DisplayAs for ErrorExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "ErrorExec")
+        }
+    }
+
+    impl ExecutionPlan for ErrorExec {
+        fn name(&self) -> &'static str {
+            "ErrorExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.cache
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            internal_err!("ErrorExec has no children")
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let a: ArrayRef = Arc::new(Int32Array::from(vec![
+                (partition * 2 + 1) as i32,
+                (partition * 2 + 2) as i32,
+            ]));
+            let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![a]).unwrap();
+            let mut items = vec![Ok(batch)];
+            if partition == self.err_partition {
+                items.push(Err(DataFusionError::Execution(format!(
+                    "error in partition {partition}"
+                ))));
+            }
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                futures::stream::iter(items),
+            )))
         }
     }
 }
