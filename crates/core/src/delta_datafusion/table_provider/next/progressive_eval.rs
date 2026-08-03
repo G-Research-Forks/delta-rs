@@ -318,7 +318,12 @@ impl InputStreams {
 
         let current_stream_idx = 0;
         let mut current_input_stream = None;
-        let mut prefetched_input_streams = Vec::with_capacity(num_input_streams_to_prefetch);
+        // The capacity required for prefetched streams is 1 more than the number of streams to
+        // prefetch, because we push a new stream before popping the new current stream. It is
+        // also bounded by the total number of inputs, excluding the current stream.
+        let prefetch_capacity =
+            num_input_streams_to_prefetch.saturating_add(1).min(input_stream_count.saturating_sub(1));
+        let mut prefetched_input_streams = Vec::with_capacity(prefetch_capacity);
 
         // Always start fetching the first input stream, and also start
         // fetching an additional `num_input_streams_to_prefetch` inputs.
