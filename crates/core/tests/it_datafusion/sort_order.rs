@@ -873,7 +873,8 @@ async fn delta_table_overlapping_files_beyond_group_cap_fall_back() -> TestResul
 //   above a scan that benefits from input partitioning.
 //   `RepartitionExec::partition_statistics` marks all column statistics
 //   inexact, so `ProgressiveEvalRule` bails.
-//   `DeltaScanExec::benefits_from_input_partitioning` opts out of this.
+//   `DeltaScanExec::benefits_from_input_partitioning` opts out of this
+//   when the scan declares an output ordering.
 // - `repartition_file_scans` splits single-file groups into byte ranges at
 //   the source. Each range carries the whole file's statistics, so
 //   partitions reading ranges of the same file have overlapping min/max and
@@ -954,6 +955,42 @@ async fn delta_table_more_target_partitions_than_files_uses_progressive_eval() -
         !rendered.contains("SortPreservingMergeExec"),
         "expected no SortPreservingMergeExec in plan:\n{rendered}"
     );
+    assert_eq!(timestamps.len(), 200);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// Without a declared sort order there are no ordering claims to protect, so
+/// the scan keeps the default behaviour and benefits from input partitioning:
+/// a round-robin `RepartitionExec` raises the scan's parallelism to the
+/// target partition count.
+#[tokio::test]
+async fn delta_table_unordered_scan_gets_round_robin_repartition() -> TestResult<()> {
+    let table = overlapping_delta_table(two_non_overlapping_files()).await?;
+
+    let ctx = create_session().into_inner();
+    for (key, value) in MANY_CORE_OPTIONS
+        .iter()
+        .copied()
+        .chain([("datafusion.optimizer.repartition_file_scans", "false")])
+    {
+        ctx.sql(&format!("SET {key} = {value}")).await?;
+    }
+    let provider = table.table_provider().await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        rendered.contains("RoundRobinBatch"),
+        "expected round-robin RepartitionExec in plan:\n{rendered}"
+    );
+
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let timestamps = collect_timestamps(&batches);
     assert_eq!(timestamps.len(), 200);
     assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
     Ok(())
