@@ -74,6 +74,17 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
 /// be ordered with respect to each other.
 /// If this is the case, return a vector of the (start, end) range for the first
 /// sort term from each partition, otherwise return None.
+///
+/// Each partition boundary is checked by walking the sort columns: a strictly
+/// ordered column proves the boundary (later columns are irrelevant), an equal
+/// column defers to the next one, and an out-of-order column rejects. The
+/// min/max statistics used for these comparisons exclude nulls, so a
+/// comparison at a column is only valid when nulls cannot hide on the wrong
+/// side of the boundary: nulls sorting last may lurk anywhere in the earlier
+/// partition (including among rows tied on all preceding sort columns, which
+/// they would follow), and nulls sorting first anywhere in the later one.
+/// Columns after a strict break are never relied on, so their nulls are
+/// harmless.
 fn ordered_partition_ranges(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
@@ -82,24 +93,26 @@ fn ordered_partition_ranges(
     // we should allow reordering the partitions.
     let partition_count = plan.output_partitioning().partition_count();
     let mut prev_ends: Vec<ScalarValue> = Vec::new();
+    let mut prev_null_counts: Vec<usize> = Vec::new();
     let mut first_col_ordering = Vec::with_capacity(partition_count);
     for partition_idx in 0..partition_count {
         let partition_stats = plan.partition_statistics(Some(partition_idx)).ok()?;
         let (starts, ends, null_counts) = get_ordering_stats(&partition_stats, ordering)?;
-        for (i, sort_expr) in ordering.iter().enumerate() {
-            if null_counts[i] != 0 {
-                // If there are any nulls, this must either be the first or last partition depending
-                // on whether nulls_first is set.
-                if (sort_expr.options.nulls_first && partition_idx != 0)
-                    || (!sort_expr.options.nulls_first && partition_idx != partition_count - 1)
-                {
+        if partition_idx != 0 {
+            // Check partition is ordered correctly with respect to the previous partition
+            for (i, sort_expr) in ordering.iter().enumerate() {
+                // Reject nulls that could sort onto the wrong side of this
+                // boundary; see the function docs.
+                let boundary_null_count = if sort_expr.options.nulls_first {
+                    null_counts[i]
+                } else {
+                    prev_null_counts[i]
+                };
+                if boundary_null_count != 0 {
                     return None;
                 }
-            }
-            if partition_idx != 0 {
-                // Check partition is ordered correctly with respect to the previous partition.
-                // Incomparable values (partial_cmp is None) bail out rather than being
-                // silently treated as equal.
+                // Incomparable values (partial_cmp is None) bail out rather
+                // than being silently treated as equal.
                 let cmp = starts[i].partial_cmp(&prev_ends[i])?;
                 let cmp = if sort_expr.options.descending {
                     cmp.reverse()
@@ -118,6 +131,7 @@ fn ordered_partition_ranges(
         }
         first_col_ordering.push((starts[0].clone(), ends[0].clone()));
         prev_ends = ends;
+        prev_null_counts = null_counts;
     }
     Some(first_col_ordering)
 }
@@ -365,6 +379,86 @@ mod tests {
             partition(vec![exact_i64(0, 99, 2), exact_i64(0, 10, 0)]),
         ]);
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn nulls_in_deeper_sort_column_hidden_by_first_column_break() {
+        // The middle partition carries a null in the second sort column. Its
+        // boundary with the first partition is strict on the first column, so
+        // the second column is never inspected for it. The boundary with the
+        // last partition is equal on the first column and falls through to
+        // the second: the middle partition's non-null max (4) < the last
+        // partition's min (5) looks ordered, but the middle partition's null
+        // rows sort after every non-null value (nulls last), so a row like
+        // (20, NULL) would precede (20, 5) in the concatenation.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 9, 0), exact_i64(0, 9, 0)]),
+            partition(vec![exact_i64(10, 20, 0), exact_i64(0, 4, 1)]),
+            partition(vec![exact_i64(20, 30, 0), exact_i64(5, 8, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn nulls_in_deeper_sort_column_harmless_when_boundaries_strict_on_first() {
+        // Both of the middle partition's boundaries are strict on the first
+        // column, so the second sort column is never relied on and its nulls
+        // cannot surface out of order.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 9, 0), exact_i64(0, 9, 0)]),
+            partition(vec![exact_i64(10, 19, 0), exact_i64(0, 4, 1)]),
+            partition(vec![exact_i64(20, 30, 0), exact_i64(5, 8, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_some());
+    }
+
+    #[test]
+    fn nulls_in_first_partition_with_all_equal_values_rejected() {
+        // Every partition shares the same value on both sort columns, so no
+        // boundary breaks early and every column is inspected. The first
+        // partition's nulls (sorting last) would surface before the later
+        // partitions' rows; the first boundary must reject them.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 1)]),
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 0)]),
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn nulls_in_middle_partition_with_all_equal_values_rejected() {
+        // As above, but the nulls sit in the middle partition: its boundary
+        // with the *next* partition is the one that must reject them.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 0)]),
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 1)]),
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn nulls_in_last_partition_with_all_equal_values_accepted() {
+        // Nulls sorting last in the last partition stream at the very end of
+        // the concatenation: correct, and there is no later boundary to
+        // invalidate.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 0)]),
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 0)]),
+            partition(vec![exact_i64(5, 5, 0), exact_i64(7, 7, 1)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_some());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, TimestampMicrosecondType};
-use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::physical_plan::displayable;
 use deltalake_core::DeltaTable;
@@ -1310,6 +1310,114 @@ async fn delta_table_nulls_in_last_partition_use_progressive_eval() -> TestResul
         "expected no SortPreservingMergeExec in plan:\n{rendered}"
     );
     assert_sorted_nulls_last(&timestamps);
+    Ok(())
+}
+
+/// Batch over (t: not-null Long, object_id: nullable Long), pre-sorted by
+/// (t ASC, object_id ASC NULLS LAST).
+fn t_id_batch(rows: &[(i64, Option<i64>)]) -> TestResult<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Int64, false),
+        Field::new("object_id", DataType::Int64, true),
+    ]));
+    let ts: Vec<i64> = rows.iter().map(|(t, _)| *t).collect();
+    let ids: Vec<Option<i64>> = rows.iter().map(|(_, id)| *id).collect();
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(Int64Array::from(ids)),
+        ],
+    )?)
+}
+
+/// Nulls in the *second* sort column of a *middle* file must prevent the
+/// `ProgressiveEvalExec` concatenation.
+///
+/// The middle file ends with (20, NULL), which sorts after every non-null
+/// object_id at t = 20 (nulls last), while the last file begins with
+/// (20, 5): statistics min/max exclude nulls, so the middle file's non-null
+/// object_id max (4) < the last file's min (5) makes the boundary look
+/// ordered even though the concatenation emits (20, NULL) before (20, 5).
+/// The merge must be kept for the rows to stream in order.
+#[tokio::test]
+async fn delta_table_nulls_in_second_sort_column_of_middle_file_keep_merge() -> TestResult<()> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "t".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "object_id".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                true,
+            ),
+        ])
+        .await?;
+
+    let files: Vec<Vec<(i64, Option<i64>)>> = vec![
+        // Strictly before the middle file on t, so the middle file's second
+        // sort column is never inspected.
+        (0..10).map(|t| (t, Some(t))).collect(),
+        vec![
+            (10, Some(0)),
+            (12, Some(1)),
+            (14, Some(2)),
+            (16, Some(3)),
+            (20, Some(4)),
+            (20, None),
+        ],
+        vec![(20, Some(5)), (21, Some(6)), (25, Some(7)), (30, Some(8))],
+    ];
+    for rows in &files {
+        table = table
+            .write(vec![t_id_batch(rows)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 3);
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("t"), FileSortColumn::asc("object_id")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT t, object_id FROM test_table ORDER BY t, object_id")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    // Sort key mirroring ORDER BY t, object_id (ASC NULLS LAST).
+    let mut keys: Vec<(i64, bool, i64)> = Vec::new();
+    for batch in &batches {
+        let ts = batch.column(0).as_primitive::<Int64Type>().values();
+        let ids = batch.column(1).as_primitive::<Int64Type>();
+        for (row, t) in ts.iter().enumerate() {
+            let id = ids.is_valid(row).then(|| ids.value(row));
+            keys.push((*t, id.is_none(), id.unwrap_or_default()));
+        }
+    }
+    assert_eq!(keys.len(), 20);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (t, object_id nulls last): {keys:?}"
+    );
+
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
     Ok(())
 }
 
