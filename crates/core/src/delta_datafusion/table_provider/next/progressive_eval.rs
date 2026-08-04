@@ -377,8 +377,10 @@ impl InputStreams {
             self.current_input_stream = None;
         } else {
             // prefetch one more input stream before setting next stream to the current input stream
-            let next_prefetch_idx =
-                self.current_stream_idx + self.num_input_streams_to_prefetch + 1;
+            let next_prefetch_idx = self
+                .current_stream_idx
+                .saturating_add(self.num_input_streams_to_prefetch)
+                .saturating_add(1);
             if next_prefetch_idx < self.input_stream_count {
                 self.num_read_inputs_counter.add(1);
                 self.prefetched_input_streams.push_back(spawn_buffered(
