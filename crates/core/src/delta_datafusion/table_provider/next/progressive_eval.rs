@@ -16,7 +16,7 @@ use datafusion::common::{Result, ScalarValue, Statistics, internal_err};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{Distribution, OrderingRequirements, Partitioning};
 use datafusion::physical_plan::common::spawn_buffered;
-use datafusion::physical_plan::execution_plan::EmissionType;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Metric, MetricBuilder, MetricValue, MetricsSet,
 };
@@ -82,7 +82,7 @@ impl ProgressiveEvalExec {
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
     ) -> Self {
-        let cache = Arc::new(Self::compute_properties(&input));
+        let cache = Arc::new(Self::compute_properties(&input, fetch));
         Self {
             input,
             value_ranges,
@@ -98,7 +98,7 @@ impl ProgressiveEvalExec {
     }
 
     /// Creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
-    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> PlanProperties {
         // Progressive eval does not change the equivalence properties of its input.
         // This assumes that if the input is ordered, then the input partitions are non-overlapping
         // with respect to the ordering and in-order.
@@ -107,11 +107,18 @@ impl ProgressiveEvalExec {
         // This node serializes all the data to a single partition
         let output_partitioning = Partitioning::UnknownPartitioning(1);
 
+        // A fetch limit makes the output finite even if the input is unbounded
+        let boundedness = if fetch.is_some() {
+            Boundedness::Bounded
+        } else {
+            input.boundedness()
+        };
+
         PlanProperties::new(
             eq_properties,
             output_partitioning,
             EmissionType::Incremental,
-            input.boundedness(),
+            boundedness,
         )
     }
 }
@@ -254,14 +261,19 @@ impl ExecutionPlan for ProgressiveEvalExec {
         {
             return internal_err!("ProgressiveEvalExec invalid partition {partition}");
         }
-        // The single output partition carries the input's combined statistics.
-        self.input.partition_statistics(None)
+        // The single output partition carries the input's combined statistics,
+        // capped by the fetch limit if one is set.
+        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
+        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        let mut new_plan = self.clone();
-        new_plan.fetch = limit;
-        Some(Arc::new(new_plan))
+        // Rebuild rather than clone so the cached plan properties reflect the new fetch
+        Some(Arc::new(Self::new(
+            Arc::<dyn ExecutionPlan>::clone(&self.input),
+            self.value_ranges.clone(),
+            limit,
+        )))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -536,6 +548,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
     use datafusion::common::DataFusionError;
+    use datafusion::common::stats::Precision;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::metrics::Timestamp;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1616,6 +1629,68 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn test_partition_statistics_account_for_fetch() {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
+        let batch = RecordBatch::try_from_iter(vec![("a", a)]).unwrap();
+        let schema = batch.schema();
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+
+        // Without a fetch limit the input statistics pass through unchanged
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None);
+        let stats = progressive.partition_statistics(Some(0)).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(5));
+
+        // A fetch limit below the input row count caps the reported row count
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, Some(3));
+        let stats = progressive.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+
+        // A fetch limit above the input row count has no effect
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, Some(10));
+        let stats = progressive.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(5));
+
+        // Setting a fetch limit on an existing plan is reflected in its statistics
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None);
+        let limited = progressive.with_fetch(Some(2)).unwrap();
+        let stats = limited.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(2));
+    }
+
+    #[test]
+    fn test_boundedness_accounts_for_fetch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let input = Arc::new(BlockingExec::new(
+            schema,
+            2,
+            Boundedness::Unbounded {
+                requires_infinite_memory: false,
+            },
+        ));
+
+        // Without a fetch limit an unbounded input makes the output unbounded
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None);
+        assert!(matches!(
+            progressive.properties().boundedness,
+            Boundedness::Unbounded { .. }
+        ));
+
+        // A fetch limit makes the output finite regardless of the input
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, Some(10));
+        assert!(matches!(
+            progressive.properties().boundedness,
+            Boundedness::Bounded
+        ));
+
+        // Removing the fetch limit from an existing plan updates its boundedness
+        let unlimited = progressive.with_fetch(None).unwrap();
+        assert!(matches!(
+            unlimited.properties().boundedness,
+            Boundedness::Unbounded { .. }
+        ));
+    }
+
     /// Create a task context whose session config sets
     /// `delta.progressive_eval_num_prefetch_input_streams` to `depth`
     fn task_ctx_with_prefetch_depth(depth: usize) -> Arc<TaskContext> {
@@ -1757,7 +1832,11 @@ mod tests {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, true)]));
 
-        let blocking_exec = Arc::new(BlockingExec::new(Arc::clone(&schema), 2));
+        let blocking_exec = Arc::new(BlockingExec::new(
+            Arc::clone(&schema),
+            2,
+            Boundedness::Bounded,
+        ));
         let refs = blocking_exec.refs();
         let progressive_exec = Arc::new(ProgressiveEvalExec::new(blocking_exec, None, None));
 
@@ -1794,12 +1873,12 @@ mod tests {
     }
 
     impl BlockingExec {
-        fn new(schema: SchemaRef, n_partitions: usize) -> Self {
+        fn new(schema: SchemaRef, n_partitions: usize, boundedness: Boundedness) -> Self {
             let cache = Arc::new(PlanProperties::new(
                 datafusion::physical_expr::EquivalenceProperties::new(Arc::clone(&schema)),
                 Partitioning::UnknownPartitioning(n_partitions),
                 EmissionType::Incremental,
-                datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                boundedness,
             ));
             Self {
                 schema,
