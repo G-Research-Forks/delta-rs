@@ -143,8 +143,8 @@ whether the streamed rows were actually in order (`sorted`).
   limit)
 - `--prefetch-streams <n>`: sets
   `delta.progressive_eval_num_prefetch_input_streams` — how many scan
-  partitions `ProgressiveEvalExec` executes ahead of the one being streamed,
-  that one included (default 2, minimum 1 = no read-ahead). Higher values
+  partitions `ProgressiveEvalExec` executes ahead of the one being streamed
+  (default 1, minimum 0 = no read-ahead). Higher values
   overlap more read I/O with streaming at the cost of eagerly executing more
   partitions; only affects `declared` runs that plan the progressive-eval
   concatenation.

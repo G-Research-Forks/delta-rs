@@ -126,8 +126,8 @@ enum Command {
         target_partitions: Option<usize>,
 
         /// Number of scan partitions ProgressiveEvalExec executes ahead of
-        /// the one being streamed, that one included (sets
-        /// delta.progressive_eval_num_prefetch_input_streams; default 2).
+        /// the one being streamed (sets
+        /// delta.progressive_eval_num_prefetch_input_streams).
         /// Only affects plans that use the progressive-eval concatenation.
         #[arg(long)]
         prefetch_streams: Option<usize>,

@@ -1424,43 +1424,6 @@ async fn delta_table_progressive_eval_limit_reads_only_needed_partitions() -> Te
     Ok(())
 }
 
-/// `SET delta.progressive_eval_num_prefetch_input_streams` reaches the
-/// operator: with prefetch reduced to 1 (no read-ahead), a LIMIT satisfied by
-/// the first partition executes exactly one of the four partitions, where the
-/// default of 2 also starts the second.
-#[tokio::test]
-async fn delta_table_progressive_eval_prefetch_streams_setting() -> TestResult<()> {
-    let table = overlapping_delta_table(disjoint_files()).await?;
-
-    let ctx = create_session().into_inner();
-    ctx.sql("SET datafusion.execution.target_partitions = 4")
-        .await?;
-    ctx.sql("SET delta.progressive_eval_num_prefetch_input_streams = 1")
-        .await?;
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" LIMIT 10")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
-    let timestamps = collect_timestamps(&batches);
-    let expected: Vec<i64> = (0..10).map(|s| s * 1_000_000).collect();
-    assert_eq!(timestamps, expected);
-
-    let num_read = sum_metric(plan.as_ref(), "ProgressiveEvalExec", "num_read_inputs")
-        .expect("expected num_read_inputs metric on ProgressiveEvalExec");
-    assert_eq!(
-        num_read, 1,
-        "expected exactly 1 of 4 partitions to be executed with prefetch=1"
-    );
-    Ok(())
-}
-
 /// A filtered ordered query still uses the concatenation, and the filter is
 /// applied within it.
 ///

@@ -5,7 +5,7 @@
 //! ordered stream. That merge compares rows across all partitions and executes every
 //! partition up front.
 //! If the partitions are non-overlapping with respect to the sort order, then
-//! this merge is unnecessary and we can stream the partitions one after another
+//! this merge is unnecessary, and we can stream the partitions one after another
 //! using a [`ProgressiveEvalExec`].
 
 use arrow_schema::SchemaRef;
@@ -91,9 +91,9 @@ fn ordered_partition_ranges(
             if null_counts[i] != 0 {
                 // If there are any nulls, this must either be the first or last partition depending
                 // on whether nulls_first is set.
-                if sort_expr.options.nulls_first && partition_idx != 0 {
-                    return None;
-                } else if !sort_expr.options.nulls_first && partition_idx != partition_count - 1 {
+                if (sort_expr.options.nulls_first && partition_idx != 0)
+                    || (!sort_expr.options.nulls_first && partition_idx != partition_count - 1)
+                {
                     return None;
                 }
             }
@@ -110,14 +110,12 @@ fn ordered_partition_ranges(
                         // Equal, need to check next sort expression
                         continue;
                     }
+                } else if starts[i] > prev_ends[i] {
+                    break;
+                } else if starts[i] < prev_ends[i] {
+                    return None;
                 } else {
-                    if starts[i] > prev_ends[i] {
-                        break;
-                    } else if starts[i] < prev_ends[i] {
-                        return None;
-                    } else {
-                        continue;
-                    }
+                    continue;
                 }
             }
         }
@@ -137,12 +135,8 @@ fn get_ordering_stats(
     let mut null_counts = Vec::with_capacity(ordering.len());
 
     for sort_expr in ordering.iter() {
-        let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
-            return None;
-        };
-        let Ok(col_index) = schema.index_of(column.name()) else {
-            break;
-        };
+        let column = sort_expr.expr.downcast_ref::<Column>()?;
+        let col_index = schema.index_of(column.name()).ok()?;
         let col_stats = &stats.column_statistics[col_index];
         // We require exact stats to guarantee no overlap in partition ranges.
         if !(col_stats.null_count.is_exact()?
@@ -164,7 +158,7 @@ fn get_ordering_stats(
         };
         starts.push(start.clone());
         ends.push(end.clone());
-        null_counts.push(col_stats.null_count.get_value()?.clone());
+        null_counts.push(*col_stats.null_count.get_value()?);
     }
 
     Some((starts, ends, null_counts))

@@ -221,11 +221,7 @@ fn null_free_ordering_prefix(
 ///
 /// Produces exactly `target_partitions` groups (fewer only when there are not
 /// enough files, more only to stay within the file-id dictionary key space),
-/// with group sizes differing by at most one file. Falling short of the
-/// target partition count would make DataFusion repartition the scan for
-/// parallelism, splitting and interleaving the files across partitions and
-/// invalidating both the declared ordering and the range-ordered-partitions
-/// claim.
+/// with group sizes differing by at most one file.
 fn chunk_ordered_files(files: Vec<PartitionedFile>, target_partitions: usize) -> Vec<FileGroup> {
     let num_files = files.len().max(1);
     let num_groups = target_partitions

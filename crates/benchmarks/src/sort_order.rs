@@ -289,7 +289,7 @@ pub struct SortBenchParams {
     pub target_partitions: Option<usize>,
     /// Override `delta.progressive_eval_num_prefetch_input_streams`: how many
     /// scan partitions `ProgressiveEvalExec` executes ahead of the one being
-    /// streamed, that one included (default 2).
+    /// streamed.
     pub prefetch_streams: Option<usize>,
     /// Verify that the streamed timestamps are globally non-decreasing. Off by
     /// default because the per-row check adds time to the measured run.
