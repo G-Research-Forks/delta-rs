@@ -8,7 +8,6 @@
 //! this merge is unnecessary, and we can stream the partitions one after another
 //! using a [`ProgressiveEvalExec`].
 
-use arrow_schema::SchemaRef;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Statistics;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -20,6 +19,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
 
 use super::progressive_eval::ProgressiveEvalExec;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// Replace [`SortPreservingMergeExec`] with [`ProgressiveEvalExec`] when its
@@ -83,10 +83,9 @@ fn ordered_partition_ranges(
     let partition_count = plan.output_partitioning().partition_count();
     let mut prev_ends: Vec<ScalarValue> = Vec::new();
     let mut first_col_ordering = Vec::with_capacity(partition_count);
-    let schema = plan.schema();
     for partition_idx in 0..partition_count {
         let partition_stats = plan.partition_statistics(Some(partition_idx)).ok()?;
-        let (starts, ends, null_counts) = get_ordering_stats(&partition_stats, ordering, &schema)?;
+        let (starts, ends, null_counts) = get_ordering_stats(&partition_stats, ordering)?;
         for (i, sort_expr) in ordering.iter().enumerate() {
             if null_counts[i] != 0 {
                 // If there are any nulls, this must either be the first or last partition depending
@@ -98,24 +97,22 @@ fn ordered_partition_ranges(
                 }
             }
             if partition_idx != 0 {
-                // Check partition is ordered correctly with respect to the previous partition
-                if sort_expr.options.descending {
-                    if starts[i] < prev_ends[i] {
-                        // In order
-                        break;
-                    } else if starts[i] > prev_ends[i] {
-                        // Out of order
-                        return None;
-                    } else {
-                        // Equal, need to check next sort expression
-                        continue;
-                    }
-                } else if starts[i] > prev_ends[i] {
-                    break;
-                } else if starts[i] < prev_ends[i] {
-                    return None;
+                // Check partition is ordered correctly with respect to the previous partition.
+                // Incomparable values (partial_cmp is None) bail out rather than being
+                // silently treated as equal.
+                let cmp = starts[i].partial_cmp(&prev_ends[i])?;
+                let cmp = if sort_expr.options.descending {
+                    cmp.reverse()
                 } else {
-                    continue;
+                    cmp
+                };
+                match cmp {
+                    // In order
+                    Ordering::Greater => break,
+                    // Out of order
+                    Ordering::Less => return None,
+                    // Equal, need to check next sort expression
+                    Ordering::Equal => continue,
                 }
             }
         }
@@ -128,7 +125,6 @@ fn ordered_partition_ranges(
 fn get_ordering_stats(
     stats: &Arc<Statistics>,
     ordering: &LexOrdering,
-    schema: &SchemaRef,
 ) -> Option<(Vec<ScalarValue>, Vec<ScalarValue>, Vec<usize>)> {
     let mut starts = Vec::with_capacity(ordering.len());
     let mut ends = Vec::with_capacity(ordering.len());
@@ -136,8 +132,7 @@ fn get_ordering_stats(
 
     for sort_expr in ordering.iter() {
         let column = sort_expr.expr.downcast_ref::<Column>()?;
-        let col_index = schema.index_of(column.name()).ok()?;
-        let col_stats = &stats.column_statistics[col_index];
+        let col_stats = stats.column_statistics.get(column.index())?;
         // We require exact stats to guarantee no overlap in partition ranges.
         if !(col_stats.null_count.is_exact()?
             && col_stats.min_value.is_exact()?
