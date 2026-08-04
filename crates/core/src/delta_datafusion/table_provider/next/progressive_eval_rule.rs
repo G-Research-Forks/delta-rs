@@ -158,3 +158,276 @@ fn get_ordering_stats(
 
     Some((starts, ends, null_counts))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
+    use datafusion::common::stats::{ColumnStatistics, Precision};
+    use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
+
+    /// Leaf plan reporting fixed per-partition statistics; never executed.
+    #[derive(Debug)]
+    struct StatsExec {
+        stats: Vec<Statistics>,
+        cache: Arc<PlanProperties>,
+    }
+
+    impl StatsExec {
+        fn new(stats: Vec<Statistics>) -> Arc<dyn ExecutionPlan> {
+            let cache = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(test_schema()),
+                Partitioning::UnknownPartitioning(stats.len()),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ));
+            Arc::new(Self { stats, cache })
+        }
+    }
+
+    impl DisplayAs for StatsExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "StatsExec")
+        }
+    }
+
+    impl ExecutionPlan for StatsExec {
+        fn name(&self) -> &'static str {
+            "StatsExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.cache
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            unimplemented!("StatsExec is only used for planning")
+        }
+
+        fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+            match partition {
+                Some(idx) => Ok(Arc::new(self.stats[idx].clone())),
+                None => Ok(Arc::new(Statistics::new_unknown(&self.schema()))),
+            }
+        }
+    }
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("t", DataType::Int64, true),
+            Field::new("id", DataType::Int64, true),
+        ]))
+    }
+
+    fn sort_expr(index: usize, name: &str, options: SortOptions) -> PhysicalSortExpr {
+        PhysicalSortExpr::new(Arc::new(Column::new(name, index)), options)
+    }
+
+    fn asc(index: usize, name: &str) -> PhysicalSortExpr {
+        sort_expr(
+            index,
+            name,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )
+    }
+
+    fn desc(index: usize, name: &str) -> PhysicalSortExpr {
+        sort_expr(
+            index,
+            name,
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )
+    }
+
+    fn exact_i64(min: i64, max: i64, null_count: usize) -> ColumnStatistics {
+        ColumnStatistics {
+            null_count: Precision::Exact(null_count),
+            min_value: Precision::Exact(ScalarValue::Int64(Some(min))),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(max))),
+            ..Default::default()
+        }
+    }
+
+    fn partition(column_statistics: Vec<ColumnStatistics>) -> Statistics {
+        Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Exact(100),
+            column_statistics,
+        }
+    }
+
+    #[test]
+    fn equal_first_column_boundary_ordered_by_second_column() {
+        // The partitions share t = 100 on the boundary; the disjoint id
+        // ranges disambiguate, so the check falls through to the second
+        // sort column and accepts.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(100, 200, 0), exact_i64(11, 20, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        let ranges = ordered_partition_ranges(&plan, &ordering).expect("expected ranges");
+        assert_eq!(
+            ranges,
+            vec![
+                (ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(100))),
+                (ScalarValue::Int64(Some(100)), ScalarValue::Int64(Some(200))),
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_first_column_boundary_overlapping_second_column() {
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(100, 200, 0), exact_i64(5, 20, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn boundary_equal_on_all_sort_columns_is_accepted() {
+        // min == prev max on every sort column bounds all rows of both
+        // partitions, so concatenation is still (non-strictly) ordered.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(100, 200, 0), exact_i64(10, 20, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_some());
+    }
+
+    #[test]
+    fn nulls_only_allowed_in_last_partition_for_nulls_last() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        // Nulls in the last partition sort after all values: accepted.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 99, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(100, 200, 2), exact_i64(0, 10, 0)]),
+        ]);
+        assert!(ordered_partition_ranges(&plan, &ordering).is_some());
+
+        // Nulls in the first partition would surface mid-stream: rejected.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 99, 2), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(100, 200, 0), exact_i64(0, 10, 0)]),
+        ]);
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn nulls_only_allowed_in_first_partition_for_nulls_first() {
+        let ordering = LexOrdering::new(vec![desc(0, "t")]).unwrap();
+
+        // Descending partitions with nulls leading in the first: accepted.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(100, 200, 2), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(0, 99, 0), exact_i64(0, 10, 0)]),
+        ]);
+        assert!(ordered_partition_ranges(&plan, &ordering).is_some());
+
+        // Nulls in the last partition sort before its values: rejected.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(100, 200, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(0, 99, 2), exact_i64(0, 10, 0)]),
+        ]);
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn descending_partitions_out_of_order() {
+        // Ascending partition layout under a descending ordering.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 99, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(100, 200, 0), exact_i64(0, 10, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![desc(0, "t")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn incomparable_statistics_types_bail_out() {
+        // Mismatched stat types across partitions are incomparable; they
+        // must not be treated as an equal boundary.
+        let utf8 = |value: &str| ScalarValue::Utf8(Some(value.to_string()));
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    min_value: Precision::Exact(utf8("a")),
+                    max_value: Precision::Exact(utf8("b")),
+                    ..Default::default()
+                },
+                exact_i64(0, 10, 0),
+            ]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn inexact_statistics_bail_out() {
+        let inexact = ColumnStatistics {
+            null_count: Precision::Exact(0),
+            min_value: Precision::Inexact(ScalarValue::Int64(Some(100))),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(200))),
+            ..Default::default()
+        };
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 99, 0), exact_i64(0, 10, 0)]),
+            partition(vec![inexact, exact_i64(0, 10, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn missing_column_statistics_bail_out() {
+        // The ordering references a column index beyond the available
+        // statistics; the lookup must bail out rather than panic.
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 99, 0)]),
+            partition(vec![exact_i64(100, 200, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(1, "id")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+}

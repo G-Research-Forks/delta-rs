@@ -465,6 +465,123 @@ async fn delta_table_multi_column_sort_order_avoids_sort() -> TestResult<()> {
     Ok(())
 }
 
+/// Batch sorted by (t, object_id) covering `t_start..=t_end` (inclusive, so
+/// adjacent files can share a boundary value) with one row per (t, id) for
+/// the given ids. The first sort column is an integer: delta-rs pads
+/// timestamp max statistics up to the next millisecond, so an exactly equal
+/// boundary is only provable from statistics for non-timestamp columns.
+fn shared_boundary_batch(t_start: i64, t_end: i64, ids: &[i64]) -> TestResult<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Int64, false),
+        Field::new("object_id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let mut ts = Vec::new();
+    let mut object_ids = Vec::new();
+    let mut values = Vec::new();
+    for t in t_start..=t_end {
+        for &id in ids {
+            ts.push(t);
+            object_ids.push(id);
+            values.push(t * 100 + id);
+        }
+    }
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(Int64Array::from(object_ids)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+/// Create a table of two files sorted by (t, object_id) that share the
+/// boundary value t = 100: the first file holds object ids {0, 1} and the
+/// second ids {2, 3}, so at the boundary the files are ordered only by
+/// virtue of the second sort column.
+async fn shared_boundary_delta_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "t".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "object_id".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for (t_start, t_end, ids) in [(0i64, 100i64, [0i64, 1]), (100, 200, [2, 3])] {
+        table = table
+            .write(vec![shared_boundary_batch(t_start, t_end, &ids)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+    Ok(table)
+}
+
+/// Two files share the boundary value of the first sort column, so it alone
+/// cannot prove the scan partitions ordered; the disjoint object-id ranges
+/// can. The equal-boundary check falls through to the second sort column and
+/// the merge is still replaced by the `ProgressiveEvalExec` concatenation.
+#[tokio::test]
+async fn delta_table_shared_boundary_value_ordered_by_second_column() -> TestResult<()> {
+    let table = shared_boundary_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("t"), FileSortColumn::asc("object_id")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT t, object_id, value FROM test_table ORDER BY t, object_id")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+
+    let mut keys: Vec<(i64, i64)> = Vec::new();
+    for batch in &batches {
+        let ts = batch.column(0).as_primitive::<Int64Type>().values();
+        let object_ids = batch.column(1).as_primitive::<Int64Type>().values();
+        keys.extend(ts.iter().copied().zip(object_ids.iter().copied()));
+    }
+    // Two files x 101 values of t x 2 object ids.
+    assert_eq!(keys.len(), 2 * 101 * 2);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (t, object_id)"
+    );
+    Ok(())
+}
+
 /// An ORDER BY over a prefix of the declared multi-column sort order is
 /// satisfied by the declared ordering without a `SortExec`, and the
 /// non-overlapping files allow the `ProgressiveEvalExec` concatenation.
@@ -1137,6 +1254,60 @@ async fn delta_table_sort_order_with_nulls_single_file_groups_avoids_sort() -> T
     assert!(
         rendered.contains("SortPreservingMergeExec"),
         "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert_sorted_nulls_last(&timestamps);
+    Ok(())
+}
+
+/// Create a table like [`nullable_sorted_delta_table`] but with the nulls
+/// confined to the second (last) file.
+async fn nulls_in_last_file_delta_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                true,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for (start, nulls) in [(0i64, 0usize), (100, 2)] {
+        table = table
+            .write(vec![nullable_batch((start..start + 100).collect(), nulls)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+    Ok(table)
+}
+
+/// Nulls in the sort column are compatible with the `ProgressiveEvalExec`
+/// concatenation when they are confined to the last partition of an
+/// ascending nulls-last ordering: every partition boundary is still provably
+/// ordered.
+#[tokio::test]
+async fn delta_table_nulls_in_last_partition_use_progressive_eval() -> TestResult<()> {
+    let table = nulls_in_last_file_delta_table().await?;
+    let (rendered, timestamps) = query_nullable_sorted(&table, 2).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
     );
     assert_sorted_nulls_last(&timestamps);
     Ok(())
