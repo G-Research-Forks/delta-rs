@@ -442,7 +442,7 @@ impl TableProviderBuilder {
     /// violate the ordering.
     ///
     /// Overlap between sort-column values in different files is handled.
-    /// Files are grouped such each group has non-overlapping values,
+    /// Files are grouped such that each group has non-overlapping values,
     /// and then groups are merged using a sort-preserving merge.
     /// The sorted result remains correct as long as each file is internally in
     /// the declared order.
@@ -457,12 +457,13 @@ impl TableProviderBuilder {
     /// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext)
     /// sessions) concatenate the scan partitions in range order instead.
     ///
-    /// Note that DataFusion may repartition files to reach the target
-    /// number of partitions, which can introduce overlap in partitions and
-    /// prevent the `ProgressiveEvalRule` from applying.
-    /// If you want to ensure that `ProgressiveEval` can be used, regardless
-    /// of the number of files or CPU cores available, set the
-    /// `datafusion.optimizer.repartition_file_scans` to false.
+    /// Note that when there are fewer files than
+    /// `datafusion.execution.target_partitions`, DataFusion may split
+    /// individual files into byte ranges to fill the target. Each range
+    /// carries the whole file's statistics, so the resulting scan partitions
+    /// overlap and the `ProgressiveEvalRule` cannot apply. To keep the
+    /// progressive-eval concatenation available regardless of file count or
+    /// CPU cores, set `datafusion.optimizer.repartition_file_scans` to false.
     pub fn with_file_sort_order(
         mut self,
         columns: impl IntoIterator<Item = FileSortColumn>,
