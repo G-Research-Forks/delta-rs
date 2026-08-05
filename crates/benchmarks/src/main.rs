@@ -132,6 +132,12 @@ enum Command {
         #[arg(long)]
         prefetch_streams: Option<usize>,
 
+        /// Disable the ProgressiveEvalRule physical optimizer rule:
+        /// non-overlapping ordered scans keep their SortPreservingMergeExec
+        /// instead of being concatenated by a ProgressiveEvalExec.
+        #[arg(long)]
+        disable_progressive_eval: bool,
+
         /// Verify that the streamed timestamps are globally non-decreasing.
         /// Off by default because the per-row check adds time to the measured
         /// run.
@@ -249,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
             memory_limit_gb,
             target_partitions,
             prefetch_streams,
+            disable_progressive_eval,
             check_order,
             show_plan,
         } => {
@@ -276,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
                     memory_limit_bytes,
                     target_partitions,
                     prefetch_streams,
+                    progressive_eval: !disable_progressive_eval,
                     check_order,
                 };
                 for iter in 0..iterations {

@@ -291,6 +291,11 @@ pub struct SortBenchParams {
     /// scan partitions `ProgressiveEvalExec` executes ahead of the one being
     /// streamed.
     pub prefetch_streams: Option<usize>,
+    /// Whether to install the `ProgressiveEvalRule` physical optimizer rule.
+    /// When disabled, non-overlapping ordered scans keep their
+    /// `SortPreservingMergeExec` instead of being concatenated by a
+    /// `ProgressiveEvalExec`.
+    pub progressive_eval: bool,
     /// Verify that the streamed timestamps are globally non-decreasing. Off by
     /// default because the per-row check adds time to the measured run.
     pub check_order: bool,
@@ -578,13 +583,16 @@ pub async fn run_sort_bench_once(
             .build(),
         None => DeltaRuntimeEnvBuilder::new().build(),
     };
-    let state = SessionStateBuilder::new()
+    let mut state_builder = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
         .with_runtime_env(runtime_env)
-        .with_query_planner(planner)
-        .with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()))
-        .build();
+        .with_query_planner(planner);
+    if params.progressive_eval {
+        state_builder =
+            state_builder.with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()));
+    }
+    let state = state_builder.build();
 
     let ctx = SessionContext::new_with_state(state);
 
