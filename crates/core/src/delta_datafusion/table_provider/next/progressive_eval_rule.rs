@@ -51,9 +51,6 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
             let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
                 return Ok(Transformed::no(plan));
             };
-            if ranges.len() != input.output_partitioning().partition_count() {
-                return Ok(Transformed::no(plan));
-            }
             let replacement =
                 ProgressiveEvalExec::new(Arc::clone(input), Some(ranges), merge.fetch());
             Ok(Transformed::yes(Arc::new(replacement) as _))
@@ -89,8 +86,6 @@ fn ordered_partition_ranges(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
 ) -> Option<Vec<(ScalarValue, ScalarValue)>> {
-    // TODO: Rather than rely on the input partitions being in order already,
-    // we should allow reordering the partitions.
     let partition_count = plan.output_partitioning().partition_count();
     let mut prev_ends: Vec<ScalarValue> = Vec::new();
     let mut prev_null_counts: Vec<usize> = Vec::new();
