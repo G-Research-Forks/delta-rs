@@ -160,6 +160,11 @@ fn get_ordering_stats(
                 col_stats.max_value.get_value()?,
             )
         };
+        // Stats may be null for all-null or empty partitions.
+        // For now, don't try to optimize this case:
+        if start.is_null() || end.is_null() {
+            return None;
+        }
         starts.push(start.clone());
         ends.push(end.clone());
         null_counts.push(*col_stats.null_count.get_value()?);
@@ -503,6 +508,37 @@ mod tests {
             partition(vec![inexact, exact_i64(0, 10, 0)]),
         ]);
         let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn null_statistics_values_bail_out() {
+        // All-null or empty partitions report exact but null min/max values;
+        // they prove nothing about the partition's range. An all-null first
+        // partition under an ascending nulls-first ordering is the dangerous
+        // layout: the null guard passes (the later partition has no nulls)
+        // and a null scalar compares before any value, so without the
+        // explicit bail-out the boundary would look ordered.
+        let all_null = ColumnStatistics {
+            null_count: Precision::Exact(10),
+            min_value: Precision::Exact(ScalarValue::Int64(None)),
+            max_value: Precision::Exact(ScalarValue::Int64(None)),
+            ..Default::default()
+        };
+        let plan = StatsExec::new(vec![
+            partition(vec![all_null, exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(0, 99, 0), exact_i64(0, 10, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![sort_expr(
+            0,
+            "t",
+            SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        )])
+        .unwrap();
 
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
     }
