@@ -122,7 +122,10 @@ whether the streamed rows were actually in order (`sorted`).
   non-overlapping (as `sort-gen` produces), the scan partitions are contiguous
   range-ordered chunks and the merge is replaced by a `ProgressiveEvalExec`
   concatenation, otherwise a merge over parallel pre-grouped ordered
-  partitions remains; `unordered` drops the ORDER BY entirely, reading in arbitrary
+  partitions remains (this mode alone disables
+  `datafusion.optimizer.repartition_file_scans`, whose byte-range splitting
+  would otherwise defeat the concatenation; the other modes keep the
+  DataFusion default); `unordered` drops the ORDER BY entirely, reading in arbitrary
   order with no sorting needed, as a lower bound for comparison;
   `sequential-read` bypasses the delta-rs scan and DataFusion entirely and
   reads the parquet files directly with the parquet crate, single-threaded and

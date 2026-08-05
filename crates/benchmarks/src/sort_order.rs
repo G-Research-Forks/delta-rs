@@ -573,9 +573,15 @@ pub async fn run_sort_bench_once(
     let sql = build_query(&extra_columns, params);
 
     let mut config: SessionConfig = DeltaSessionConfig::default().into();
-    config
-        .options_mut()
-        .set("datafusion.optimizer.repartition_file_scans", "false")?;
+    if params.mode == SortBenchMode::Declared {
+        // Byte-range splitting of file scans defeats the progressive-eval
+        // concatenation (the ranges carry whole-file statistics, so scan
+        // partitions overlap). Only the declared mode needs it disabled;
+        // the other modes keep the DataFusion default.
+        config
+            .options_mut()
+            .set("datafusion.optimizer.repartition_file_scans", "false")?;
+    }
     let planner = DeltaPlanner::new();
     let runtime_env = match params.memory_limit_bytes {
         Some(bytes) => DeltaRuntimeEnvBuilder::new()
