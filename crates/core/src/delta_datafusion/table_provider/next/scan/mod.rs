@@ -219,11 +219,15 @@ fn null_free_ordering_prefix(
 /// groups. Group boundaries follow the ordering, so the groups themselves are
 /// non-overlapping and range-ordered.
 ///
-/// Produces exactly `target_partitions` groups (fewer only when there are not
-/// enough files, more only to stay within the file-id dictionary key space),
-/// with group sizes differing by at most one file.
+/// Produces exactly `target_partitions` groups (none when there are no files,
+/// fewer only when there are not enough files, more only to stay within the
+/// file-id dictionary key space), with group sizes differing by at most one
+/// file.
 fn chunk_ordered_files(files: Vec<PartitionedFile>, target_partitions: usize) -> Vec<FileGroup> {
-    let num_files = files.len().max(1);
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let num_files = files.len();
     let num_groups = target_partitions
         .clamp(1, num_files)
         .max(num_files.div_ceil(MAX_PARTITION_DICT_CARDINALITY));
@@ -1044,6 +1048,12 @@ mod tests {
             flattened,
             (0..100).map(|i| format!("f{i}.parquet")).collect_vec()
         );
+    }
+
+    #[test]
+    fn test_chunk_ordered_files_empty_input_produces_no_groups() {
+        let groups = chunk_ordered_files(Vec::new(), 4);
+        assert!(groups.is_empty());
     }
 
     #[test]
