@@ -272,7 +272,9 @@ fn split_file_groups_for_ordering(
     let flat = vec![FileGroup::new(files.clone())];
 
     // First-fit bin packing yields a single group exactly when all files are
-    // mutually non-overlapping on the sort order.
+    // mutually non-overlapping on the sort order. On the overlapping path this
+    // duplicates the statistics analysis of the grouping below, which is fine:
+    // it is a cheap planning-time pass over per-file min/max values.
     match FileScanConfig::split_groups_by_statistics(table_schema, &flat, ordering) {
         Ok(mut groups) if groups.len() == 1 => {
             let ordered_files = groups.remove(0).into_inner();
