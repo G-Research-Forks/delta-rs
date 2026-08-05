@@ -456,6 +456,13 @@ impl TableProviderBuilder {
     /// physical optimizer rule registered (the default for
     /// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext)
     /// sessions) concatenate the scan partitions in range order instead.
+    ///
+    /// Note that DataFusion may repartition files to reach the target
+    /// number of partitions, which can introduce overlap in partitions and
+    /// prevent the `ProgressiveEvalRule` from applying.
+    /// If you want to ensure that `ProgressiveEval` can be used, regardless
+    /// of the number of files or CPU cores available, set the
+    /// `datafusion.optimizer.repartition_file_scans` to false.
     pub fn with_file_sort_order(
         mut self,
         columns: impl IntoIterator<Item = FileSortColumn>,
