@@ -508,11 +508,23 @@ async fn run_sequential_read(
                 path.display()
             ))
         })?;
+        // Same conversion as core's `LogicalFileView::object_store_path`
+        // (which is pub(crate)): parse to preserve percent-encoding
+        // semantics, falling back to raw-path encoding.
+        let store_path = ObjectStorePath::parse(file.path().as_ref())
+            .unwrap_or_else(|_| ObjectStorePath::from(file.path().as_ref()));
+        let size = u64::try_from(file.size()).map_err(|_| {
+            DeltaTableError::generic(format!(
+                "negative size {} in the delta log for {}",
+                file.size(),
+                path.display()
+            ))
+        })?;
         files.push(FileEntry {
             min_timestamp: min,
             fs_path: path,
-            store_path: ObjectStorePath::from(file.path().as_ref()),
-            size: file.size() as u64,
+            store_path,
+            size,
         });
     }
     files.sort_unstable_by_key(|f| f.min_timestamp);
