@@ -133,9 +133,10 @@ whether the streamed rows were actually in order (`sorted`).
   workloads that read parquet files in a known order — the output is still
   globally sorted because the files are sorted and non-overlapping);
   `sequential-read-async` is the same read through the parquet crate's async
-  reader over tokio files — the IO pattern used by object-storage readers and
-  DataFusion's parquet source — isolating the cost of the async read path from
-  the rest of the stack. The sequential read modes honor `--select-columns`
+  reader over the table's object store — the IO stack used by DataFusion's
+  parquet source, fetching all projected column chunks of a row group in one
+  vectored request — isolating the cost of the async read path from the rest
+  of the stack. The sequential read modes honor `--select-columns`
   and `--limit` but ignore `--memory-limit-gb` and `--target-partitions`.
 - `--select-columns <n>`: number of extra float32 columns in the SELECT
   (default: all)

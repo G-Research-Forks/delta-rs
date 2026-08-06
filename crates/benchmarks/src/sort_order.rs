@@ -27,13 +27,16 @@ use deltalake_core::delta_datafusion::{
     create_session, DeltaRuntimeEnvBuilder, DeltaSessionConfig, FileSortColumn, ProgressiveEvalRule,
 };
 use deltalake_core::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use deltalake_core::parquet::arrow::async_reader::ParquetObjectReader;
 use deltalake_core::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use deltalake_core::parquet::arrow::ProjectionMask;
 use deltalake_core::parquet::basic::Compression;
 use deltalake_core::parquet::file::properties::WriterProperties;
 use deltalake_core::parquet::file::statistics::Statistics as ParquetStatistics;
 use deltalake_core::protocol::SaveMode;
-use deltalake_core::{open_table, DeltaResult, DeltaTable, DeltaTableError};
+use deltalake_core::{
+    open_table, DeltaResult, DeltaTable, DeltaTableError, Path as ObjectStorePath,
+};
 use futures::StreamExt;
 use url::Url;
 
@@ -255,9 +258,11 @@ pub enum SortBenchMode {
     /// globally ordered without any sorting work.
     SequentialRead,
     /// Like `sequential-read`, but through the parquet crate's async reader
-    /// over tokio files: the IO pattern used by object-storage readers (and
-    /// by DataFusion's parquet source), still without delta-rs or DataFusion.
-    /// Isolates the cost of the async read path from the rest of the stack.
+    /// over the table's object store (`ParquetObjectReader`): the IO stack
+    /// used by DataFusion's parquet source, where all projected column chunks
+    /// of a row group are fetched with a single vectored `get_ranges` request.
+    /// Still reads one file at a time without delta-rs scans or DataFusion,
+    /// isolating the cost of the async read path from the rest of the stack.
     SequentialReadAsync,
 }
 
@@ -450,15 +455,17 @@ impl SequentialReadState {
 /// no delta-rs scan, no DataFusion. See [`SortBenchMode::SequentialRead`] and
 /// [`SortBenchMode::SequentialReadAsync`].
 ///
-/// The delta log is used only to list the live files; they are then ordered
-/// by the minimum timestamp in their parquet footer statistics — the stand-in
-/// for a production naming or layout convention that makes the read order
-/// known up front. Reading is single-threaded, one file at a time, using the
-/// sync arrow reader over `std::fs::File` or, when `async_reader` is set, the
-/// async arrow reader over `tokio::fs::File`. `memory_limit_bytes` and
-/// `target_partitions` are ignored. The batch size matches DataFusion's
-/// default (8192) and, when `check_order` is set, the output ordering is
-/// verified exactly like in the DataFusion modes.
+/// The delta log is used only to list the live files (and, in async mode, to
+/// obtain the object store handle); they are then ordered by the minimum
+/// timestamp in their parquet footer statistics — the stand-in for a
+/// production naming or layout convention that makes the read order known up
+/// front. Reading is single-threaded, one file at a time, using the sync
+/// arrow reader over `std::fs::File` or, when `async_reader` is set, the
+/// async arrow reader over a `ParquetObjectReader` — the same IO stack as
+/// DataFusion's parquet source. `memory_limit_bytes` and `target_partitions`
+/// are ignored. The batch size matches DataFusion's default (8192) and, when
+/// `check_order` is set, the output ordering is verified exactly like in the
+/// DataFusion modes.
 async fn run_sequential_read(
     table_url: &Url,
     params: &SortBenchParams,
@@ -479,7 +486,15 @@ async fn run_sequential_read(
     // indices: leaf 0 is the timestamp, leaves 1..=selected the value columns.
     let leaves: Vec<usize> = (0..=selected).collect();
 
-    let mut files: Vec<(i64, std::path::PathBuf)> = Vec::new();
+    struct FileEntry {
+        min_timestamp: i64,
+        fs_path: std::path::PathBuf,
+        store_path: ObjectStorePath,
+        size: u64,
+    }
+
+    let store = table.object_store();
+    let mut files: Vec<FileEntry> = Vec::new();
     for file in table.snapshot()?.log_data().iter() {
         let path = root.join(file.path().to_string());
         let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
@@ -493,17 +508,23 @@ async fn run_sequential_read(
                 path.display()
             ))
         })?;
-        files.push((min, path));
+        files.push(FileEntry {
+            min_timestamp: min,
+            fs_path: path,
+            store_path: ObjectStorePath::from(file.path().as_ref()),
+            size: file.size() as u64,
+        });
     }
-    files.sort_unstable();
+    files.sort_unstable_by_key(|f| f.min_timestamp);
     let provider_elapsed = provider_start.elapsed();
 
     let exec_start = Instant::now();
     let mut state = SequentialReadState::new(exec_start, params.limit, params.check_order);
-    'files: for (_, path) in &files {
+    'files: for file in &files {
         if async_reader {
-            let file = tokio::fs::File::open(path).await?;
-            let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
+            let reader = ParquetObjectReader::new(store.clone(), file.store_path.clone())
+                .with_file_size(file.size);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
             let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
             let mut stream = builder
                 .with_projection(mask)
@@ -515,7 +536,8 @@ async fn run_sequential_read(
                 }
             }
         } else {
-            let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&file.fs_path)?)?;
             let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
             let reader = builder
                 .with_projection(mask)
@@ -535,7 +557,11 @@ async fn run_sequential_read(
             "SequentialParquetRead: files={}, columns={}, batch_size=8192, reader={} (parquet crate, bypasses delta-rs scan and DataFusion)",
             files.len(),
             selected + 1,
-            if async_reader { "async" } else { "sync" },
+            if async_reader {
+                "async (object store)"
+            } else {
+                "sync (std::fs::File)"
+            },
         ),
         has_sort_exec: false,
         has_sort_preserving_merge: false,
