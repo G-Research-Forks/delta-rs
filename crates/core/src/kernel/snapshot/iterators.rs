@@ -348,7 +348,7 @@ impl LogicalFileView {
             size: Some(self.size()),
             partition_values: Some(self.partition_values_map()),
             deletion_vector: self.deletion_vector().map(|dv| dv.descriptor()),
-            tags: None,
+            tags: self.tags(),
             base_row_id: None,
             default_row_commit_version: None,
         }
@@ -878,7 +878,9 @@ mod tests {
         assert_eq!(tags.get("foo"), Some(&Some("bar".to_string())));
         assert_eq!(tags.get("no-value"), Some(&None));
         // to_add must preserve the tags rather than dropping them.
-        assert_eq!(view.to_add().tags, Some(tags));
+        assert_eq!(view.to_add().tags, Some(tags.clone()));
+        // Remove actions declare extendedFileMetadata, so they must carry the tags too.
+        assert_eq!(view.remove_action(true).tags, Some(tags));
     }
 
     #[test]
@@ -886,6 +888,7 @@ mod tests {
         let view = logical_file_view_without_raw_stats();
         assert!(view.tags().is_none());
         assert!(view.to_add().tags.is_none());
+        assert!(view.remove_action(true).tags.is_none());
     }
 
     #[test]
