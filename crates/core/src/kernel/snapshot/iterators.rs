@@ -222,7 +222,7 @@ impl LogicalFileView {
 
     /// Returns the tags stored in the log for this file, if any.
     ///
-    /// Tags are free-form `Map<String, String>` metadata on Add actions
+    /// Tags are a free-form metadata map from string keys to optional string values on Add actions
     pub fn tags(&self) -> Option<HashMap<String, Option<String>>> {
         self.files
             .column_by_name(FIELD_NAME_FILE_CONSTANT_VALUES)
