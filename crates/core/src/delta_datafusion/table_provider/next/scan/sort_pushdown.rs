@@ -196,10 +196,10 @@ pub(super) fn plan_sort_pushdown(
     let cmp_prefix = |a: &[ScalarValue], b: &[ScalarValue]| compare_rows(a, b, &prefix_options);
 
     // --- Pair every file with its exact partition-prefix key. ---
-    // Sort a lightweight (key, index) permutation rather than the large file objects.
-    let mut keyed: Vec<(Vec<ScalarValue>, usize)> = Vec::with_capacity(files.len());
+    // Sort lightweight (key, reference) pairs rather than the large file objects.
+    let mut keyed: Vec<(Vec<ScalarValue>, &PartitionedFile)> = Vec::with_capacity(files.len());
     let mut key_types = KeyTypes::default();
-    for (index, file) in files.iter().enumerate() {
+    for &file in files {
         let Some(values) = file.extensions.get::<DeltaPartitionValues>() else {
             return Ok(None);
         };
@@ -215,7 +215,7 @@ pub(super) fn plan_sort_pushdown(
         if !key_types.accept(&key) {
             return Ok(None);
         }
-        keyed.push((key, index));
+        keyed.push((key, file));
     }
     keyed.sort_by(|a, b| cmp_prefix(&a.0, &b.0).expect("keys share a non-nested type per column"));
 
@@ -223,15 +223,15 @@ pub(super) fn plan_sort_pushdown(
     // One comparator decides both the bucket boundary and its validity: equal
     // keys extend the current bucket and a strict step opens a new one; the
     // keys were sorted with the same comparator, so any other outcome is a
-    // backstop, not an expected path. Buckets hold file indices: nothing has
+    // backstop, not an expected path. Buckets hold references: nothing has
     // been cloned yet.
-    let mut index_buckets: Vec<(Vec<ScalarValue>, Vec<usize>)> = Vec::new();
-    for (key, index) in keyed {
-        match index_buckets.last_mut() {
-            None => index_buckets.push((key, vec![index])),
-            Some((last_key, indices)) => match cmp_prefix(last_key, &key) {
-                Ok(Ordering::Equal) => indices.push(index),
-                Ok(Ordering::Less) => index_buckets.push((key, vec![index])),
+    let mut key_buckets: Vec<(Vec<ScalarValue>, Vec<&PartitionedFile>)> = Vec::new();
+    for (key, file) in keyed {
+        match key_buckets.last_mut() {
+            None => key_buckets.push((key, vec![file])),
+            Some((last_key, bucket)) => match cmp_prefix(last_key, &key) {
+                Ok(Ordering::Equal) => bucket.push(file),
+                Ok(Ordering::Less) => key_buckets.push((key, vec![file])),
                 _ => return Ok(None),
             },
         }
@@ -241,9 +241,8 @@ pub(super) fn plan_sort_pushdown(
     //     reference: a refusal, the common outcome probed on every ORDER BY
     //     over this scan, must copy nothing. ---
     let mut ordered_buckets: Vec<(Vec<ScalarValue>, Vec<&PartitionedFile>)> =
-        Vec::with_capacity(index_buckets.len());
-    for (key, indices) in index_buckets {
-        let bucket: Vec<&PartitionedFile> = indices.into_iter().map(|index| files[index]).collect();
+        Vec::with_capacity(key_buckets.len());
+    for (key, bucket) in key_buckets {
         let bucket = match shape.suffix.as_ref() {
             Some(suffix) if bucket.len() >= 2 => {
                 // Concatenating several files into one group interleaves each

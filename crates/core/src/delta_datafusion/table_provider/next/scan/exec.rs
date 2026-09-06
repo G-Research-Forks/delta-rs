@@ -432,19 +432,6 @@ impl DeltaScanExec {
         ))
     }
 
-    /// Re-express an ordering over this exec's output schema against the input
-    /// plan's schema.
-    ///
-    /// `None` when a column does not survive the crossing - a partition column
-    /// above all, which is materialised here and absent from the parquet child.
-    fn map_ordering_to_input(&self, order: &[PhysicalSortExpr]) -> Option<Vec<PhysicalSortExpr>> {
-        super::sort_pushdown::rebind_ordering(
-            order,
-            &self.scan_plan.contract.output_schema,
-            &self.input.schema(),
-        )
-    }
-
     /// Offer an ordering this exec cannot serve itself to the scan underneath.
     ///
     /// The per-file work done here - partition values, column transforms,
@@ -466,7 +453,14 @@ impl DeltaScanExec {
         if self.has_selection_vectors {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
-        let Some(child_order) = self.map_ordering_to_input(order) else {
+        // A column that does not survive the crossing into the child's schema
+        // - a partition column above all, which is materialised here and
+        // absent from the parquet child - cannot be asked of it.
+        let Some(child_order) = super::sort_pushdown::rebind_ordering(
+            order,
+            &self.scan_plan.contract.output_schema,
+            &self.input.schema(),
+        ) else {
             return Ok(SortOrderPushdownResult::Unsupported);
         };
         // Whatever the child answers, it was rebuilt for the requested order,

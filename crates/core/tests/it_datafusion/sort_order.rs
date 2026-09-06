@@ -982,6 +982,12 @@ fn desc_write_batch(start: i64, len: i64) -> TestResult<RecordBatch> {
 /// Create a Delta table whose files are all sorted by timestamp *descending*,
 /// with non-overlapping timestamp ranges across files.
 async fn desc_sorted_delta_table() -> TestResult<DeltaTable> {
+    desc_delta_table(&[(300, 100), (200, 100), (100, 100), (0, 100)]).await
+}
+
+/// Create an unpartitioned Delta table with one file per entry of `writes`,
+/// each `(start, len)` sorted by timestamp *descending*.
+async fn desc_delta_table(writes: &[(i64, i64)]) -> TestResult<DeltaTable> {
     let mut table = DeltaTable::new_in_memory()
         .create()
         .with_columns(vec![
@@ -998,13 +1004,13 @@ async fn desc_sorted_delta_table() -> TestResult<DeltaTable> {
         ])
         .await?;
 
-    for start in [300, 200, 100, 0] {
+    for &(start, len) in writes {
         table = table
-            .write(vec![desc_write_batch(start, 100)?])
+            .write(vec![desc_write_batch(start, len)?])
             .with_save_mode(SaveMode::Append)
             .await?;
     }
-    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+    assert_eq!(table.snapshot()?.log_data().num_files(), writes.len());
     Ok(table)
 }
 
@@ -1113,28 +1119,7 @@ async fn delta_table_descending_sort_order_degrades_for_ascending_query() -> Tes
 /// them back to back would emit 100..50 followed by 60..40 as if sorted.
 #[tokio::test]
 async fn delta_table_descending_overlapping_files_keep_order() -> TestResult<()> {
-    let mut table = DeltaTable::new_in_memory()
-        .create()
-        .with_columns(vec![
-            StructField::new(
-                "timestamp".to_string(),
-                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
-                false,
-            ),
-            StructField::new(
-                "value".to_string(),
-                DeltaDataType::Primitive(PrimitiveType::Long),
-                false,
-            ),
-        ])
-        .await?;
-    for (start, len) in [(50, 51), (40, 21)] {
-        table = table
-            .write(vec![desc_write_batch(start, len)?])
-            .with_save_mode(SaveMode::Append)
-            .await?;
-    }
-    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+    let table = desc_delta_table(&[(50, 51), (40, 21)]).await?;
 
     let ctx = create_session().into_inner();
     ctx.sql("SET datafusion.execution.target_partitions = 1")
