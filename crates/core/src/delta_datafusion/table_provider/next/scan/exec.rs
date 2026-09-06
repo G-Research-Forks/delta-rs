@@ -456,10 +456,15 @@ impl DeltaScanExec {
         let Some(child_order) = self.map_ordering_to_input(order) else {
             return Ok(SortOrderPushdownResult::Unsupported);
         };
+        // Whatever the child answers, it was rebuilt for the requested order,
+        // not for the one a previous regrouping claimed: the parquet scan's
+        // `Inexact` path reorders or reverses row groups within each file
+        // while leaving the file groups - which is all `with_new_input`
+        // compares - untouched. Advertise only what the new child does.
         Ok(self
             .input
             .try_pushdown_sort(&child_order)?
-            .map(|inner| self.with_new_input(inner)))
+            .map(|inner| self.with_input(inner, None)))
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
