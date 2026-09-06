@@ -889,6 +889,17 @@ impl ExecutionPlan for DeltaScanExec {
         // into one queue for the sibling streams to share, read them in any
         // order, and let a pushed fetch prune earlier row groups - so say so
         // explicitly.
+        //
+        // The flag costs the work stealing and byte-range balancing an
+        // order-insensitive scan gets, which is only a loss when the regrouped
+        // scan ends up under a sort anyway. That happens with
+        // `repartition_sorts` off: `CoalescePartitionsExec` delegates the
+        // pushdown here, downgrades the `Exact` answer to `Inexact` because
+        // its input had several partitions, and `PushdownSort` keeps the
+        // `SortExec` over the regrouped scan. Clearing the flag would break
+        // the `Exact` claim on the default path, so the trade-off stands until
+        // upstream keeps the original child when it downgrades an answer it
+        // cannot use.
         .with_preserve_order(true)
         .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;
