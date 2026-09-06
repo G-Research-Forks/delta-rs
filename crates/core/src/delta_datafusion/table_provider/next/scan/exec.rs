@@ -16,6 +16,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use dashmap::DashMap;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::error::{DataFusionError, Result};
+use datafusion::common::stats::Precision;
 use datafusion::common::{
     ColumnStatistics, HashMap, internal_datafusion_err, internal_err, plan_err,
 };
@@ -151,6 +152,18 @@ fn derive_output_orderings(
         }
     }
     orderings
+}
+
+/// Whether `stat` describes a column holding exactly one non-null value, so
+/// that every non-empty subset of its rows has the same bounds and null count
+/// as the whole. Partition-column statistics carry no sums or distinct counts
+/// that could disagree.
+fn is_single_valued(stat: &ColumnStatistics) -> bool {
+    stat.null_count == Precision::Exact(0)
+        && matches!(
+            (&stat.min_value, &stat.max_value),
+            (Precision::Exact(min), Precision::Exact(max)) if !min.is_null() && min == max
+        )
 }
 
 /// Descend through wrappers that hand their input's partitions on untouched -
@@ -523,7 +536,9 @@ impl DeltaScanExec {
             .zip(self.pushed.as_ref())
             .and_then(|(idx, pushed)| pushed.per_partition_stats.get(idx));
         // The aggregated stats span every scanned file: valid bounds for a
-        // single execution partition, but exact only when there is just one.
+        // single execution partition, but exact only when there is just one -
+        // or when the column holds a single value, so that no partition can
+        // differ from the whole.
         let aggregate_is_exact =
             partition.is_none() || self.properties.partitioning.partition_count() == 1;
         let partition_stat = |name: &str| -> Option<ColumnStatistics> {
@@ -531,7 +546,7 @@ impl DeltaScanExec {
                 return Some(stat.clone());
             }
             let stat = self.partition_stats.get(name).cloned()?;
-            Some(if aggregate_is_exact {
+            Some(if aggregate_is_exact || is_single_valued(&stat) {
                 stat
             } else {
                 stat.to_inexact()

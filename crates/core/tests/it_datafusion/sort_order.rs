@@ -91,6 +91,18 @@ fn delta_write_batch(part: &str, start: i64, len: i64) -> TestResult<RecordBatch
 /// partitions so that grouping which ignores statistics always places
 /// overlapping files in the same group.
 async fn sorted_delta_table() -> TestResult<DeltaTable> {
+    partitioned_delta_table(&[
+        ("A", 0, 100),
+        ("A", 100, 100),
+        ("A", 200, 100),
+        ("B", 50, 100),
+    ])
+    .await
+}
+
+/// Create a Delta table partitioned by "part" with one file per entry of
+/// `writes`, each `(part, start, len)` sorted by timestamp.
+async fn partitioned_delta_table(writes: &[(&str, i64, i64)]) -> TestResult<DeltaTable> {
     let mut table = DeltaTable::new_in_memory()
         .create()
         .with_columns(vec![
@@ -113,19 +125,13 @@ async fn sorted_delta_table() -> TestResult<DeltaTable> {
         .with_partition_columns(vec!["part"])
         .await?;
 
-    let writes = [
-        ("A", 0, 100),
-        ("A", 100, 100),
-        ("A", 200, 100),
-        ("B", 50, 100),
-    ];
-    for (part, start, len) in writes {
+    for &(part, start, len) in writes {
         table = table
             .write(vec![delta_write_batch(part, start, len)?])
             .with_save_mode(SaveMode::Append)
             .await?;
     }
-    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+    assert_eq!(table.snapshot()?.log_data().num_files(), writes.len());
     Ok(table)
 }
 
@@ -371,6 +377,53 @@ async fn delta_table_partition_prefix_with_sort_pushdown_disabled_keeps_sort() -
     );
     let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
     assert_eq!(rows, 400);
+    Ok(())
+}
+
+/// A partition column with a single value is described exactly by the
+/// table-wide statistics on every execution partition: no subset of its rows
+/// can have other bounds or a different null count. With the sort pushdown
+/// disabled (or refused, as for column-mapped tables) the scan is not
+/// regrouped, so those aggregate statistics are all `ProgressiveEvalRule`
+/// has to prove the partitions disjoint on `part`; reporting them inexact
+/// would keep the merge.
+#[tokio::test]
+async fn delta_table_single_partition_value_concatenates_without_pushdown() -> TestResult<()> {
+    let table = partitioned_delta_table(&[
+        ("A", 0, 100),
+        ("A", 100, 100),
+        ("A", 200, 100),
+        ("A", 300, 100),
+    ])
+    .await?;
+
+    let ctx = create_session().into_inner();
+    ctx.sql("SET datafusion.optimizer.enable_sort_pushdown = false")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    let keys = collect_string_i64_keys(&batches, 0, 1)?;
+    assert_eq!(keys.len(), 400);
+    assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
     Ok(())
 }
 
