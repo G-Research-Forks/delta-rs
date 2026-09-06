@@ -930,6 +930,26 @@ mod tests {
         );
     }
 
+    /// Under a descending ordering a file starts at its maximum and ends at
+    /// its minimum, so overlap is judged between the previous minimum and the
+    /// next maximum. Comparing the raw extrema instead would accept
+    /// `[50, 100]` followed by `[40, 60]` as ordered.
+    #[test]
+    fn test_order_bucket_refuses_overlapping_files_for_a_descending_ordering() {
+        assert_eq!(
+            ordered_bucket(&[("a", 50, 100), ("b", 40, 60)], desc(0, "timestamp")),
+            None
+        );
+        assert_eq!(
+            ordered_bucket(&[("a", 50, 100), ("b", 40, 50)], desc(0, "timestamp")),
+            None
+        );
+        assert_eq!(
+            ordered_bucket(&[("a", 50, 100), ("b", 40, 49)], desc(0, "timestamp")),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
     /// A file with no statistics at all cannot be placed.
     #[test]
     fn test_order_bucket_refuses_without_statistics() {

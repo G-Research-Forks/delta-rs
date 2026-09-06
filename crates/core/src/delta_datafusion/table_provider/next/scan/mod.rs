@@ -265,7 +265,9 @@ impl KeyTypes {
 /// precedes the next file's min in min-sorted order - so comparing the endpoint
 /// tuples directly decides it, and the order it accepts is that same min-sorted
 /// order. Endpoints are per-column extrema compared under the sort options,
-/// which is what the row encoding there does.
+/// which is what the row encoding there does. A descending column's extrema
+/// swap roles: its maximum is where a file starts in sort order and its
+/// minimum where it ends, as `MinMaxStatistics` arranges them.
 ///
 /// Values that cannot be compared refuse the files rather than being ordered
 /// arbitrarily. Nulls among the sort columns are the caller's concern: the
@@ -274,24 +276,32 @@ pub(super) fn non_overlapping_file_order<'a>(
     files: impl IntoIterator<Item = &'a PartitionedFile>,
     ordering: &LexOrdering,
 ) -> Option<Vec<usize>> {
+    // Each file's first and last key in sort order.
     let mut ranges: Vec<(Vec<ScalarValue>, Vec<ScalarValue>, usize)> = Vec::new();
     let mut key_types = KeyTypes::default();
     for (index, file) in files.into_iter().enumerate() {
         let stats = file.statistics.as_ref()?;
-        let mut mins = Vec::with_capacity(ordering.len());
-        let mut maxes = Vec::with_capacity(ordering.len());
+        let mut starts = Vec::with_capacity(ordering.len());
+        let mut ends = Vec::with_capacity(ordering.len());
         for sort_expr in ordering.iter() {
             let column = sort_expr.expr.downcast_ref::<Column>()?;
             let column_stats = stats.column_statistics.get(column.index())?;
             // Read the bounds whatever their precision, as `MinMaxStatistics`
             // does.
-            mins.push(column_stats.min_value.get_value()?.clone());
-            maxes.push(column_stats.max_value.get_value()?.clone());
+            let min = column_stats.min_value.get_value()?.clone();
+            let max = column_stats.max_value.get_value()?.clone();
+            let (start, end) = if sort_expr.options.descending {
+                (max, min)
+            } else {
+                (min, max)
+            };
+            starts.push(start);
+            ends.push(end);
         }
-        if !(key_types.accept(&mins) && key_types.accept(&maxes)) {
+        if !(key_types.accept(&starts) && key_types.accept(&ends)) {
             return None;
         }
-        ranges.push((mins, maxes, index));
+        ranges.push((starts, ends, index));
     }
 
     let options: Vec<SortOptions> = ordering.iter().map(|sort_expr| sort_expr.options).collect();

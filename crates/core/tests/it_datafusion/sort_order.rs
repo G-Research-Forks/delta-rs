@@ -1048,6 +1048,66 @@ async fn delta_table_descending_sort_order_degrades_for_ascending_query() -> Tes
     Ok(())
 }
 
+/// Two descending files whose timestamp ranges overlap: `[50, 100]` and
+/// `[40, 60]`. In descending order the first file starts at 100 and ends at
+/// 50, and the second starts at 60 - inside the first - so they cannot share
+/// a group. Judged on the raw minimum and maximum instead, the second file
+/// would appear to start after the first one ends, and a single group reading
+/// them back to back would emit 100..50 followed by 60..40 as if sorted.
+#[tokio::test]
+async fn delta_table_descending_overlapping_files_keep_order() -> TestResult<()> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+    for (start, len) in [(50, 51), (40, 21)] {
+        table = table
+            .write(vec![desc_write_batch(start, len)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+
+    let ctx = create_session().into_inner();
+    ctx.sql("SET datafusion.execution.target_partitions = 1")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::desc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" DESC")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("2 groups"),
+        "expected the overlapping files to land in separate groups:\n{rendered}"
+    );
+    let timestamps = collect_timestamps(&batches);
+    assert_eq!(timestamps.len(), 72);
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] >= pair[1]),
+        "results are not sorted by timestamp descending:\n{rendered}"
+    );
+    Ok(())
+}
+
 /// `ORDER BY ... DESC LIMIT n` against an ascending declaration is where the
 /// delegated reverse scan pays off: `DeltaScanExec` cannot serve the reversed
 /// ordering itself, so it offers it to the parquet scan, which reads each
