@@ -425,20 +425,11 @@ impl DeltaScanExec {
     /// `None` when a column does not survive the crossing - a partition column
     /// above all, which is materialised here and absent from the parquet child.
     fn map_ordering_to_input(&self, order: &[PhysicalSortExpr]) -> Option<Vec<PhysicalSortExpr>> {
-        let output_schema = &self.scan_plan.contract.output_schema;
-        let input_schema = self.input.schema();
-        order
-            .iter()
-            .map(|sort_expr| {
-                let column = sort_expr.expr.downcast_ref::<Column>()?;
-                let name = output_schema.fields().get(column.index())?.name();
-                let index = input_schema.index_of(name).ok()?;
-                Some(PhysicalSortExpr::new(
-                    Arc::new(Column::new(name, index)),
-                    sort_expr.options,
-                ))
-            })
-            .collect()
+        super::sort_pushdown::rebind_ordering(
+            order,
+            &self.scan_plan.contract.output_schema,
+            &self.input.schema(),
+        )
     }
 
     /// Offer an ordering this exec cannot serve itself to the scan underneath.
@@ -465,15 +456,10 @@ impl DeltaScanExec {
         let Some(child_order) = self.map_ordering_to_input(order) else {
             return Ok(SortOrderPushdownResult::Unsupported);
         };
-        Ok(match self.input.try_pushdown_sort(&child_order)? {
-            SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
-                inner: self.with_new_input(inner),
-            },
-            SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
-                inner: self.with_new_input(inner),
-            },
-            SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
-        })
+        Ok(self
+            .input
+            .try_pushdown_sort(&child_order)?
+            .map(|inner| self.with_new_input(inner)))
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
@@ -482,11 +468,19 @@ impl DeltaScanExec {
         // built, so it survives a child that was rebuilt around the same groups.
         let pushed = self
             .pushed
-            .as_ref()
+            .clone()
             .filter(|_| grouping_is_unchanged(&self.input, &input));
-        let properties =
-            Self::build_properties(&self.scan_plan, &input, pushed.map(|p| p.as_ref()));
-        let pushed = pushed.cloned();
+        self.with_input(input, pushed)
+    }
+
+    /// Rebuild this exec around `input`, claiming `pushed` as the sort its
+    /// file grouping serves, and recompute the plan properties from both.
+    fn with_input(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        pushed: Option<Arc<PushedSort>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let properties = Self::build_properties(&self.scan_plan, &input, pushed.as_deref());
         Arc::new(Self {
             input,
             properties,
@@ -726,10 +720,7 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        let new_input = self.input.with_fetch(limit)?;
-        let mut new_plan = self.clone();
-        new_plan.input = new_input;
-        Some(Arc::new(new_plan))
+        Some(self.with_new_input(self.input.with_fetch(limit)?))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -826,12 +817,7 @@ impl ExecutionPlan for DeltaScanExec {
             .table_schema()
             .table_schema()
             .clone();
-        let target_groups = self
-            .input
-            .properties()
-            .partitioning
-            .partition_count()
-            .max(1);
+        let target_groups = self.input.properties().partitioning.partition_count();
 
         // Try to form new groups ordered by the partition columns; the config
         // is only cloned once that has succeeded, so the Unsupported paths -
@@ -885,14 +871,8 @@ impl ExecutionPlan for DeltaScanExec {
             ordering,
             per_partition_stats: plan.per_partition_stats,
         });
-        let properties = Self::build_properties(&self.scan_plan, &new_input, Some(&pushed));
         Ok(SortOrderPushdownResult::Exact {
-            inner: Arc::new(Self {
-                input: new_input,
-                properties,
-                pushed: Some(pushed),
-                ..self.clone()
-            }),
+            inner: self.with_input(new_input, Some(pushed)),
         })
     }
 

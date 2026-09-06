@@ -71,6 +71,28 @@ pub(super) struct OrderShape {
     suffix: Option<LexOrdering>,
 }
 
+/// Re-express `order`, whose columns are bound to `from`, over `to` by column
+/// name. `None` when a sort expression is not a plain column or `to` has no
+/// column of that name.
+pub(super) fn rebind_ordering(
+    order: &[PhysicalSortExpr],
+    from: &SchemaRef,
+    to: &SchemaRef,
+) -> Option<Vec<PhysicalSortExpr>> {
+    order
+        .iter()
+        .map(|sort_expr| {
+            let column = sort_expr.expr.downcast_ref::<Column>()?;
+            let name = from.fields().get(column.index())?.name();
+            let index = to.index_of(name).ok()?;
+            Some(PhysicalSortExpr::new(
+                Arc::new(Column::new(name, index)),
+                sort_expr.options,
+            ))
+        })
+        .collect()
+}
+
 /// Classify `order` as a partition-column prefix plus a file-sort-order suffix,
 /// or `None` when this scan cannot satisfy it by regrouping.
 ///
@@ -121,29 +143,20 @@ pub(super) fn analyze_order(
         });
     }
 
-    // The suffix must match a prefix of the declared file sort order, column for
-    // column and direction for direction, re-expressed over the read schema.
-    let file_sort_order = file_sort_order?;
-    if suffix_exprs.len() > file_sort_order.len() {
-        return None;
+    // A partition column after the prefix cannot be honored by regrouping:
+    // the files are not ordered on it.
+    for suffix_expr in suffix_exprs {
+        if partition_column_names.contains(&column_name(output_schema, suffix_expr)?) {
+            return None;
+        }
     }
-    let mut suffix = Vec::with_capacity(suffix_exprs.len());
-    for (suffix_expr, file_sort_expr) in suffix_exprs.iter().zip(file_sort_order.iter()) {
-        let suffix_name = column_name(output_schema, suffix_expr)?;
-        // A partition column after the prefix cannot be honored by regrouping:
-        // the files are not ordered on it.
-        if partition_column_names.contains(&suffix_name) {
-            return None;
-        }
-        let index = file_sort_expr.expr.downcast_ref::<Column>()?.index();
-        let file_sort_name = parquet_read_schema.fields().get(index)?.name();
-        if *file_sort_name != suffix_name || suffix_expr.options != file_sort_expr.options {
-            return None;
-        }
-        suffix.push(PhysicalSortExpr::new(
-            Arc::new(Column::new(file_sort_name, index)),
-            suffix_expr.options,
-        ));
+    // The suffix must match a prefix of the declared file sort order, column for
+    // column and direction for direction, re-expressed over the read schema
+    // (which is what the declared order is bound to).
+    let file_sort_order = file_sort_order?;
+    let suffix = rebind_ordering(suffix_exprs, output_schema, parquet_read_schema)?;
+    if suffix.len() > file_sort_order.len() || suffix[..] != file_sort_order[..suffix.len()] {
+        return None;
     }
 
     Some(OrderShape {
@@ -224,46 +237,40 @@ pub(super) fn plan_sort_pushdown(
         }
     }
 
-    // --- Order each bucket on the suffix, refusing overlap. Still on indices:
-    //     a refusal, the common outcome probed on every ORDER BY over this
-    //     scan, must copy nothing. ---
-    let mut ordered_buckets: Vec<(Vec<ScalarValue>, Vec<usize>)> =
+    // --- Order each bucket on the suffix, refusing overlap. Still by
+    //     reference: a refusal, the common outcome probed on every ORDER BY
+    //     over this scan, must copy nothing. ---
+    let mut ordered_buckets: Vec<(Vec<ScalarValue>, Vec<&PartitionedFile>)> =
         Vec::with_capacity(index_buckets.len());
     for (key, indices) in index_buckets {
-        let indices = match shape.suffix.as_ref() {
-            Some(suffix) if indices.len() >= 2 => {
-                let bucket_files = || indices.iter().map(|&index| files[index]);
+        let bucket: Vec<&PartitionedFile> = indices.into_iter().map(|index| files[index]).collect();
+        let bucket = match shape.suffix.as_ref() {
+            Some(suffix) if bucket.len() >= 2 => {
                 // Concatenating several files into one group interleaves each
                 // file's nulls into the middle of the group's stream, which
                 // min/max cannot detect, so every suffix column must be
                 // provably null-free.
                 let null_free =
-                    null_free_ordering_prefix(suffix, parquet_read_schema, bucket_files());
+                    null_free_ordering_prefix(suffix, parquet_read_schema, bucket.iter().copied());
                 if null_free.is_none_or(|p| p.len() < suffix.len()) {
                     return Ok(None);
                 }
-                let Some(order) = non_overlapping_file_order(bucket_files(), suffix) else {
+                let Ok(bucket) = non_overlapping_file_order(bucket, |file| *file, suffix) else {
                     return Ok(None);
                 };
-                order
-                    .into_iter()
-                    .map(|position| indices[position])
-                    .collect()
+                bucket
             }
-            _ => indices,
+            _ => bucket,
         };
-        ordered_buckets.push((key, indices));
+        ordered_buckets.push((key, bucket));
     }
 
     // --- Every check has passed: materialize the buckets. ---
     let buckets: Vec<Bucket> = ordered_buckets
         .into_iter()
-        .map(|(key, indices)| Bucket {
+        .map(|(key, bucket)| Bucket {
             key,
-            files: indices
-                .into_iter()
-                .map(|index| files[index].clone())
-                .collect(),
+            files: bucket.into_iter().cloned().collect(),
         })
         .collect();
 
@@ -883,9 +890,10 @@ mod tests {
             .collect();
         let ordering = LexOrdering::new(vec![sort]).unwrap();
         Some(
-            non_overlapping_file_order(&files, &ordering)?
+            non_overlapping_file_order(files, |file| file, &ordering)
+                .ok()?
                 .into_iter()
-                .map(|index| files[index].object_meta.location.to_string())
+                .map(|file| file.object_meta.location.to_string())
                 .collect(),
         )
     }
@@ -959,7 +967,7 @@ mod tests {
         ];
         files[1].statistics = None;
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
-        assert!(non_overlapping_file_order(&files, &ordering).is_none());
+        assert!(non_overlapping_file_order(files, |file| file, &ordering).is_err());
     }
 
     /// Statistics whose `ScalarValue` variant differs between files are
@@ -982,7 +990,7 @@ mod tests {
             })
             .collect();
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
-        assert!(non_overlapping_file_order(&files, &ordering).is_none());
+        assert!(non_overlapping_file_order(files, |file| file, &ordering).is_err());
     }
 
     fn three_two_column_files() -> Vec<PartitionedFile> {
@@ -1146,15 +1154,7 @@ mod tests {
             .unwrap();
         let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
         let schema = scan.schema();
-        let sort_col = |name: &str| {
-            PhysicalSortExpr::new(
-                Arc::new(Column::new(name, schema.index_of(name).unwrap())),
-                SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            )
-        };
+        let sort_col = |name: &str| asc(schema.index_of(name).unwrap(), name);
         let before = file_scan(scan.children()[0]).clone();
 
         let pushed = match scan
@@ -1309,15 +1309,7 @@ mod tests {
 
         let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
         let schema = scan.schema();
-        let sort_col = |name: &str| {
-            PhysicalSortExpr::new(
-                Arc::new(Column::new(name, schema.index_of(name).unwrap())),
-                SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            )
-        };
+        let sort_col = |name: &str| asc(schema.index_of(name).unwrap(), name);
 
         let pushed = match scan
             .try_pushdown_sort(&[sort_col("part"), sort_col("timestamp")])
@@ -1370,15 +1362,7 @@ mod tests {
 
         let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
         let schema = scan.schema();
-        let sort_col = |name: &str| {
-            PhysicalSortExpr::new(
-                Arc::new(Column::new(name, schema.index_of(name).unwrap())),
-                SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            )
-        };
+        let sort_col = |name: &str| asc(schema.index_of(name).unwrap(), name);
         let order = vec![sort_col("part"), sort_col("timestamp")];
 
         let pushed = match scan.try_pushdown_sort(&order).unwrap() {

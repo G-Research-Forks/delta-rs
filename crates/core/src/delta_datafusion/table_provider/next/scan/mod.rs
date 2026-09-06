@@ -249,8 +249,10 @@ impl KeyTypes {
     }
 }
 
-/// The order in which `files` are mutually non-overlapping on `ordering`, as
-/// indices into `files`, or `None` when they overlap or cannot be placed.
+/// Arrange `items` in the order in which their files (`file` reads the
+/// `PartitionedFile` off an item) are mutually non-overlapping on `ordering`.
+/// When they overlap or cannot be placed, `Err` hands the items back as they
+/// came.
 ///
 /// This is `FileScanConfig::split_groups_by_statistics` specialised to the
 /// single-group answer, which is all its callers accept. That routine builds
@@ -272,7 +274,25 @@ impl KeyTypes {
 /// Values that cannot be compared refuse the files rather than being ordered
 /// arbitrarily. Nulls among the sort columns are the caller's concern: the
 /// bounds say nothing about them.
-pub(super) fn non_overlapping_file_order<'a>(
+pub(super) fn non_overlapping_file_order<T>(
+    items: Vec<T>,
+    file: impl Fn(&T) -> &PartitionedFile,
+    ordering: &LexOrdering,
+) -> Result<Vec<T>, Vec<T>> {
+    match non_overlapping_order(items.iter().map(file), ordering) {
+        Some(order) => {
+            let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+            Ok(order
+                .into_iter()
+                .map(|index| slots[index].take().expect("a permutation of the items"))
+                .collect())
+        }
+        None => Err(items),
+    }
+}
+
+/// [`non_overlapping_file_order`] as a permutation of `files`.
+fn non_overlapping_order<'a>(
     files: impl IntoIterator<Item = &'a PartitionedFile>,
     ordering: &LexOrdering,
 ) -> Option<Vec<usize>> {
@@ -374,14 +394,10 @@ fn split_file_groups_for_ordering(
 
     // Missing/unusable statistics fall through: the grouping below fails the
     // same way and takes its default-grouping fallback.
-    if let Some(order) = non_overlapping_file_order(&files, ordering) {
-        let mut slots: Vec<Option<PartitionedFile>> = files.into_iter().map(Some).collect();
-        let ordered_files = order
-            .into_iter()
-            .map(|index| slots[index].take().expect("a permutation of the files"))
-            .collect();
-        return chunk_ordered_files(ordered_files, target_partitions);
-    }
+    let files = match non_overlapping_file_order(files, |file| file, ordering) {
+        Ok(ordered_files) => return chunk_ordered_files(ordered_files, target_partitions),
+        Err(files) => files,
+    };
 
     let flat = vec![FileGroup::new(files)];
     let default_grouping = |flat: Vec<FileGroup>| {

@@ -38,12 +38,16 @@ fn assert_sorted_result(batches: &[RecordBatch]) {
 /// batches. The partition column may be dictionary-encoded or a view array,
 /// and a timestamp column casts to its microsecond value, so both are read
 /// through a cast.
-fn collect_string_i64_keys(batches: &[RecordBatch]) -> TestResult<Vec<(String, i64)>> {
+fn collect_string_i64_keys(
+    batches: &[RecordBatch],
+    string_column: usize,
+    i64_column: usize,
+) -> TestResult<Vec<(String, i64)>> {
     let mut keys = Vec::new();
     for batch in batches {
-        let firsts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
+        let firsts = arrow_cast::cast(batch.column(string_column), &DataType::Utf8)?;
         let firsts = firsts.as_string::<i32>();
-        let seconds = arrow_cast::cast(batch.column(1), &DataType::Int64)?;
+        let seconds = arrow_cast::cast(batch.column(i64_column), &DataType::Int64)?;
         let seconds = seconds.as_primitive::<Int64Type>();
         keys.extend(
             firsts
@@ -330,7 +334,7 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
         "expected ProgressiveEvalExec in plan:\n{rendered}"
     );
 
-    let keys = collect_string_i64_keys(&batches)?;
+    let keys = collect_string_i64_keys(&batches, 0, 1)?;
     assert_eq!(keys.len(), 400);
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -408,7 +412,7 @@ async fn delta_table_partition_prefix_overlapping_files_keep_sort() -> TestResul
         "expected SortExec in plan:\n{rendered}"
     );
 
-    let keys = collect_string_i64_keys(&batches)?;
+    let keys = collect_string_i64_keys(&batches, 0, 1)?;
     assert_eq!(keys.len(), 300);
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -494,7 +498,7 @@ async fn query_two_partition_prefix(
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
     let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
 
-    Ok((rendered, collect_string_i64_keys(&batches)?))
+    Ok((rendered, collect_string_i64_keys(&batches, 0, 1)?))
 }
 
 /// `pack_buckets` cuts a file group at every change of a leading partition
@@ -2269,20 +2273,11 @@ async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResu
     .expect("query hung: the merge started only some of the join's partitions")?;
 
     // Every wanted value is in partition A (B holds 50..150), in timestamp order.
-    let mut values: Vec<i64> = Vec::new();
-    let mut parts: Vec<String> = Vec::new();
-    for batch in &batches {
-        values.extend(batch.column(1).as_primitive::<Int64Type>().values());
-        let batch_parts = arrow_cast::cast(batch.column(2), &DataType::Utf8)?;
-        parts.extend(
-            batch_parts
-                .as_string::<i32>()
-                .iter()
-                .map(|part| part.unwrap().to_string()),
-        );
-    }
-    assert_eq!(values, vec![1, 2, 3, 150, 250]);
-    assert_eq!(parts, vec!["A"; 5]);
+    let keys = collect_string_i64_keys(&batches, 2, 1)?;
+    assert_eq!(
+        keys,
+        [1, 2, 3, 150, 250].map(|value| ("A".to_string(), value))
+    );
     Ok(())
 }
 
@@ -2330,16 +2325,10 @@ async fn delta_table_partition_prefix_pushes_through_round_robin_repartition() -
         "expected ProgressiveEvalExec in plan:\n{rendered}"
     );
 
-    let mut parts: Vec<String> = Vec::new();
-    for batch in &batches {
-        let column = arrow_cast::cast(batch.column(2), &DataType::Utf8)?;
-        parts.extend(
-            column
-                .as_string::<i32>()
-                .iter()
-                .map(|part| part.unwrap().to_string()),
-        );
-    }
+    let parts: Vec<String> = collect_string_i64_keys(&batches, 2, 0)?
+        .into_iter()
+        .map(|(part, _)| part)
+        .collect();
     assert_eq!(parts.len(), 400);
     assert!(
         parts.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -2399,19 +2388,7 @@ async fn delta_table_partition_prefix_pushes_down_over_split_files() -> TestResu
         "regrouped statistics should count each file once:\n{rendered}"
     );
 
-    let mut keys: Vec<(String, i64)> = Vec::new();
-    for batch in &batches {
-        let parts = arrow_cast::cast(batch.column(2), &DataType::Utf8)?;
-        let parts = parts.as_string::<i32>();
-        let timestamps = arrow_cast::cast(batch.column(0), &DataType::Int64)?;
-        let timestamps = timestamps.as_primitive::<Int64Type>();
-        keys.extend(
-            parts
-                .iter()
-                .map(|part| part.unwrap().to_string())
-                .zip(timestamps.values().iter().copied()),
-        );
-    }
+    let keys = collect_string_i64_keys(&batches, 2, 0)?;
     assert_eq!(keys.len(), 400);
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
