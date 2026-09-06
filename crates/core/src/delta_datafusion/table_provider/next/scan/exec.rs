@@ -713,7 +713,7 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        self.input.supports_limit_pushdown()
+        !self.has_selection_vectors && self.input.supports_limit_pushdown()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -724,7 +724,13 @@ impl ExecutionPlan for DeltaScanExec {
         self.input.fetch()
     }
 
+    /// A fetch handed to the parquet scan counts raw rows, but deletion
+    /// vectors are applied above it, so a scan carrying any would come up
+    /// short. Refusing the fetch leaves the limit to a node above this one.
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        if self.has_selection_vectors {
+            return None;
+        }
         Some(self.with_new_input(self.input.with_fetch(limit)?))
     }
 

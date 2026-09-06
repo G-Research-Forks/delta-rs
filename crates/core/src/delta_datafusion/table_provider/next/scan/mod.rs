@@ -684,6 +684,10 @@ async fn get_data_scan_plan(
     };
     let file_id_field = scan_plan.contract.file_id_field.clone();
     let file_sort_order = resolve_file_sort_order(config, &scan_plan);
+    // The parquet scan applies a limit to raw rows, before the deletion
+    // vectors are, so a scan carrying any would come up short. The planner
+    // keeps its own limit above the scan either way.
+    let limit = if dvs.is_empty() { limit } else { None };
     let pq_plan = get_read_plan(
         session,
         files_by_store,

@@ -2396,3 +2396,49 @@ async fn delta_table_partition_prefix_pushes_down_over_split_files() -> TestResu
     );
     Ok(())
 }
+
+// --- Deletion vectors ---
+
+/// A limit handed to the parquet scan counts raw rows, but deletion vectors
+/// are applied above the scan, so a file with deleted rows would come up
+/// short. The fixture holds ten rows with two deleted; `LIMIT 8` must return
+/// all eight live rows whether the limit arrives through the provider (a
+/// plain `LIMIT`) or through a fetch pushed into the exec (`ORDER BY` on the
+/// declared order, whose sort is removed before `LimitPushdown` runs).
+#[tokio::test]
+async fn delta_table_with_deletion_vectors_keeps_limit_above_scan() -> TestResult<()> {
+    let table_url =
+        url::Url::from_directory_path(deltalake_test::utils::TestTables::WithDvSmall.as_path())
+            .unwrap();
+    let table = deltalake_core::open_table(table_url).await?;
+
+    let ctx = create_session().into_inner();
+    ctx.sql("SET datafusion.execution.target_partitions = 1")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("value")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    for sql in [
+        "SELECT value FROM test_table LIMIT 8",
+        "SELECT value FROM test_table ORDER BY value LIMIT 8",
+    ] {
+        let df = ctx.sql(sql).await?;
+        let plan = df.create_physical_plan().await?;
+        let rendered = displayable(plan.as_ref()).indent(true).to_string();
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+        assert!(
+            !rendered.contains("limit=8"),
+            "expected no limit on the parquet scan for `{sql}`:\n{rendered}"
+        );
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows, 8,
+            "`{sql}` lost rows to the deletion vector:\n{rendered}"
+        );
+    }
+    Ok(())
+}
