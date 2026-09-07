@@ -46,6 +46,7 @@ use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::stream::{Stream, StreamExt};
+use indexmap::IndexMap;
 use object_store::path::Path as ObjectStorePath;
 
 use super::plan::KernelScanPlan;
@@ -224,38 +225,34 @@ fn file_reading_input(input: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Executi
 /// This is required to restore correct min/max stats and be able to prove files
 /// are non-overlapping, because chunks from a split file inherit the min/max stats
 /// of the full file.
-fn coalesce_file_ranges(pieces: &[&PartitionedFile]) -> Option<Vec<PartitionedFile>> {
-    let mut order: Vec<&ObjectStorePath> = Vec::new();
-    let mut by_path: HashMap<&ObjectStorePath, Vec<&PartitionedFile>> = HashMap::new();
-    for piece in pieces {
-        let path = &piece.object_meta.location;
-        let entry = by_path.entry(path).or_default();
-        if entry.is_empty() {
-            order.push(path);
-        }
-        entry.push(piece);
+///
+/// Each file is represented by its first piece, borrowed as it came: nothing
+/// is copied for a pushdown that is then refused, and the piece's range is
+/// cleared when the file is materialized (see `plan_sort_pushdown`).
+fn coalesce_file_ranges<'a>(pieces: &[&'a PartitionedFile]) -> Option<Vec<&'a PartitionedFile>> {
+    let mut by_path: IndexMap<&ObjectStorePath, Vec<&'a PartitionedFile>> = IndexMap::new();
+    for &piece in pieces {
+        by_path
+            .entry(&piece.object_meta.location)
+            .or_default()
+            .push(piece);
     }
 
-    let mut files = Vec::with_capacity(order.len());
-    for path in order {
-        let group = by_path.remove(path)?;
-        let mut ranges: Vec<(u64, u64)> = group.iter().map(|piece| piece.range()).collect();
-        ranges.sort_unstable();
-        let mut covered = 0;
-        for (start, end) in ranges {
-            if start != covered {
-                return None;
+    by_path
+        .into_values()
+        .map(|group| {
+            let mut ranges: Vec<(u64, u64)> = group.iter().map(|piece| piece.range()).collect();
+            ranges.sort_unstable();
+            let mut covered = 0;
+            for (start, end) in ranges {
+                if start != covered {
+                    return None;
+                }
+                covered = end;
             }
-            covered = end;
-        }
-        if covered != group[0].object_meta.size {
-            return None;
-        }
-        let mut file = group[0].clone();
-        file.range = None;
-        files.push(file);
-    }
-    Some(files)
+            (covered == group[0].object_meta.size).then_some(group[0])
+        })
+        .collect()
 }
 
 /// Physical execution plan for scanning Delta tables.
@@ -410,6 +407,15 @@ impl DeltaScanExec {
     /// would line the mask up against the wrong rows. That returns the wrong
     /// *data*, not merely the wrong order, and no `SortExec` above can repair
     /// it. (The tables `try_pushdown_sort` refuses outright never get here.)
+    ///
+    /// This is not free. `PushdownSort` offers every `SortExec` to its input,
+    /// and the parquet scan answers `Inexact` for any ordering that leads with
+    /// a file column, rebuilding its `FileScanConfig` - a copy of every
+    /// `PartitionedFile` - and ranking the files by statistics to do so. The
+    /// reordering only pays off under a `LIMIT`, where the TopK sort above can
+    /// finish early; a full sort gains nothing from it. The fetch is not
+    /// visible here (the rule applies it to the answer), so the cost cannot be
+    /// gated on it and is accepted as plan time proportional to the file count.
     fn delegate_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
@@ -778,18 +784,15 @@ impl ExecutionPlan for DeltaScanExec {
             .iter()
             .flat_map(|group| group.iter())
             .collect();
-        let whole_files = if pieces.iter().any(|piece| piece.range.is_some()) {
+        // A byte-range piece stands in for its whole file until the files are
+        // materialized: nothing in between reads the range.
+        let files: Vec<&PartitionedFile> = if pieces.iter().any(|piece| piece.range.is_some()) {
             match coalesce_file_ranges(&pieces) {
-                Some(files) => Some(files),
+                Some(files) => files,
                 None => return unsupported(),
             }
         } else {
-            None
-        };
-        let files: Vec<&PartitionedFile> = match &whole_files {
-            Some(files) => files.iter().collect(),
-            // Avoid copying PartitionedFile values if no files were split
-            None => pieces,
+            pieces
         };
         let parquet_table_schema = file_scan
             .file_source()
@@ -2030,20 +2033,21 @@ mod tests {
         file
     }
 
-    /// Wrapper around [`coalesce_file_ranges`] for testing
-    fn coalesced_paths(pieces: &[PartitionedFile]) -> Option<Vec<(String, bool)>> {
+    /// Wrapper around [`coalesce_file_ranges`] for testing: the path and byte
+    /// range of each representative piece.
+    fn coalesced_paths(pieces: &[PartitionedFile]) -> Option<Vec<(String, (u64, u64))>> {
         let refs: Vec<&PartitionedFile> = pieces.iter().collect();
 
         coalesce_file_ranges(&refs).map(|coalesced| {
             coalesced
                 .into_iter()
-                .map(|file| (file.object_meta.location.to_string(), file.range.is_none()))
+                .map(|file| (file.object_meta.location.to_string(), file.range()))
                 .collect()
         })
     }
 
-    /// Pieces that tile their file become one whole-file entry, keeping the
-    /// order the first piece of each file appeared in.
+    /// Pieces that tile their file are represented by the first of them,
+    /// keeping the order the first piece of each file appeared in.
     #[test]
     fn test_coalesce_file_ranges_reassembles_tiling_pieces() {
         let pieces = vec![
@@ -2053,7 +2057,7 @@ mod tests {
         ];
         assert_eq!(
             coalesced_paths(&pieces),
-            Some(vec![("a".to_string(), true), ("b".to_string(), true)])
+            Some(vec![("a".to_string(), (0, 40)), ("b".to_string(), (0, 60))])
         );
     }
 

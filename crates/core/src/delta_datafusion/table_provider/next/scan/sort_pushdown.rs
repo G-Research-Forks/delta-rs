@@ -192,6 +192,8 @@ impl Bucket {
 ///
 /// * `parquet_read_schema` – physical file columns; its indices address
 ///   `PartitionedFile` statistics directly.
+/// * `files` - Files to be regrouped. May have a range set, but this is ignored,
+///   and the planned pushdown always uses the full file range.
 /// * `target_groups` – desired execution-partition count; the result may hold
 ///   more groups, up to [`group_budget`].
 pub(super) fn plan_sort_pushdown(
@@ -277,11 +279,20 @@ pub(super) fn plan_sort_pushdown(
     }
 
     // --- Every check has passed: materialize the buckets. ---
+    // A file that arrived split into byte ranges is represented by one of its
+    // pieces (see `coalesce_file_ranges`); the copy reads the whole file.
     let buckets: Vec<Bucket> = ordered_buckets
         .into_iter()
         .map(|(key, bucket)| Bucket {
             key,
-            files: bucket.into_iter().cloned().collect(),
+            files: bucket
+                .into_iter()
+                .map(|file| {
+                    let mut file = file.clone();
+                    file.range = None;
+                    file
+                })
+                .collect(),
         })
         .collect();
 
