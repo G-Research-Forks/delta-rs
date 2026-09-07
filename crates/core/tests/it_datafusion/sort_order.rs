@@ -59,6 +59,39 @@ fn collect_string_i64_keys(
     Ok(keys)
 }
 
+/// Check `keys` come back in non-decreasing order.
+fn assert_sorted<T: PartialOrd>(keys: &[T], order: &str) {
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by {order}"
+    );
+}
+
+/// Register `table` as `test_table` with `file_sort_order` declared (none
+/// when empty), apply the session `options`, and run `sql`: the rendered plan
+/// and the result batches.
+async fn run_query(
+    table: &DeltaTable,
+    file_sort_order: &[FileSortColumn],
+    options: &[(&str, &str)],
+    sql: &str,
+) -> TestResult<(String, Vec<RecordBatch>)> {
+    let ctx = create_session().into_inner();
+    for (key, value) in options {
+        ctx.sql(&format!("SET {key} = {value}")).await?;
+    }
+    let provider = table
+        .table_provider()
+        .with_file_sort_order(file_sort_order.iter().cloned())
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok((rendered, batches))
+}
+
 fn delta_write_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new(
@@ -317,19 +350,13 @@ async fn delta_table_sort_order_validation() -> TestResult<()> {
 async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult<()> {
     let table = sorted_delta_table().await?;
 
-    let ctx = create_session().into_inner();
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[FileSortColumn::asc("timestamp")],
+        &[],
+        "SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"",
+    )
+    .await?;
 
     assert!(
         !rendered.contains("SortExec"),
@@ -342,10 +369,7 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
 
     let keys = collect_string_i64_keys(&batches, 0, 1)?;
     assert_eq!(keys.len(), 400);
-    assert!(
-        keys.windows(2).all(|pair| pair[0] <= pair[1]),
-        "results are not sorted by (part, timestamp)"
-    );
+    assert_sorted(&keys, "(part, timestamp)");
     Ok(())
 }
 
@@ -355,28 +379,21 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
 async fn delta_table_partition_prefix_with_sort_pushdown_disabled_keeps_sort() -> TestResult<()> {
     let table = sorted_delta_table().await?;
 
-    let ctx = create_session().into_inner();
-    ctx.sql("SET datafusion.optimizer.enable_sort_pushdown = false")
-        .await?;
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[FileSortColumn::asc("timestamp")],
+        &[("datafusion.optimizer.enable_sort_pushdown", "false")],
+        "SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"",
+    )
+    .await?;
 
     assert!(
         rendered.contains("SortExec"),
         "expected SortExec in plan:\n{rendered}"
     );
-    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-    assert_eq!(rows, 400);
+    let keys = collect_string_i64_keys(&batches, 0, 1)?;
+    assert_eq!(keys.len(), 400);
+    assert_sorted(&keys, "(part, timestamp)");
     Ok(())
 }
 
@@ -397,21 +414,13 @@ async fn delta_table_single_partition_value_concatenates_without_pushdown() -> T
     ])
     .await?;
 
-    let ctx = create_session().into_inner();
-    ctx.sql("SET datafusion.optimizer.enable_sort_pushdown = false")
-        .await?;
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[FileSortColumn::asc("timestamp")],
+        &[("datafusion.optimizer.enable_sort_pushdown", "false")],
+        "SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"",
+    )
+    .await?;
 
     assert!(
         rendered.contains("ProgressiveEvalExec"),
@@ -423,7 +432,7 @@ async fn delta_table_single_partition_value_concatenates_without_pushdown() -> T
     );
     let keys = collect_string_i64_keys(&batches, 0, 1)?;
     assert_eq!(keys.len(), 400);
-    assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_sorted(&keys, "(part, timestamp)");
     Ok(())
 }
 
@@ -446,19 +455,13 @@ async fn delta_table_partition_prefix_overlapping_files_keep_sort() -> TestResul
     }
     assert_eq!(table.snapshot()?.log_data().num_files(), 3);
 
-    let ctx = create_session().into_inner();
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[FileSortColumn::asc("timestamp")],
+        &[],
+        "SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"",
+    )
+    .await?;
 
     assert!(
         rendered.contains("SortExec"),
@@ -467,10 +470,7 @@ async fn delta_table_partition_prefix_overlapping_files_keep_sort() -> TestResul
 
     let keys = collect_string_i64_keys(&batches, 0, 1)?;
     assert_eq!(keys.len(), 300);
-    assert!(
-        keys.windows(2).all(|pair| pair[0] <= pair[1]),
-        "results are not sorted by (part, timestamp)"
-    );
+    assert_sorted(&keys, "(part, timestamp)");
     Ok(())
 }
 
@@ -533,24 +533,16 @@ async fn query_two_partition_prefix(
     table: &DeltaTable,
     target_partitions: usize,
 ) -> TestResult<(String, Vec<(String, i64)>)> {
-    let ctx = create_session().into_inner();
-    ctx.sql(&format!(
-        "SET datafusion.execution.target_partitions = {target_partitions}"
-    ))
+    let (rendered, batches) = run_query(
+        table,
+        &[FileSortColumn::asc("value")],
+        &[(
+            "datafusion.execution.target_partitions",
+            &target_partitions.to_string(),
+        )],
+        "SELECT part, sub, value FROM test_table ORDER BY part, sub, value",
+    )
     .await?;
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("value")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT part, sub, value FROM test_table ORDER BY part, sub, value")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
-
     Ok((rendered, collect_string_i64_keys(&batches, 0, 1)?))
 }
 
@@ -572,10 +564,7 @@ async fn delta_table_partition_prefix_single_target_group_avoids_sort() -> TestR
         "expected every bucket packed into one group:\n{rendered}"
     );
     assert_eq!(keys.len(), 20);
-    assert!(
-        keys.windows(2).all(|pair| pair[0] <= pair[1]),
-        "results are not sorted by (part, sub)"
-    );
+    assert_sorted(&keys, "(part, sub)");
     Ok(())
 }
 
@@ -594,10 +583,7 @@ async fn delta_table_partition_prefix_exceeding_multi_partition_target_avoids_so
         "expected no SortExec in plan:\n{rendered}"
     );
     assert_eq!(keys.len(), 20);
-    assert!(
-        keys.windows(2).all(|pair| pair[0] <= pair[1]),
-        "results are not sorted by (part, sub)"
-    );
+    assert_sorted(&keys, "(part, sub)");
     Ok(())
 }
 
@@ -646,10 +632,7 @@ async fn delta_table_partition_prefix_beyond_group_budget_keeps_merge_only() -> 
         "packed groups cannot be proven disjoint:\n{rendered}"
     );
     assert_eq!(keys.len(), parts as usize);
-    assert!(
-        keys.windows(2).all(|pair| pair[0] <= pair[1]),
-        "results are not sorted by (part, sub)"
-    );
+    assert_sorted(&keys, "(part, sub)");
     Ok(())
 }
 
@@ -1121,21 +1104,13 @@ async fn delta_table_descending_sort_order_degrades_for_ascending_query() -> Tes
 async fn delta_table_descending_overlapping_files_keep_order() -> TestResult<()> {
     let table = desc_delta_table(&[(50, 51), (40, 21)]).await?;
 
-    let ctx = create_session().into_inner();
-    ctx.sql("SET datafusion.execution.target_partitions = 1")
-        .await?;
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::desc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" DESC")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[FileSortColumn::desc("timestamp")],
+        &[("datafusion.execution.target_partitions", "1")],
+        "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" DESC",
+    )
+    .await?;
 
     assert!(
         rendered.contains("2 groups"),
@@ -1160,19 +1135,13 @@ async fn delta_table_descending_overlapping_files_keep_order() -> TestResult<()>
 async fn delta_table_reversed_limit_query_reads_row_groups_backwards() -> TestResult<()> {
     let table = sorted_delta_table().await?;
 
-    let ctx = create_session().into_inner();
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" DESC LIMIT 5")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[FileSortColumn::asc("timestamp")],
+        &[],
+        "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" DESC LIMIT 5",
+    )
+    .await?;
 
     assert!(
         rendered.contains("SortExec"),
@@ -1266,22 +1235,13 @@ async fn query_sorted_with_session_options(
     table: &DeltaTable,
     options: &[(&str, &str)],
 ) -> TestResult<(String, Vec<i64>)> {
-    let ctx = create_session().into_inner();
-    for (key, value) in options {
-        ctx.sql(&format!("SET {key} = {value}")).await?;
-    }
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("timestamp")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
-    let df = ctx
-        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        table,
+        &[FileSortColumn::asc("timestamp")],
+        options,
+        "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+    )
+    .await?;
     Ok((rendered, collect_timestamps(&batches)))
 }
 
@@ -1701,6 +1661,114 @@ async fn nulls_in_last_file_delta_table() -> TestResult<DeltaTable> {
     }
     assert_eq!(table.snapshot()?.log_data().num_files(), 2);
     Ok(table)
+}
+
+/// A declared sort order whose leading column holds nulls declares no
+/// ordering for multi-file groups, so the parquet scan is not order-sensitive
+/// and DataFusion's file-stream work stealing may hand a partition's files to
+/// a sibling. The file groups are still range-ordered with exact statistics,
+/// which is all `ProgressiveEvalRule` reads, so the concatenation it plans is
+/// only correct if the rule also pins every file to its partition. The check
+/// needs a multi-threaded runtime: on one thread the first partition drains
+/// the shared queue before the second starts, and the result is ordered by
+/// accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<()> {
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion_datasource::file_scan_config::FileScanConfig;
+    use datafusion_datasource::source::DataSourceExec;
+
+    fn file_scan_preserves_order(plan: &Arc<dyn ExecutionPlan>) -> Option<bool> {
+        if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
+            let config = scan
+                .data_source()
+                .as_ref()
+                .downcast_ref::<FileScanConfig>()?;
+            return Some(config.preserve_order);
+        }
+        plan.children()
+            .into_iter()
+            .find_map(file_scan_preserves_order)
+    }
+
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                true,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+    // Files large enough for the streams to interleave; nulls only in the last.
+    for (start, nulls) in [(0i64, 0usize), (50_000, 0), (100_000, 0), (150_000, 2)] {
+        table = table
+            .write(vec![nullable_batch(
+                (start..start + 50_000).collect(),
+                nulls,
+            )?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+
+    for _ in 0..5 {
+        let ctx = create_session().into_inner();
+        for (key, value) in [
+            ("datafusion.execution.target_partitions", "2"),
+            // Keep the sort above the scan so the rule proves the boundaries
+            // from the file groups' statistics alone.
+            ("datafusion.optimizer.enable_sort_pushdown", "false"),
+        ] {
+            ctx.sql(&format!("SET {key} = {value}")).await?;
+        }
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("timestamp")])
+            .await?;
+        ctx.register_table("test_table", provider)?;
+
+        let plan = ctx
+            .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let rendered = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            rendered.contains("ProgressiveEvalExec"),
+            "expected ProgressiveEvalExec in plan:\n{rendered}"
+        );
+        assert_eq!(
+            file_scan_preserves_order(&plan),
+            Some(true),
+            "expected the file scan under the concatenation to be order-sensitive:\n{rendered}"
+        );
+
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        let timestamps: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .iter()
+            })
+            .collect();
+        assert_eq!(timestamps.len(), 200_002);
+        // Nulls last: a null key sorts after every value.
+        let keys: Vec<(bool, i64)> = timestamps
+            .iter()
+            .map(|timestamp| (timestamp.is_none(), timestamp.unwrap_or(0)))
+            .collect();
+        assert_sorted(&keys, "timestamp with nulls last");
+    }
+    Ok(())
 }
 
 /// Nulls in the sort column are compatible with the `ProgressiveEvalExec`
@@ -2327,28 +2395,20 @@ async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResu
 async fn delta_table_partition_prefix_pushes_through_round_robin_repartition() -> TestResult<()> {
     let table = sorted_delta_table().await?;
 
-    let ctx = create_session().into_inner();
-    for (key, value) in [
-        ("datafusion.execution.target_partitions", "4"),
-        // Round-robin is only judged beneficial for a scan with more rows than
-        // one batch; this keeps the fixture small instead.
-        ("datafusion.execution.batch_size", "10"),
-    ] {
-        ctx.sql(&format!("SET {key} = {value}"))
-            .await?
-            .collect()
-            .await?;
-    }
     // No declared file sort order: an ordered scan is left unpartitioned, so
     // this path is reachable only without one.
-    ctx.register_table("test_table", table.table_provider().await?)?;
-
-    let df = ctx
-        .sql("SELECT \"timestamp\", value, part FROM test_table ORDER BY part")
-        .await?;
-    let plan = df.create_physical_plan().await?;
-    let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[],
+        &[
+            ("datafusion.execution.target_partitions", "4"),
+            // Round-robin is only judged beneficial for a scan with more rows
+            // than one batch; this keeps the fixture small instead.
+            ("datafusion.execution.batch_size", "10"),
+        ],
+        "SELECT \"timestamp\", value, part FROM test_table ORDER BY part",
+    )
+    .await?;
 
     assert!(
         !rendered.contains("RepartitionExec"),
@@ -2368,10 +2428,7 @@ async fn delta_table_partition_prefix_pushes_through_round_robin_repartition() -
         .map(|(part, _)| part)
         .collect();
     assert_eq!(parts.len(), 400);
-    assert!(
-        parts.windows(2).all(|pair| pair[0] <= pair[1]),
-        "results are not sorted by part"
-    );
+    assert_sorted(&parts, "part");
     Ok(())
 }
 
@@ -2428,10 +2485,7 @@ async fn delta_table_partition_prefix_pushes_down_over_split_files() -> TestResu
 
     let keys = collect_string_i64_keys(&batches, 2, 0)?;
     assert_eq!(keys.len(), 400);
-    assert!(
-        keys.windows(2).all(|pair| pair[0] <= pair[1]),
-        "results are not sorted by (part, timestamp)"
-    );
+    assert_sorted(&keys, "(part, timestamp)");
     Ok(())
 }
 
@@ -2450,23 +2504,17 @@ async fn delta_table_with_deletion_vectors_keeps_limit_above_scan() -> TestResul
             .unwrap();
     let table = deltalake_core::open_table(table_url).await?;
 
-    let ctx = create_session().into_inner();
-    ctx.sql("SET datafusion.execution.target_partitions = 1")
-        .await?;
-    let provider = table
-        .table_provider()
-        .with_file_sort_order([FileSortColumn::asc("value")])
-        .await?;
-    ctx.register_table("test_table", provider)?;
-
     for sql in [
         "SELECT value FROM test_table LIMIT 8",
         "SELECT value FROM test_table ORDER BY value LIMIT 8",
     ] {
-        let df = ctx.sql(sql).await?;
-        let plan = df.create_physical_plan().await?;
-        let rendered = displayable(plan.as_ref()).indent(true).to_string();
-        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        let (rendered, batches) = run_query(
+            &table,
+            &[FileSortColumn::asc("value")],
+            &[("datafusion.execution.target_partitions", "1")],
+            sql,
+        )
+        .await?;
 
         assert!(
             !rendered.contains("limit=8"),

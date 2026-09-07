@@ -171,6 +171,21 @@ struct Bucket {
     files: Vec<PartitionedFile>,
 }
 
+impl Bucket {
+    /// Cut the bucket's files into `groups` contiguous pieces, each a bucket
+    /// under the same key so that its statistics stay exact. See
+    /// [`chunk_ordered_files`] for the exact count.
+    fn split(self, groups: usize) -> impl Iterator<Item = Bucket> {
+        let key = self.key;
+        chunk_ordered_files(self.files, groups)
+            .into_iter()
+            .map(move |piece| Bucket {
+                key: key.clone(),
+                files: piece.into_inner(),
+            })
+    }
+}
+
 /// Regroup `files` so that reading each group in order yields the ordering
 /// described by `shape`, or return `None` when that cannot be guaranteed (the
 /// caller then reports `Unsupported`).
@@ -374,19 +389,10 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Option<Vec<Vec<Bucket>>
     let target = target.max(1);
     let max_groups = group_budget(target);
 
-    // Split any bucket the file-id dictionary cannot key; every piece keeps
-    // the bucket's key, so its statistics stay exact.
+    // Split any bucket the file-id dictionary cannot key.
     let buckets: Vec<Bucket> = buckets
         .into_iter()
-        .flat_map(|bucket| {
-            let key = bucket.key;
-            chunk_ordered_files(bucket.files, 1)
-                .into_iter()
-                .map(move |piece| Bucket {
-                    key: key.clone(),
-                    files: piece.into_inner(),
-                })
-        })
+        .flat_map(|bucket| bucket.split(1))
         .collect();
     if buckets.is_empty() {
         return Some(Vec::new());
@@ -419,17 +425,7 @@ fn split_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<Vec<Bucket>> {
         let files = bucket.files.len();
         let groups_left = target.saturating_sub(out.len()).max(1);
         let share = (groups_left * files).div_ceil(files_left).clamp(1, files);
-        let key = bucket.key;
-        out.extend(
-            chunk_ordered_files(bucket.files, share)
-                .into_iter()
-                .map(|piece| {
-                    vec![Bucket {
-                        key: key.clone(),
-                        files: piece.into_inner(),
-                    }]
-                }),
-        );
+        out.extend(bucket.split(share).map(|piece| vec![piece]));
         files_left -= files;
     }
     out
@@ -450,18 +446,6 @@ fn pack_buckets(
     let mut run: Vec<Bucket> = Vec::new();
     let mut run_files = 0;
 
-    /// Emit the open run and charge it against the remaining files.
-    fn close(
-        run: &mut Vec<Bucket>,
-        run_files: &mut usize,
-        out: &mut Vec<Vec<Bucket>>,
-        files_left: &mut usize,
-    ) {
-        *files_left -= *run_files;
-        *run_files = 0;
-        out.push(std::mem::take(run));
-    }
-
     for bucket in buckets {
         buckets_left -= 1;
         let files = bucket.files.len();
@@ -470,8 +454,10 @@ fn pack_buckets(
             run_files + files <= MAX_PARTITION_DICT_CARDINALITY
                 && (!cut_on_leading_change || last.key[..leading] == bucket.key[..leading])
         });
+        // Emit the open run and charge it against the remaining files.
         if !run.is_empty() && !extends {
-            close(&mut run, &mut run_files, &mut out, &mut files_left);
+            files_left -= std::mem::take(&mut run_files);
+            out.push(std::mem::take(&mut run));
         }
         run_files += files;
         run.push(bucket);
@@ -483,7 +469,8 @@ fn pack_buckets(
         let groups_left = target.saturating_sub(out.len()).max(1);
         let share = files_left.div_ceil(groups_left);
         if run_files >= share || buckets_left < groups_left {
-            close(&mut run, &mut run_files, &mut out, &mut files_left);
+            files_left -= std::mem::take(&mut run_files);
+            out.push(std::mem::take(&mut run));
         }
     }
     if !run.is_empty() {
@@ -1099,6 +1086,24 @@ mod tests {
         .unwrap()
     }
 
+    /// Offer `columns`, ascending, to `scan` and return the regrouped exec.
+    fn exact_pushdown(
+        scan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        columns: &[&str],
+    ) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        let schema = scan.schema();
+        let order: Vec<PhysicalSortExpr> = columns
+            .iter()
+            .map(|name| asc(schema.index_of(name).unwrap(), name))
+            .collect();
+        match scan.try_pushdown_sort(&order).unwrap() {
+            SortOrderPushdownResult::Exact { inner } => inner,
+            other => panic!("expected an exact pushdown, got {other:?}"),
+        }
+    }
+
     /// Four files across two partition values: every file sorted by timestamp,
     /// non-overlapping within a partition, overlapping across partitions — so
     /// `ORDER BY part, timestamp` is only answerable without a sort by
@@ -1128,7 +1133,7 @@ mod tests {
     /// schema adaptation of filters and projections pushed in afterwards.
     #[tokio::test]
     async fn pushdown_carries_the_scan_settings_across() {
-        use datafusion::physical_plan::{ExecutionPlan, SortOrderPushdownResult};
+        use datafusion::physical_plan::ExecutionPlan;
         use datafusion_datasource::file_scan_config::FileScanConfig;
         use datafusion_datasource::source::DataSourceExec;
 
@@ -1151,17 +1156,9 @@ mod tests {
             .await
             .unwrap();
         let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
-        let schema = scan.schema();
-        let sort_col = |name: &str| asc(schema.index_of(name).unwrap(), name);
         let before = file_scan(scan.children()[0]).clone();
 
-        let pushed = match scan
-            .try_pushdown_sort(&[sort_col("part"), sort_col("timestamp")])
-            .unwrap()
-        {
-            SortOrderPushdownResult::Exact { inner } => inner,
-            other => panic!("expected an exact pushdown, got {other:?}"),
-        };
+        let pushed = exact_pushdown(&scan, &["part", "timestamp"]);
         let after = file_scan(pushed.children()[0]);
 
         assert_eq!(after.object_store_url, before.object_store_url);
@@ -1268,7 +1265,6 @@ mod tests {
     /// lets a pushed fetch prune earlier row groups.
     #[tokio::test]
     async fn pushdown_marks_the_regrouped_scan_order_sensitive() {
-        use datafusion::physical_plan::SortOrderPushdownResult;
         use datafusion_datasource::file_scan_config::FileScanConfig;
         use datafusion_datasource::source::DataSourceExec;
 
@@ -1306,16 +1302,7 @@ mod tests {
             .unwrap();
 
         let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
-        let schema = scan.schema();
-        let sort_col = |name: &str| asc(schema.index_of(name).unwrap(), name);
-
-        let pushed = match scan
-            .try_pushdown_sort(&[sort_col("part"), sort_col("timestamp")])
-            .unwrap()
-        {
-            SortOrderPushdownResult::Exact { inner } => inner,
-            other => panic!("expected an exact pushdown, got {other:?}"),
-        };
+        let pushed = exact_pushdown(&scan, &["part", "timestamp"]);
 
         let child = Arc::clone(pushed.children()[0]);
         let file_scan = child
@@ -1344,9 +1331,7 @@ mod tests {
     async fn with_new_children_drops_pushdown_state() {
         use datafusion::physical_expr::Partitioning;
         use datafusion::physical_plan::repartition::RepartitionExec;
-        use datafusion::physical_plan::{
-            ExecutionPlan, ExecutionPlanProperties, SortOrderPushdownResult,
-        };
+        use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
         use crate::delta_datafusion::{FileSortColumn, create_session};
 
@@ -1359,14 +1344,7 @@ mod tests {
             .unwrap();
 
         let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
-        let schema = scan.schema();
-        let sort_col = |name: &str| asc(schema.index_of(name).unwrap(), name);
-        let order = vec![sort_col("part"), sort_col("timestamp")];
-
-        let pushed = match scan.try_pushdown_sort(&order).unwrap() {
-            SortOrderPushdownResult::Exact { inner } => inner,
-            other => panic!("expected an exact pushdown, got {other:?}"),
-        };
+        let pushed = exact_pushdown(&scan, &["part", "timestamp"]);
 
         let leads_with_part = |plan: &Arc<dyn ExecutionPlan>| {
             plan.properties()
