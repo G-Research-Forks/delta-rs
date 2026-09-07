@@ -271,9 +271,9 @@ impl KeyTypes {
 /// swap roles: its maximum is where a file starts in sort order and its
 /// minimum where it ends, as `MinMaxStatistics` arranges them.
 ///
-/// Values that cannot be compared refuse the files rather than being ordered
-/// arbitrarily. Nulls among the sort columns are the caller's concern: the
-/// bounds say nothing about them.
+/// Values that cannot be compared, and null bounds, refuse the files rather
+/// than being ordered arbitrarily. Nulls among the sort columns are the
+/// caller's concern: the bounds say nothing about them.
 pub(super) fn non_overlapping_file_order<T>(
     items: Vec<T>,
     file: impl Fn(&T) -> &PartitionedFile,
@@ -307,9 +307,16 @@ fn non_overlapping_order<'a>(
             let column = sort_expr.expr.downcast_ref::<Column>()?;
             let column_stats = stats.column_statistics.get(column.index())?;
             // Read the bounds whatever their precision, as `MinMaxStatistics`
-            // does.
-            let min = column_stats.min_value.get_value()?.clone();
-            let max = column_stats.max_value.get_value()?.clone();
+            // does. A null bound is an absent one: stats parsed against a
+            // schema wider than the columns a writer indexed carry typed
+            // nulls for the rest, and `compare_rows` would place such a
+            // bound after every value rather than nowhere.
+            let min = column_stats.min_value.get_value()?;
+            let max = column_stats.max_value.get_value()?;
+            if min.is_null() || max.is_null() {
+                return None;
+            }
+            let (min, max) = (min.clone(), max.clone());
             let (start, end) = if sort_expr.options.descending {
                 (max, min)
             } else {
@@ -1181,6 +1188,29 @@ mod tests {
 
         // Files within each group must still be non-overlapping.
         assert!(groups.len() >= 2);
+    }
+
+    #[test]
+    fn test_non_overlapping_file_order_rejects_null_bounds() {
+        // `b` carries typed-null bounds, as a file whose statistics omit the
+        // sort column does once parsed against the table schema. Its real
+        // rows could fall anywhere, so no order is non-overlapping.
+        let mut unbounded = stats_file("b", 0, 0);
+        unbounded.statistics = Some(Arc::new(Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                min_value: Precision::Exact(ScalarValue::Int64(None)),
+                max_value: Precision::Exact(ScalarValue::Int64(None)),
+                ..Default::default()
+            }],
+        }));
+        let files = vec![stats_file("a", 0, 99), unbounded, stats_file("c", 100, 199)];
+
+        let result = non_overlapping_file_order(files, |file| file, &int64_asc_ordering());
+
+        assert!(result.is_err());
     }
 
     #[test]
