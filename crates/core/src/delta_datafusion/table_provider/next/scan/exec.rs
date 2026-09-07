@@ -154,10 +154,7 @@ fn derive_output_orderings(
     orderings
 }
 
-/// Whether `stat` describes a column holding exactly one non-null value, so
-/// that every non-empty subset of its rows has the same bounds and null count
-/// as the whole. Partition-column statistics carry no sums or distinct counts
-/// that could disagree.
+/// Whether `stat` describes a column holding exactly one non-null value
 fn is_single_valued(stat: &ColumnStatistics) -> bool {
     stat.null_count == Precision::Exact(0)
         && matches!(
@@ -168,12 +165,6 @@ fn is_single_valued(stat: &ColumnStatistics) -> bool {
 
 /// Descend through wrappers that hand their input's partitions on untouched -
 /// same rows, same partition, same order - to whatever they wrap.
-///
-/// Only wrappers known to have that property are crossed; today that is the
-/// cooperative-yield wrapper `EnsureCooperative` may add around a leaf. The
-/// claim checked through this function is per partition, so a node that
-/// merely maintains order within each output partition, such as an
-/// order-preserving repartition, does not qualify.
 fn pass_through_leaf(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     let mut plan = plan;
     while let Some(cooperative) = plan.downcast_ref::<CooperativeExec>() {
@@ -210,20 +201,7 @@ fn file_group_extents(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<FileExten
 
 /// Whether `new` reads exactly the file groups `old` did, in the same order.
 ///
-/// This is the property a [`PushedSort`] depends on: it claims the input's
-/// partitions are range-ordered on an ordering that the arrangement of the
-/// files - not the node reading them - establishes. A rebuild that only
-/// attaches a filter, adjusts a projection or refreshes statistics keeps it;
-/// any regrouping or file splitting does not. An input whose grouping cannot be
-/// read is treated as changed, so the claim is dropped rather than assumed.
-///
-/// Dropping it fails closed at a price. By the time the child is replaced,
-/// `PushdownSort` has already deleted the `SortExec`, so the merge above is
-/// left with a requirement nothing satisfies and `SanityCheckPlan` fails the
-/// query rather than letting it return misordered rows. That is the right
-/// failure, but it means a rule that wraps the child in a node that
-/// [`pass_through_leaf`] does not cross turns into a planning error instead of
-/// a slower plan; extend that function when such a wrapper appears.
+/// Required for a [`PushedSort`] to remain compatible when the input changes.
 fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
     match (file_group_extents(old), file_group_extents(new)) {
         (Some(old), Some(new)) => old == new,
@@ -232,13 +210,6 @@ fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPl
 }
 
 /// See through a round-robin repartition to the plan that actually reads files.
-///
-/// `EnforceDistribution` runs long before `PushdownSort`, so by the time a sort
-/// is offered an unordered scan has usually already had a `RepartitionExec`
-/// inserted beneath this exec purely for parallelism - this exec requires no
-/// particular distribution of its input. A sort pushdown replaces that with
-/// parallelism that carries an order, so the repartition can be dropped. Any
-/// other partitioning was asked for on purpose and is left alone.
 fn file_reading_input(input: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
     match input.downcast_ref::<RepartitionExec>() {
         Some(repartition) => matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
@@ -248,16 +219,11 @@ fn file_reading_input(input: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Executi
 }
 
 /// Put byte-range pieces of the same file back together, keeping first-appearance
-/// order. `None` when some file's pieces do not tile it exactly.
+/// order. Returns `None` if any files are only partially read.
 ///
-/// `EnforceDistribution` may also have split files into byte ranges for
-/// parallelism. Each piece carries a clone of the whole file's statistics, so
-/// treating pieces as distinct files makes two pieces of one file look like two
-/// files with identical min/max - an overlap that is not there, which refuses
-/// the pushdown - and counts that file's rows once per piece in the regrouped
-/// statistics. The regrouping supersedes the split, so undo it first. A range
-/// that does not tile its file was narrowed by someone else and is never
-/// widened here.
+/// This is required to restore correct min/max stats and be able to prove files
+/// are non-overlapping, because chunks from a split file inherit the min/max stats
+/// of the full file.
 fn coalesce_file_ranges(pieces: &[&PartitionedFile]) -> Option<Vec<PartitionedFile>> {
     let mut order: Vec<&ObjectStorePath> = Vec::new();
     let mut by_path: HashMap<&ObjectStorePath, Vec<&PartitionedFile>> = HashMap::new();
@@ -333,9 +299,7 @@ pub struct DeltaScanExec {
     /// Result of a successful sort pushdown, or `None` without one. Valid only
     /// for the file grouping it was computed against.
     pushed: Option<Arc<PushedSort>>,
-    /// Whether any scanned file carries a deletion vector, sampled while
-    /// [`Self::selection_vectors`] is still complete - it is drained as the
-    /// masks are consumed during execution.
+    /// Whether any scanned file carries a deletion vector
     has_selection_vectors: bool,
 }
 
@@ -463,11 +427,7 @@ impl DeltaScanExec {
         ) else {
             return Ok(SortOrderPushdownResult::Unsupported);
         };
-        // Whatever the child answers, it was rebuilt for the requested order,
-        // not for the one a previous regrouping claimed: the parquet scan's
-        // `Inexact` path reorders or reverses row groups within each file
-        // while leaving the file groups - which is all `with_new_input`
-        // compares - untouched. Advertise only what the new child does.
+        // Push down the sort to the child, rebuilding this exec's input with the re-ordered result
         Ok(self
             .input
             .try_pushdown_sort(&child_order)?
@@ -476,11 +436,11 @@ impl DeltaScanExec {
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        // A pushed-down sort describes the file grouping `try_pushdown_sort`
-        // built, so it survives a child that was rebuilt around the same groups.
         let pushed = self
             .pushed
             .clone()
+            // A pushed-down sort describes the file grouping `try_pushdown_sort`
+            // built, so it survives a child that was rebuilt around the same groups.
             .filter(|_| grouping_is_unchanged(&self.input, &input));
         self.with_input(input, pushed)
     }
@@ -733,11 +693,11 @@ impl ExecutionPlan for DeltaScanExec {
         self.input.fetch()
     }
 
-    /// A fetch handed to the parquet scan counts raw rows, but deletion
-    /// vectors are applied above it, so a scan carrying any would come up
-    /// short. Refusing the fetch leaves the limit to a node above this one.
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         if self.has_selection_vectors {
+            // A fetch handed to the parquet scan counts raw rows, but deletion
+            // vectors are applied above it, so a scan carrying any would come up
+            // short. Refusing the fetch leaves the limit to a node above this one.
             return None;
         }
         Some(self.with_new_input(self.input.with_fetch(limit)?))
@@ -818,8 +778,6 @@ impl ExecutionPlan for DeltaScanExec {
             .iter()
             .flat_map(|group| group.iter())
             .collect();
-        // Nothing is copied while the scan is unsplit, which is the common case
-        // and the one probed by every `ORDER BY` over this scan.
         let whole_files = if pieces.iter().any(|piece| piece.range.is_some()) {
             match coalesce_file_ranges(&pieces) {
                 Some(files) => Some(files),
@@ -830,6 +788,7 @@ impl ExecutionPlan for DeltaScanExec {
         };
         let files: Vec<&PartitionedFile> = match &whole_files {
             Some(files) => files.iter().collect(),
+            // Avoid copying PartitionedFile values if no files were split
             None => pieces,
         };
         let parquet_table_schema = file_scan
@@ -839,11 +798,8 @@ impl ExecutionPlan for DeltaScanExec {
             .clone();
         let target_groups = self.input.properties().partitioning.partition_count();
 
-        // Try to form new groups ordered by the partition columns; the config
-        // is only cloned once that has succeeded, so the Unsupported paths -
-        // probed on every ORDER BY over this scan - copy nothing. The plan may
-        // hold more groups than the input has partitions, within the bounds
-        // `sort_pushdown::group_budget` explains.
+        // Try to form new groups ordered by the partition columns.
+        // Try to avoid expensive metadata copying before this point.
         let Some(plan) = super::sort_pushdown::plan_sort_pushdown(
             &shape,
             &self.scan_plan.parquet_read_schema,
@@ -856,13 +812,10 @@ impl ExecutionPlan for DeltaScanExec {
 
         let (file_groups, statistics) =
             compute_all_files_statistics(plan.file_groups, parquet_table_schema, true, false)?;
-        // Rebuilt field by field rather than through
+        // Rebuild the FileScanConfig field by field rather than through
         // `FileScanConfigBuilder::from(file_scan.clone())`: cloning the config
         // deep-copies every `PartitionedFile` only for `with_file_groups` to
-        // drop them again, which doubles the per-file copying of a scan over
-        // tens of thousands of files. These are exactly the fields that
-        // `From<FileScanConfig>` carries across, so a field added to it
-        // upstream has to be added here too.
+        // drop them again. This code needs to be updated if a new field is added.
         let new_file_scan = FileScanConfigBuilder::new(
             file_scan.object_store_url.clone(),
             Arc::clone(file_scan.file_source()),
@@ -2070,20 +2023,23 @@ mod tests {
         Ok((kernel_type, Arc::new(scan_plan)))
     }
 
+    /// Create a PartitionedFile with a specified range
     fn piece(path: &str, size: u64, range: Option<(i64, i64)>) -> PartitionedFile {
         let mut file = PartitionedFile::new(path.to_string(), size);
         file.range = range.map(|(start, end)| datafusion_datasource::FileRange { start, end });
         file
     }
 
+    /// Wrapper around [`coalesce_file_ranges`] for testing
     fn coalesced_paths(pieces: &[PartitionedFile]) -> Option<Vec<(String, bool)>> {
         let refs: Vec<&PartitionedFile> = pieces.iter().collect();
-        Some(
-            coalesce_file_ranges(&refs)?
+
+        coalesce_file_ranges(&refs).map(|coalesced| {
+            coalesced
                 .into_iter()
                 .map(|file| (file.object_meta.location.to_string(), file.range.is_none()))
-                .collect(),
-        )
+                .collect()
+        })
     }
 
     /// Pieces that tile their file become one whole-file entry, keeping the
@@ -2101,8 +2057,7 @@ mod tests {
         );
     }
 
-    /// A range nobody split - one that leaves part of the file unread - is
-    /// never widened; the pushdown gives up instead.
+    /// Coalescing file ranges should fail if any file is not fully covered
     #[test]
     fn test_coalesce_file_ranges_refuses_a_partial_file() {
         assert_eq!(coalesced_paths(&[piece("a", 100, Some((0, 40)))]), None);
@@ -2113,8 +2068,8 @@ mod tests {
             ]),
             None
         );
-        // A whole-file entry alongside pieces of the same file would be read
-        // twice over.
+        // A whole-file entry alongside pieces of the same file should also be rejected,
+        // otherwise this would be read twice over.
         assert_eq!(
             coalesced_paths(&[piece("a", 100, None), piece("a", 100, Some((0, 100)))]),
             None
@@ -2166,7 +2121,7 @@ mod tests {
     }
 
     /// Wrappers that pass partitions through untouched do not hide the
-    /// grouping; anything else does, and the claim is dropped.
+    /// grouping. Any unknown wrappers are assumed to possibly change the grouping.
     #[test]
     fn test_grouping_is_unchanged_looks_through_pass_through_wrappers() {
         let scan = parquet_scan(&[&[("a", 100, None)], &[("b", 100, None)]]);

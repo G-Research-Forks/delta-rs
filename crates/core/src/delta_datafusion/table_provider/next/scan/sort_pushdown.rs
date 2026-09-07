@@ -72,8 +72,8 @@ pub(super) struct OrderShape {
 }
 
 /// Re-express `order`, whose columns are bound to `from`, over `to` by column
-/// name. `None` when a sort expression is not a plain column or `to` has no
-/// column of that name.
+/// name. Returns `None` when a sort expression is not a plain column or `to`
+/// has no column of that name.
 pub(super) fn rebind_ordering(
     order: &[PhysicalSortExpr],
     from: &SchemaRef,
@@ -175,9 +175,6 @@ struct Bucket {
 /// described by `shape`, or return `None` when that cannot be guaranteed (the
 /// caller then reports `Unsupported`).
 ///
-/// Files are borrowed until every check has passed, so that a refusal - the
-/// common outcome probed on every ORDER BY over this scan - copies nothing.
-///
 /// * `parquet_read_schema` – physical file columns; its indices address
 ///   `PartitionedFile` statistics directly.
 /// * `target_groups` – desired execution-partition count; the result may hold
@@ -197,6 +194,7 @@ pub(super) fn plan_sort_pushdown(
 
     // --- Pair every file with its exact partition-prefix key. ---
     // Sort lightweight (key, reference) pairs rather than the large file objects.
+    // Files are borrowed until every check has passed to keep a failed pushdown-sort cheap.
     let mut keyed: Vec<(Vec<ScalarValue>, &PartitionedFile)> = Vec::with_capacity(files.len());
     let mut key_types = KeyTypes::default();
     for &file in files {
@@ -222,9 +220,9 @@ pub(super) fn plan_sort_pushdown(
     // --- Cut the sorted files into buckets of equal prefix key. ---
     // One comparator decides both the bucket boundary and its validity: equal
     // keys extend the current bucket and a strict step opens a new one; the
-    // keys were sorted with the same comparator, so any other outcome is a
-    // backstop, not an expected path. Buckets hold references: nothing has
-    // been cloned yet.
+    // keys were sorted with the same comparator, so any other outcome is unexpected
+    // and prevents the pushdown-sort from applying.
+    // Buckets hold references: nothing has been cloned yet.
     let mut key_buckets: Vec<(Vec<ScalarValue>, Vec<&PartitionedFile>)> = Vec::new();
     for (key, file) in keyed {
         match key_buckets.last_mut() {
@@ -237,9 +235,8 @@ pub(super) fn plan_sort_pushdown(
         }
     }
 
-    // --- Order each bucket on the suffix, refusing overlap. Still by
-    //     reference: a refusal, the common outcome probed on every ORDER BY
-    //     over this scan, must copy nothing. ---
+    // --- Order each bucket on the suffix, refusing overlap ---
+    // Still keep working with references only.
     let mut ordered_buckets: Vec<(Vec<ScalarValue>, Vec<&PartitionedFile>)> =
         Vec::with_capacity(key_buckets.len());
     for (key, bucket) in key_buckets {
@@ -402,6 +399,8 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Option<Vec<Vec<Bucket>>
         if groups.len() <= max_groups {
             groups
         } else {
+            // Failed to pack into fewer than the max allowed, fall back to allowing
+            // buckets to be split within a run of a prefix column.
             pack_buckets(groups.into_iter().flatten().collect(), target, false)
         }
     };

@@ -251,28 +251,15 @@ impl KeyTypes {
 
 /// Arrange `items` in the order in which their files (`file` reads the
 /// `PartitionedFile` off an item) are mutually non-overlapping on `ordering`.
-/// When they overlap or cannot be placed, `Err` hands the items back as they
+/// When they overlap or cannot be ordered, `Err` hands the items back as they
 /// came.
 ///
-/// This is `FileScanConfig::split_groups_by_statistics` specialised to the
-/// single-group answer, which is all its callers accept. That routine builds
-/// a `RecordBatch` per endpoint, a `RowConverter`, and a re-clone of every
-/// file - once per call, and the sort pushdown calls it once per bucket of a
-/// daily- or hourly-partitioned table.
+/// This is a specialised version of `FileScanConfig::split_groups_by_statistics`,
+/// which splits files into multiple groups. This version only forms a single
+/// group and avoids extra overhead involved in split_groups_by_statistics
+/// like cloning every file.
 ///
-/// The result is identical. `split_groups_by_statistics` sorts files by their
-/// min key and first-fit bin packs them, appending a file to a group when it
-/// starts after that group's last file ends. It lands in one group exactly
-/// when every file is appended to the first, that is when each file's max
-/// precedes the next file's min in min-sorted order - so comparing the endpoint
-/// tuples directly decides it, and the order it accepts is that same min-sorted
-/// order. Endpoints are per-column extrema compared under the sort options,
-/// which is what the row encoding there does. A descending column's extrema
-/// swap roles: its maximum is where a file starts in sort order and its
-/// minimum where it ends, as `MinMaxStatistics` arranges them.
-///
-/// Values that cannot be compared refuse the files rather than being ordered
-/// arbitrarily. Nulls among the sort columns are the caller's concern: the
+/// Nulls among the sort columns are the caller's concern: the
 /// bounds say nothing about them.
 pub(super) fn non_overlapping_file_order<T>(
     items: Vec<T>,
@@ -319,6 +306,7 @@ fn non_overlapping_order<'a>(
             ends.push(end);
         }
         if !(key_types.accept(&starts) && key_types.accept(&ends)) {
+            // This file has different types for the key columns to what has been seen before
             return None;
         }
         ranges.push((starts, ends, index));
