@@ -1663,6 +1663,114 @@ async fn nulls_in_last_file_delta_table() -> TestResult<DeltaTable> {
     Ok(table)
 }
 
+/// A declared sort order whose leading column holds nulls declares no
+/// ordering for multi-file groups, so the parquet scan is not order-sensitive
+/// and DataFusion's file-stream work stealing may hand a partition's files to
+/// a sibling. The file groups are still range-ordered with exact statistics,
+/// which is all `ProgressiveEvalRule` reads, so the concatenation it plans is
+/// only correct if the rule also pins every file to its partition. The check
+/// needs a multi-threaded runtime: on one thread the first partition drains
+/// the shared queue before the second starts, and the result is ordered by
+/// accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<()> {
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion_datasource::file_scan_config::FileScanConfig;
+    use datafusion_datasource::source::DataSourceExec;
+
+    fn file_scan_preserves_order(plan: &Arc<dyn ExecutionPlan>) -> Option<bool> {
+        if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
+            let config = scan
+                .data_source()
+                .as_ref()
+                .downcast_ref::<FileScanConfig>()?;
+            return Some(config.preserve_order);
+        }
+        plan.children()
+            .into_iter()
+            .find_map(file_scan_preserves_order)
+    }
+
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                true,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+    // Files large enough for the streams to interleave; nulls only in the last.
+    for (start, nulls) in [(0i64, 0usize), (50_000, 0), (100_000, 0), (150_000, 2)] {
+        table = table
+            .write(vec![nullable_batch(
+                (start..start + 50_000).collect(),
+                nulls,
+            )?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+
+    for _ in 0..5 {
+        let ctx = create_session().into_inner();
+        for (key, value) in [
+            ("datafusion.execution.target_partitions", "2"),
+            // Keep the sort above the scan so the rule proves the boundaries
+            // from the file groups' statistics alone.
+            ("datafusion.optimizer.enable_sort_pushdown", "false"),
+        ] {
+            ctx.sql(&format!("SET {key} = {value}")).await?;
+        }
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("timestamp")])
+            .await?;
+        ctx.register_table("test_table", provider)?;
+
+        let plan = ctx
+            .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let rendered = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            rendered.contains("ProgressiveEvalExec"),
+            "expected ProgressiveEvalExec in plan:\n{rendered}"
+        );
+        assert_eq!(
+            file_scan_preserves_order(&plan),
+            Some(true),
+            "expected the file scan under the concatenation to be order-sensitive:\n{rendered}"
+        );
+
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        let timestamps: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .iter()
+            })
+            .collect();
+        assert_eq!(timestamps.len(), 200_002);
+        // Nulls last: a null key sorts after every value.
+        let keys: Vec<(bool, i64)> = timestamps
+            .iter()
+            .map(|timestamp| (timestamp.is_none(), timestamp.unwrap_or(0)))
+            .collect();
+        assert_sorted(&keys, "timestamp with nulls last");
+    }
+    Ok(())
+}
+
 /// Nulls in the sort column are compatible with the `ProgressiveEvalExec`
 /// concatenation when they are confined to the last partition of an
 /// ascending nulls-last ordering: every partition boundary is still provably

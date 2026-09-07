@@ -59,8 +59,8 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
             let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
                 return Ok(Transformed::no(plan));
             };
-            let replacement =
-                ProgressiveEvalExec::new(Arc::clone(input), Some(ranges), merge.fetch());
+            let input = preserve_input_order(Arc::clone(input))?;
+            let replacement = ProgressiveEvalExec::new(input, Some(ranges), merge.fetch());
             Ok(Transformed::yes(Arc::new(replacement) as _))
         })
         .data()
@@ -94,6 +94,24 @@ fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
             .downcast_ref::<HashJoinExec>()
             .is_some())
     })
+}
+
+/// Mark every node of `plan` order-sensitive, so that data sources keep the
+/// partition-to-data mapping their per-partition statistics describe.
+///
+/// A file scan that declares no output ordering is free to let its sibling
+/// streams steal unopened files from one another at execution time, which is
+/// what `datafusion.execution.enable_file_stream_work_stealing` does by
+/// default. The partition boundaries proven above are then meaningless: a
+/// partition can emit rows planned for another. This is the case for a scan
+/// under a per-partition `SortExec` whose file groups were arranged by
+/// statistics without an ordering being declared for them.
+fn preserve_input_order(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_down(|plan| match plan.with_preserve_order(true) {
+        Some(pinned) => Ok(Transformed::yes(pinned)),
+        None => Ok(Transformed::no(plan)),
+    })
+    .data()
 }
 
 /// To be able to convert to a ProgressiveEval, we need the partitions to
