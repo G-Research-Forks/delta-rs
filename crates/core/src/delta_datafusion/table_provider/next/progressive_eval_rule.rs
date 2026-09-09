@@ -22,6 +22,8 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::source::DataSourceExec;
 
 use super::progressive_eval::ProgressiveEvalExec;
 use std::cmp::Ordering;
@@ -96,7 +98,7 @@ fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
     })
 }
 
-/// Mark every node of `plan` order-sensitive, so that data sources keep the
+/// Mark the data sources under `plan` order-sensitive, so that they keep the
 /// partition-to-data mapping their per-partition statistics describe.
 ///
 /// A file scan that declares no output ordering is free to let its sibling
@@ -106,12 +108,33 @@ fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
 /// partition can emit rows planned for another. This is the case for a scan
 /// under a per-partition `SortExec` whose file groups were arranged by
 /// statistics without an ordering being declared for them.
+///
+/// Only leaves are asked: the nodes above forward `with_preserve_order` to
+/// their children and rebuild themselves, which the walk already does for the
+/// ancestors of a changed leaf. A file scan that keeps its files local is
+/// left as it is - `FileScanConfig::with_preserve_order` copies every file
+/// even when the flag already matches, and a scan regrouped for a pushed-down
+/// sort is already order-sensitive.
 fn preserve_input_order(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-    plan.transform_down(|plan| match plan.with_preserve_order(true) {
-        Some(pinned) => Ok(Transformed::yes(pinned)),
-        None => Ok(Transformed::no(plan)),
+    plan.transform_down(|plan| {
+        if !plan.children().is_empty() || scan_keeps_files_local(&plan) {
+            return Ok(Transformed::no(plan));
+        }
+        match plan.with_preserve_order(true) {
+            Some(pinned) => Ok(Transformed::yes(pinned)),
+            None => Ok(Transformed::no(plan)),
+        }
     })
     .data()
+}
+
+/// Whether `plan` is a file scan whose streams cannot take each other's files:
+/// order-sensitive, or partitioned by file group, which disables the sharing
+/// as well.
+fn scan_keeps_files_local(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.downcast_ref::<DataSourceExec>()
+        .and_then(|scan| scan.data_source().as_ref().downcast_ref::<FileScanConfig>())
+        .is_some_and(|config| config.preserve_order || config.partitioned_by_file_group)
 }
 
 /// To be able to convert to a ProgressiveEval, we need the partitions to
@@ -676,5 +699,49 @@ mod tests {
             "expected SortPreservingMergeExec, got {}",
             optimized.name()
         );
+    }
+
+    /// A parquet scan over one file, order-sensitive or not.
+    fn parquet_scan(preserve_order: bool) -> Arc<dyn ExecutionPlan> {
+        use datafusion::datasource::physical_plan::ParquetSource;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion_datasource::file_groups::FileGroup;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::{PartitionedFile, TableSchema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let source = Arc::new(ParquetSource::new(TableSchema::new(schema, vec![])));
+        let group: FileGroup = [PartitionedFile::new("a", 10)].into_iter().collect();
+        let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file_groups(vec![group])
+            .with_preserve_order(preserve_order)
+            .build();
+        DataSourceExec::from_data_source(config)
+    }
+
+    /// A scan that already keeps its files local is handed back as it is:
+    /// asking it would copy every file for nothing.
+    #[test]
+    fn preserve_input_order_leaves_a_pinned_scan_untouched() {
+        let scan = parquet_scan(true);
+        let pinned = preserve_input_order(Arc::clone(&scan)).unwrap();
+        assert!(Arc::ptr_eq(&scan, &pinned));
+    }
+
+    /// An order-insensitive scan is pinned, and the nodes above it rebuilt
+    /// around the pinned leaf, whether or not they forward the request
+    /// themselves.
+    #[test]
+    fn preserve_input_order_pins_a_scan_through_its_parents() {
+        use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+
+        let scan = parquet_scan(false);
+        assert!(!scan_keeps_files_local(&scan));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CoalesceBatchesExec::new(scan, 8));
+
+        let pinned = preserve_input_order(plan).unwrap();
+
+        assert!(pinned.downcast_ref::<CoalesceBatchesExec>().is_some());
+        assert!(scan_keeps_files_local(pinned.children()[0]));
     }
 }
