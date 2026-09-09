@@ -259,6 +259,14 @@ impl KeyTypes {
 /// group and avoids extra overhead involved in split_groups_by_statistics
 /// like cloning every file.
 ///
+/// Files whose ranges merely touch are accepted, as `MinMaxStatistics::is_sorted`
+/// accepts them when validating a group's ordering (the packing in
+/// `split_groups_by_statistics` takes a strict step, but that is a packing
+/// choice, not a soundness requirement): every row of the earlier file
+/// compares at or below its end tuple and every row of the later one at or
+/// above its start tuple, so equal endpoints still yield a non-decreasing
+/// stream.
+///
 /// Values that cannot be compared, and null bounds, refuse the files rather
 /// than being ordered arbitrarily. Nulls among the sort columns are the
 /// caller's concern: the bounds say nothing about them.
@@ -326,7 +334,7 @@ fn non_overlapping_order<'a>(
     };
     ranges.sort_by(|a, b| cmp(&a.0, &b.0));
     for pair in ranges.windows(2) {
-        if cmp(&pair[0].1, &pair[1].0) != Ordering::Less {
+        if cmp(&pair[0].1, &pair[1].0) == Ordering::Greater {
             return None;
         }
     }

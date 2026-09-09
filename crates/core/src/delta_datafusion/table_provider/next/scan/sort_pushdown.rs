@@ -920,17 +920,27 @@ mod tests {
         );
     }
 
-    /// Overlapping ranges are refused, and so are merely touching ones: first
-    /// fit needs the next minimum to be strictly past the previous maximum.
+    /// Overlapping ranges are refused.
     #[test]
-    fn test_order_bucket_refuses_overlapping_and_touching_files() {
+    fn test_order_bucket_refuses_overlapping_files() {
         assert_eq!(
             ordered_bucket(&[("a", 0, 15), ("b", 10, 19)], asc(0, "timestamp")),
             None
         );
+    }
+
+    /// Ranges that merely touch are accepted: every row of the earlier file
+    /// is at or below the shared value and every row of the later one at or
+    /// above it, so the concatenation is still non-decreasing.
+    #[test]
+    fn test_order_bucket_accepts_touching_files() {
         assert_eq!(
-            ordered_bucket(&[("a", 0, 10), ("b", 10, 19)], asc(0, "timestamp")),
-            None
+            ordered_bucket(&[("b", 10, 19), ("a", 0, 10)], asc(0, "timestamp")),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            ordered_bucket(&[("a", 0, 10), ("b", 10, 19)], desc(0, "timestamp")),
+            Some(vec!["b".to_string(), "a".to_string()])
         );
     }
 
@@ -942,10 +952,6 @@ mod tests {
     fn test_order_bucket_refuses_overlapping_files_for_a_descending_ordering() {
         assert_eq!(
             ordered_bucket(&[("a", 50, 100), ("b", 40, 60)], desc(0, "timestamp")),
-            None
-        );
-        assert_eq!(
-            ordered_bucket(&[("a", 50, 100), ("b", 40, 50)], desc(0, "timestamp")),
             None
         );
         assert_eq!(

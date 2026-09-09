@@ -2151,29 +2151,54 @@ async fn delta_table_progressive_eval_with_uneven_file_count() -> TestResult<()>
     Ok(())
 }
 
-/// Touching boundaries count as overlap for the concatenation: a shared value
-/// on the group boundary is not provably ordered by min/max statistics alone,
-/// so the merge is kept.
+/// Files whose ranges share a boundary value are still ordered: every row of
+/// the earlier file is at or below the shared value and every row of the
+/// later one at or above it. They form one ordered chain, so the sort is
+/// avoided, and the concatenation applies whether the shared value falls
+/// inside a group (two files per group) or on a group boundary (one file per
+/// group). The order is on the integer column: the writer rounds a
+/// timestamp's maximum statistic up to the next millisecond, so timestamp
+/// files that touch in the data overlap by their statistics.
 #[tokio::test]
-async fn delta_table_touching_files_keep_merge() -> TestResult<()> {
+async fn delta_table_touching_files_avoid_sort() -> TestResult<()> {
     // File boundaries share the values 99, 199 and 299.
     let files: Vec<Vec<i64>> = [0i64, 99, 199, 299]
         .into_iter()
         .map(|start| (start..start + 100).collect())
         .collect();
     let table = overlapping_delta_table(files).await?;
-    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 2).await?;
 
-    assert!(
-        !rendered.contains("ProgressiveEvalExec"),
-        "expected no ProgressiveEvalExec in plan:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected SortPreservingMergeExec in plan:\n{rendered}"
-    );
-    assert_eq!(timestamps.len(), 400);
-    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    for target_partitions in ["2", "4"] {
+        let (rendered, batches) = run_query(
+            &table,
+            &[FileSortColumn::asc("value")],
+            &[("datafusion.execution.target_partitions", target_partitions)],
+            "SELECT value FROM test_table ORDER BY value",
+        )
+        .await?;
+
+        assert!(
+            !rendered.contains("SortExec"),
+            "expected no SortExec in plan with {target_partitions} target partitions:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ProgressiveEvalExec"),
+            "expected ProgressiveEvalExec in plan with {target_partitions} target partitions:\n{rendered}"
+        );
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values.len(), 400);
+        assert_sorted(&values, "value");
+    }
     Ok(())
 }
 
