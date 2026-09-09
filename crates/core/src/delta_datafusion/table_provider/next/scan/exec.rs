@@ -155,13 +155,10 @@ fn derive_output_orderings(
     orderings
 }
 
-/// Whether `stat` describes a column holding exactly one non-null value
+/// Whether `stat` describes a column holding exactly one non-null value:
+/// a singleton in DataFusion's sense, with no nulls beside it.
 fn is_single_valued(stat: &ColumnStatistics) -> bool {
-    stat.null_count == Precision::Exact(0)
-        && matches!(
-            (&stat.min_value, &stat.max_value),
-            (Precision::Exact(min), Precision::Exact(max)) if !min.is_null() && min == max
-        )
+    stat.null_count == Precision::Exact(0) && stat.is_singleton()
 }
 
 /// Descend through wrappers that hand their input's partitions on untouched -
