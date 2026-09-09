@@ -623,6 +623,11 @@ async fn get_data_scan_plan(
     // this is used to create a DataSourceExec plan for each store
     // To correlate the data with the original file, we add the file url as a partition value
     // This is required to apply the correct transform to the data in downstream processing.
+    // The files share only as many distinct partition tuples as the table has
+    // partitions: intern them, so that every file's extension is a handle to
+    // a shared tuple and each tuple's bounds are folded into the aggregate
+    // statistics once. Only null counts accrue per file.
+    let mut interned: std::collections::HashSet<Arc<[ScalarValue]>> = Default::default();
     let to_partitioned_file = |f: ScanFileContext| {
         // Convert each file's kernel partition values once; the aggregated
         // statistics and the per-file extension must agree.
@@ -630,9 +635,18 @@ async fn get_data_scan_plan(
             .partitions
             .as_ref()
             .map(|data| extract_partition_values(data, partition_column_names))
-            .transpose()?;
+            .transpose()?
+            .map(|values| match interned.get(values.as_slice()) {
+                Some(shared) => Arc::clone(shared),
+                None => {
+                    fold_partition_bounds(partition_column_names, &values, &mut partition_stats);
+                    let shared: Arc<[ScalarValue]> = values.into();
+                    interned.insert(Arc::clone(&shared));
+                    shared
+                }
+            });
         if let Some(values) = &partition_values {
-            update_partition_stats(
+            add_partition_null_counts(
                 partition_column_names,
                 values,
                 &f.stats,
@@ -719,9 +733,10 @@ async fn get_data_scan_plan(
 }
 
 /// Partition-column values for one data file, aligned to the table's
-/// partition columns. Attached to each [`PartitionedFile`] via an extension.
+/// partition columns. Attached to each [`PartitionedFile`] via an extension;
+/// files of the same partition share one tuple.
 #[derive(Debug)]
-pub(super) struct DeltaPartitionValues(pub(super) Vec<ScalarValue>);
+pub(super) struct DeltaPartitionValues(pub(super) Arc<[ScalarValue]>);
 
 /// Extract the partition-column values for one file from its kernel
 /// partition struct, aligned to `partition_column_names` (missing columns become
@@ -741,29 +756,29 @@ fn extract_partition_values(
         .try_collect()
 }
 
-/// Fold one file's converted partition values into the table-wide per-column
-/// statistics. `values` is aligned to `partition_column_names`.
-fn update_partition_stats(
+/// Fold a partition tuple's bounds into the table-wide per-column statistics.
+/// Called once per distinct tuple: the bounds do not depend on how many files
+/// share it. `values` is aligned to `partition_column_names`; a null value
+/// leaves the column's bounds unknown.
+fn fold_partition_bounds(
     partition_column_names: &[String],
     values: &[ScalarValue],
-    stats: &Statistics,
     part_stats: &mut HashMap<String, ColumnStatistics>,
 ) {
     for (name, converted) in partition_column_names.iter().zip(values.iter()) {
-        let (null_count, value) = if converted.is_null() {
-            (stats.num_rows, Precision::Absent)
+        let value = if converted.is_null() {
+            Precision::Absent
         } else {
-            (Precision::Exact(0), Precision::Exact(converted.clone()))
+            Precision::Exact(converted.clone())
         };
         if let Some(part_stat) = part_stats.get_mut(name) {
-            part_stat.null_count = part_stat.null_count.add(&null_count);
             part_stat.min_value = part_stat.min_value.min(&value);
             part_stat.max_value = part_stat.max_value.max(&value);
         } else {
             part_stats.insert(
                 name.clone(),
                 ColumnStatistics {
-                    null_count,
+                    null_count: Precision::Exact(0),
                     min_value: value.clone(),
                     max_value: value,
                     distinct_count: Precision::Absent,
@@ -771,6 +786,24 @@ fn update_partition_stats(
                     byte_size: Precision::Absent,
                 },
             );
+        }
+    }
+}
+
+/// Count one file's rows against every partition column its tuple holds a
+/// null for. The tuple's bounds must have been folded already.
+fn add_partition_null_counts(
+    partition_column_names: &[String],
+    values: &[ScalarValue],
+    stats: &Statistics,
+    part_stats: &mut HashMap<String, ColumnStatistics>,
+) {
+    for (name, converted) in partition_column_names.iter().zip(values.iter()) {
+        if !converted.is_null() {
+            continue;
+        }
+        if let Some(part_stat) = part_stats.get_mut(name) {
+            part_stat.null_count = part_stat.null_count.add(&stats.num_rows);
         }
     }
 }
@@ -1185,6 +1218,35 @@ mod tests {
 
         // Files within each group must still be non-overlapping.
         assert!(groups.len() >= 2);
+    }
+
+    /// Bounds are folded once per distinct partition tuple; null counts accrue
+    /// per file, and a null partition value leaves the column's bounds unknown.
+    #[test]
+    fn test_partition_stats_fold_bounds_once_and_null_counts_per_file() {
+        let names = vec!["part".to_string(), "sub".to_string()];
+        let rows = |n: usize| Statistics {
+            num_rows: Precision::Exact(n),
+            ..Statistics::new_unknown(&Schema::empty())
+        };
+        let a1 = vec![ScalarValue::from("A"), ScalarValue::Int64(Some(1))];
+        let b_null = vec![ScalarValue::from("B"), ScalarValue::Null];
+        let mut part_stats = HashMap::new();
+
+        fold_partition_bounds(&names, &a1, &mut part_stats);
+        add_partition_null_counts(&names, &a1, &rows(10), &mut part_stats);
+        add_partition_null_counts(&names, &a1, &rows(5), &mut part_stats);
+        fold_partition_bounds(&names, &b_null, &mut part_stats);
+        add_partition_null_counts(&names, &b_null, &rows(3), &mut part_stats);
+
+        let part = &part_stats["part"];
+        assert_eq!(part.null_count, Precision::Exact(0));
+        assert_eq!(part.min_value, Precision::Exact(ScalarValue::from("A")));
+        assert_eq!(part.max_value, Precision::Exact(ScalarValue::from("B")));
+        let sub = &part_stats["sub"];
+        assert_eq!(sub.null_count, Precision::Exact(3));
+        assert_eq!(sub.min_value, Precision::Absent);
+        assert_eq!(sub.max_value, Precision::Absent);
     }
 
     #[test]

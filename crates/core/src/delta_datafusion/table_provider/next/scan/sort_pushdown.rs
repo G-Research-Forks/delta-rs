@@ -567,7 +567,8 @@ mod tests {
                 ColumnStatistics::default(),
             ],
         }));
-        file.extensions.insert(DeltaPartitionValues(vec![part]));
+        file.extensions
+            .insert(DeltaPartitionValues(vec![part].into()));
         file
     }
 
@@ -855,10 +856,9 @@ mod tests {
 
     fn two_column_file(url: &str, part: &str, sub: i64) -> PartitionedFile {
         let mut file = file(url, utf8(part), 0, 99, 0);
-        file.extensions.insert(DeltaPartitionValues(vec![
-            utf8(part),
-            ScalarValue::Int64(Some(sub)),
-        ]));
+        file.extensions.insert(DeltaPartitionValues(
+            vec![utf8(part), ScalarValue::Int64(Some(sub))].into(),
+        ));
         file
     }
 
@@ -1339,6 +1339,44 @@ mod tests {
             file_scan.preserve_order,
             "the regrouped scan must be order-sensitive"
         );
+    }
+
+    /// Files of one partition share a single interned tuple of partition
+    /// values rather than each carrying a copy.
+    #[tokio::test]
+    async fn files_of_a_partition_share_their_partition_values() {
+        use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::source::DataSourceExec;
+
+        use crate::delta_datafusion::create_session;
+
+        let table = partitioned_sorted_table().await;
+        let ctx = create_session().into_inner();
+        let provider = table.table_provider().await.unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let file_scan = scan.children()[0]
+            .downcast_ref::<DataSourceExec>()
+            .unwrap()
+            .data_source()
+            .as_ref()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+
+        let mut by_partition: HashMap<String, Vec<&Arc<[ScalarValue]>>> = HashMap::new();
+        for file in file_scan.file_groups.iter().flat_map(|group| group.iter()) {
+            let values = &file.extensions.get::<DeltaPartitionValues>().unwrap().0;
+            by_partition
+                .entry(values[0].to_string())
+                .or_default()
+                .push(values);
+        }
+        assert!(
+            by_partition.values().any(|files| files.len() >= 2),
+            "the fixture should hold several files of one partition"
+        );
+        for files in by_partition.values() {
+            assert!(files.iter().all(|values| Arc::ptr_eq(values, files[0])));
+        }
     }
 
     /// Sort-pushdown state is only valid for the file grouping it was computed
