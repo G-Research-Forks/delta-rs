@@ -441,14 +441,28 @@ impl DeltaScanExec {
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
-    fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        let pushed = self
-            .pushed
-            .clone()
-            // A pushed-down sort describes the file grouping `try_pushdown_sort`
-            // built, so it survives a child that was rebuilt around the same groups.
-            .filter(|_| grouping_is_unchanged(&self.input, &input));
-        self.with_input(input, pushed)
+    ///
+    /// A pushed-down sort describes the file grouping `try_pushdown_sort`
+    /// built, so it survives a child that was rebuilt around the same groups
+    /// and nothing else. By the time a child is swapped, `PushdownSort` has
+    /// already deleted the `SortExec` on the strength of that grouping, so a
+    /// child whose grouping differs or cannot be read is an error: dropping
+    /// the claim instead would return unsorted rows without a word.
+    fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Some(pushed) = &self.pushed
+            && !Arc::ptr_eq(&self.input, &input)
+            && !grouping_is_unchanged(&self.input, &input)
+        {
+            return internal_err!(
+                "DeltaScanExec: the input was replaced by a plan whose file grouping \
+                 does not match the regrouping made for the pushed-down sort `{}`; the \
+                 sort above it has already been removed, so the ordering can no longer \
+                 be guaranteed. Physical optimizer rules that run after `PushdownSort` \
+                 must leave the parquet scan's file groups unchanged",
+                pushed.ordering
+            );
+        }
+        Ok(self.with_input(input, self.pushed.clone()))
     }
 
     /// Rebuild this exec around `input`, claiming `pushed` as the sort its
@@ -620,7 +634,7 @@ impl ExecutionPlan for DeltaScanExec {
         if children.len() != 1 {
             return plan_err!("DeltaScan: wrong number of children {}", children.len());
         }
-        Ok(self.with_new_input(children[0].clone()))
+        self.with_new_input(children[0].clone())
     }
 
     fn repartitioned(
@@ -652,7 +666,7 @@ impl ExecutionPlan for DeltaScanExec {
         if let Some(input) = self.input.repartitioned(target_partitions, config)? {
             // Rebuild the cached properties: the new input's partitioning can
             // differ from the one this exec was built around.
-            Ok(Some(self.with_new_input(input)))
+            Ok(Some(self.with_new_input(input)?))
         } else {
             Ok(None)
         }
@@ -715,7 +729,9 @@ impl ExecutionPlan for DeltaScanExec {
             // short. Refusing the fetch leaves the limit to a node above this one.
             return None;
         }
-        Some(self.with_new_input(self.input.with_fetch(limit)?))
+        // A child that took the fetch keeps its file groups; should one ever
+        // not, refusing the fetch here leaves the limit above the scan.
+        self.with_new_input(self.input.with_fetch(limit)?).ok()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {

@@ -1336,10 +1336,13 @@ mod tests {
     }
 
     /// Sort-pushdown state is only valid for the file grouping it was computed
-    /// for, and `per_partition_stats` is indexed by execution partition.
-    /// Swapping in a child must drop the advertised ordering.
+    /// for, and `per_partition_stats` is indexed by execution partition. The
+    /// `SortExec` is already gone by the time a child is swapped, so a child
+    /// with another grouping is refused outright rather than the ordering
+    /// being silently dropped; the same child, or one over the same groups,
+    /// is accepted and keeps the claim.
     #[tokio::test]
-    async fn with_new_children_drops_pushdown_state() {
+    async fn with_new_children_refuses_a_changed_grouping() {
         use datafusion::physical_expr::Partitioning;
         use datafusion::physical_plan::repartition::RepartitionExec;
         use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -1376,6 +1379,14 @@ mod tests {
         );
 
         let child = Arc::clone(pushed.children()[0]);
+        let same = Arc::clone(&pushed)
+            .with_new_children(vec![Arc::clone(&child)])
+            .unwrap();
+        assert!(
+            leads_with_part(&same),
+            "the same child should keep the pushed ordering"
+        );
+
         let repartitioned = Arc::new(
             RepartitionExec::try_new(
                 child,
@@ -1383,11 +1394,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let swapped = pushed.with_new_children(vec![repartitioned]).unwrap();
-
+        let error = pushed
+            .with_new_children(vec![repartitioned])
+            .expect_err("a child with another grouping must be refused")
+            .to_string();
         assert!(
-            !leads_with_part(&swapped),
-            "stale `part`-leading ordering survived a child change"
+            error.contains("pushed-down sort"),
+            "unexpected error message: {error}"
         );
     }
 
