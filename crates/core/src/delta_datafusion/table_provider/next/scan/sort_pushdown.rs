@@ -1431,6 +1431,40 @@ mod tests {
         );
     }
 
+    /// A deletion vector's keep mask is consumed from the front of one shared
+    /// sequence per file, so byte-range pieces of that file read on different
+    /// streams would apply each other's positions. A scan with one refuses to
+    /// be re-split.
+    #[tokio::test]
+    async fn a_deletion_vector_stops_the_repartition() {
+        use datafusion::config::ConfigOptions;
+
+        use crate::delta_datafusion::create_session;
+
+        let table_url =
+            url::Url::from_directory_path(crate::test_utils::TestTables::WithDvSmall.as_path())
+                .unwrap();
+        let table = crate::open_table(table_url).await.unwrap();
+        let ctx = create_session().into_inner();
+        let provider = table.table_provider().await.unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let mut config = ConfigOptions::new();
+        // The test file is tiny; split on any size.
+        config.optimizer.repartition_file_min_size = 1;
+        assert!(
+            scan.children()[0]
+                .repartitioned(4, &config)
+                .unwrap()
+                .is_some(),
+            "the parquet scan would split the file; the test is inert"
+        );
+        assert!(
+            scan.repartitioned(4, &config).unwrap().is_none(),
+            "a scan with a deletion vector must not be byte-range split"
+        );
+    }
+
     /// Without pushed-down per-partition statistics, a request for one
     /// execution partition's statistics falls back to the table-wide
     /// aggregated partition-column stats. Those are valid bounds for the

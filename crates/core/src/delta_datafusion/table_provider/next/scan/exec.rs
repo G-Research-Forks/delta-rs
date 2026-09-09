@@ -640,6 +640,15 @@ impl ExecutionPlan for DeltaScanExec {
             return Ok(None);
         }
 
+        if self.has_selection_vectors {
+            // A deletion vector's keep mask is one shared sequence per file,
+            // consumed from the front as that file's batches arrive. Byte-range
+            // pieces of the file read on different streams would each drain it
+            // for their own rows, applying positions that belong to the other
+            // piece: deleted rows returned and live rows dropped.
+            return Ok(None);
+        }
+
         if let Some(input) = self.input.repartitioned(target_partitions, config)? {
             // Rebuild the cached properties: the new input's partitioning can
             // differ from the one this exec was built around.
