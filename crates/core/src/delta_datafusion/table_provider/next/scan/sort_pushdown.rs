@@ -364,15 +364,24 @@ fn group_prefix_stats(
 
 /// Largest group count a pushdown may produce for `target_groups`.
 ///
-/// A single target group is the one case that cannot absorb any overshoot:
-/// `PushdownSort` deletes the `SortExec` on `Exact` without re-checking the
-/// partitioning, and a single-partition input means the deleted sort was the
-/// global one with no merge operator above it, so extra partitions would be
-/// coalesced in arbitrary order. A multi-partition input implies a
-/// per-partition sort whose consumers do not care how many sorted partitions
-/// they get, so a bounded overshoot is sound there.
+/// The group count may exceed the target so that a group can be cut at every
+/// change of a leading partition column. That keeps each group's
+/// partition-column statistics exact, which lets `ProgressiveEvalRule` prove
+/// neighbouring groups disjoint and replace the `SortPreservingMergeExec`
+/// above with a `ProgressiveEvalExec`.
+///
+/// The replacement is not guaranteed, and a merge that is kept opens every
+/// partition at once, so the overshoot is capped at [`max_num_groups`], the
+/// same bound a scan with a declared file sort order already gets.
 pub(super) fn group_budget(target_groups: usize) -> usize {
     if target_groups <= 1 {
+        // A single target group is the one case that cannot absorb any overshoot:
+        // `PushdownSort` deletes the `SortExec` on `Exact` without re-checking the
+        // partitioning, and a single-partition input means the deleted sort was the
+        // global one with no merge operator above it, so extra partitions would be
+        // coalesced in arbitrary order. A multi-partition input implies a
+        // per-partition sort whose consumers do not care how many sorted partitions
+        // they get, so a bounded overshoot is sound there.
         1
     } else {
         max_num_groups(target_groups)
