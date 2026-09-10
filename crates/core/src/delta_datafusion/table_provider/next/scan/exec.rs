@@ -438,18 +438,13 @@ impl DeltaScanExec {
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
-    ///
-    /// A pushed-down sort describes the file grouping `try_pushdown_sort`
-    /// built, so it survives a child that was rebuilt around the same groups
-    /// and nothing else. By the time a child is swapped, `PushdownSort` has
-    /// already deleted the `SortExec` on the strength of that grouping, so a
-    /// child whose grouping differs or cannot be read is an error: dropping
-    /// the claim instead would return unsorted rows without a word.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(pushed) = &self.pushed
             && !Arc::ptr_eq(&self.input, &input)
             && !grouping_is_unchanged(&self.input, &input)
         {
+            // The file grouping used for sort-pushdown is no longer valid, so the removal
+            // of the `SortExec` may be unsafe and lead to out-of-order results.
             return internal_err!(
                 "DeltaScanExec: the input was replaced by a plan whose file grouping \
                  does not match the regrouping made for the pushed-down sort `{}`; the \
@@ -652,11 +647,8 @@ impl ExecutionPlan for DeltaScanExec {
         }
 
         if self.has_selection_vectors {
-            // A deletion vector's keep mask is one shared sequence per file,
-            // consumed from the front as that file's batches arrive. Byte-range
-            // pieces of the file read on different streams would each drain it
-            // for their own rows, applying positions that belong to the other
-            // piece: deleted rows returned and live rows dropped.
+            // A deletion vector's mask is per-file and is drained as it is used,
+            // so it's unsafe to use it from multiple streams for different file chunks.
             return Ok(None);
         }
 
@@ -853,25 +845,20 @@ impl ExecutionPlan for DeltaScanExec {
         .with_partitioned_by_file_group(file_scan.partitioned_by_file_group)
         .with_file_groups(file_groups)
         .with_statistics(statistics)
-        // The regrouped files are ordered by the partition prefix first, which the
-        // parquet child cannot express (partition columns are not in its schema),
-        // so it declares no ordering; the combined order is advertised by this
-        // exec instead. A scan that declares nothing is not order-sensitive by
-        // default, and an order-insensitive scan lets DataFusion pool every file
-        // into one queue for the sibling streams to share, read them in any
-        // order, and let a pushed fetch prune earlier row groups - so say so
-        // explicitly.
+        // The original input may have carried a sort order, but the files
+        // are now grouped so that they are ordered based on the partition columns.
+        // The partition columns are not part of the input schema, so we don't
+        // declare an ordering here.
+        // Because no order is declared, the scan is not considered order-sensitive
+        // by default, so we have to explicitly request the order to be preserved.
         //
-        // The flag costs the work stealing and byte-range balancing an
-        // order-insensitive scan gets, which is only a loss when the regrouped
-        // scan ends up under a sort anyway. That happens with
-        // `repartition_sorts` off: `CoalescePartitionsExec` delegates the
-        // pushdown here, downgrades the `Exact` answer to `Inexact` because
+        // Note: This comes with a trade-off as under some scenarios it's possible that
+        // a sort is still required even after the sort pushdown, so some performance
+        // might be lost by disabling work stealing and file range balancing.
+        // That happens with `repartition_sorts` off: `CoalescePartitionsExec` delegates
+        // the pushdown here, downgrades the `Exact` answer to `Inexact` because
         // its input had several partitions, and `PushdownSort` keeps the
-        // `SortExec` over the regrouped scan. Clearing the flag would break
-        // the `Exact` claim on the default path, so the trade-off stands until
-        // upstream keeps the original child when it downgrades an answer it
-        // cannot use.
+        // `SortExec` over the regrouped scan.
         .with_preserve_order(true)
         .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;

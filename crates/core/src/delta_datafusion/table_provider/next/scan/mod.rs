@@ -257,15 +257,8 @@ impl KeyTypes {
 /// This is a specialised version of `FileScanConfig::split_groups_by_statistics`,
 /// which splits files into multiple groups. This version only forms a single
 /// group and avoids extra overhead involved in split_groups_by_statistics
-/// like cloning every file.
-///
-/// Files whose ranges merely touch are accepted, as `MinMaxStatistics::is_sorted`
-/// accepts them when validating a group's ordering (the packing in
-/// `split_groups_by_statistics` takes a strict step, but that is a packing
-/// choice, not a soundness requirement): every row of the earlier file
-/// compares at or below its end tuple and every row of the later one at or
-/// above its start tuple, so equal endpoints still yield a non-decreasing
-/// stream.
+/// like cloning every file. It also allows ranges to touch at the end-points,
+/// which `split_groups_by_statistics` does not.
 ///
 /// Values that cannot be compared, and null bounds, refuse the files rather
 /// than being ordered arbitrarily. Nulls among the sort columns are the
@@ -757,8 +750,7 @@ fn extract_partition_values(
 }
 
 /// Fold a partition tuple's bounds into the table-wide per-column statistics.
-/// Called once per distinct tuple: the bounds do not depend on how many files
-/// share it. `values` is aligned to `partition_column_names`; a null value
+/// `values` is aligned to `partition_column_names`; a null value
 /// leaves the column's bounds unknown.
 fn fold_partition_bounds(
     partition_column_names: &[String],
