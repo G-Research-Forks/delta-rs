@@ -152,10 +152,17 @@ pub(super) fn analyze_order(
     }
     // The suffix must match a prefix of the declared file sort order, column for
     // column and direction for direction, re-expressed over the read schema
-    // (which is what the declared order is bound to).
+    // (which is what the declared order is bound to). Null placement only has
+    // to agree on columns that can hold nulls; `satisfy_expr` applies
+    // DataFusion's rule that it is immaterial on a non-nullable column.
     let file_sort_order = file_sort_order?;
     let suffix = rebind_ordering(suffix_exprs, output_schema, parquet_read_schema)?;
-    if suffix.len() > file_sort_order.len() || suffix[..] != file_sort_order[..suffix.len()] {
+    let matches_declared_order = suffix.len() <= file_sort_order.len()
+        && suffix
+            .iter()
+            .zip(file_sort_order.iter())
+            .all(|(requested, declared)| declared.satisfy_expr(requested, parquet_read_schema));
+    if !matches_declared_order {
         return None;
     }
 
@@ -771,6 +778,60 @@ mod tests {
         let order = vec![asc(0, "part"), asc(2, "value")];
 
         assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
+    }
+
+    /// Null placement is immaterial on a column that cannot hold nulls, so a
+    /// request that only differs from the declared order in `nulls_first`
+    /// still matches there; on a nullable column it must agree exactly.
+    #[test]
+    fn suffix_null_placement_only_matters_on_nullable_columns() {
+        let nulls_first_asc = |index, name| {
+            PhysicalSortExpr::new(
+                Arc::new(Column::new(name, index)),
+                SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            )
+        };
+        let order =
+            LexOrdering::new(vec![asc(0, "part"), nulls_first_asc(1, "timestamp")]).unwrap();
+        let analyze = |read_schema: &SchemaRef| {
+            analyze_order(
+                &order,
+                &output_schema(),
+                read_schema,
+                &["part".to_string()],
+                Some(&file_sort_order()),
+            )
+        };
+
+        // The fixture's read schema declares `timestamp` nullable.
+        assert!(
+            analyze(&parquet_read_schema()).is_none(),
+            "nulls-first must not match a nulls-last order on a nullable column"
+        );
+
+        let non_nullable = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let shape =
+            analyze(&non_nullable).expect("null placement is immaterial on a non-nullable column");
+        assert_eq!(shape.suffix.as_ref().map(|s| s.len()), Some(1));
+
+        // Direction still has to agree regardless of nullability.
+        let order = LexOrdering::new(vec![asc(0, "part"), desc(1, "timestamp")]).unwrap();
+        assert!(
+            analyze_order(
+                &order,
+                &output_schema(),
+                &non_nullable,
+                &["part".to_string()],
+                Some(&file_sort_order()),
+            )
+            .is_none()
+        );
     }
 
     #[test]
