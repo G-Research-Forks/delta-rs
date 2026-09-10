@@ -1282,6 +1282,69 @@ mod tests {
         ));
     }
 
+    /// A declared sort order whose column may hold nulls declares no ordering
+    /// for multi-file groups, yet the groups are still arranged by statistics
+    /// and publish exact per-group statistics. The scan must be
+    /// order-sensitive regardless: otherwise DataFusion's file-stream work
+    /// stealing lets sibling streams trade files and the statistics describe
+    /// nothing a partition actually emits.
+    #[tokio::test]
+    async fn statistics_arranged_groups_are_order_sensitive_without_an_ordering() {
+        use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::source::DataSourceExec;
+
+        use crate::delta_datafusion::{FileSortColumn, create_session};
+        use crate::protocol::SaveMode;
+
+        let mut table = crate::DeltaTable::new_in_memory()
+            .write(vec![nullable_write_batch("A", 0, 10, false)])
+            .with_partition_columns(vec!["part"])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        for (part, start) in [("B", 100), ("C", 200), ("D", 300)] {
+            table = table
+                .write(vec![nullable_write_batch(part, start, 10, part == "D")])
+                .with_save_mode(SaveMode::Append)
+                .await
+                .unwrap();
+        }
+
+        let ctx = create_session().into_inner();
+        ctx.sql("SET datafusion.execution.target_partitions = 2")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("timestamp")])
+            .await
+            .unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let file_scan = scan.children()[0]
+            .downcast_ref::<DataSourceExec>()
+            .unwrap()
+            .data_source()
+            .as_ref()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+        assert!(
+            file_scan.file_groups.iter().any(|group| group.len() > 1),
+            "the fixture should form multi-file groups"
+        );
+        assert!(
+            file_scan.output_ordering.is_empty(),
+            "a nullable sort column should leave the ordering undeclared"
+        );
+        assert!(
+            file_scan.preserve_order,
+            "groups arranged by statistics must keep their files on their partition"
+        );
+    }
+
     /// The regrouped scan must be marked order-sensitive.
     ///
     /// The file-to-partition assignment *is* the pushdown result, but the
@@ -1298,8 +1361,8 @@ mod tests {
         use crate::protocol::SaveMode;
 
         // A null in the sort column stops `get_read_plan` declaring a
-        // store-level ordering across the multi-file groups it builds, so the
-        // scan the pushdown inherits from is order-insensitive.
+        // store-level ordering across the multi-file groups it builds; the
+        // regrouped scan must be order-sensitive on its own account.
         let mut table = crate::DeltaTable::new_in_memory()
             .write(vec![nullable_write_batch("A", 0, 10, false)])
             .with_partition_columns(vec!["part"])

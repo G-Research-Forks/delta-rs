@@ -994,6 +994,15 @@ async fn get_read_plan(
         if let Some(ordering) = store_sort_order {
             config_builder = config_builder.with_output_ordering(vec![ordering]);
         }
+        // If there was a file order set, the groups were arranged by statistics
+        // and exact per-group statistics are published. This applies even when the
+        // null-free ordering is empty and no output ordering is set.
+        // For the exact partition statistics to remain correct,
+        // order must be preserved to prevent work stealing from rearranging
+        // the data that ends up in each partition.
+        if file_sort_order.is_some() {
+            config_builder = config_builder.with_preserve_order(true);
+        }
         let config = config_builder.build();
 
         plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);

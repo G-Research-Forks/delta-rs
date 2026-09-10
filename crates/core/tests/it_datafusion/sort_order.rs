@@ -1664,14 +1664,15 @@ async fn nulls_in_last_file_delta_table() -> TestResult<DeltaTable> {
 }
 
 /// A declared sort order whose leading column holds nulls declares no
-/// ordering for multi-file groups, so the parquet scan is not order-sensitive
-/// and DataFusion's file-stream work stealing may hand a partition's files to
-/// a sibling. The file groups are still range-ordered with exact statistics,
-/// which is all `ProgressiveEvalRule` reads, so the concatenation it plans is
-/// only correct if the rule also pins every file to its partition. The check
-/// needs a multi-threaded runtime: on one thread the first partition drains
-/// the shared queue before the second starts, and the result is ordered by
-/// accident.
+/// ordering for multi-file groups, so nothing but the scan's own
+/// order-sensitivity keeps DataFusion's file-stream work stealing from
+/// handing a partition's files to a sibling. The file groups are
+/// range-ordered with exact statistics, which is all `ProgressiveEvalRule`
+/// reads, so the concatenation it plans is only correct while every file
+/// stays on its partition: the scan is built order-sensitive and the rule
+/// pins whatever is not. The check needs a multi-threaded runtime: on one
+/// thread the first partition drains the shared queue before the second
+/// starts, and the result is ordered by accident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<()> {
     use datafusion::physical_plan::ExecutionPlan;
