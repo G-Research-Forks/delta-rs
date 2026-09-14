@@ -32,8 +32,8 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 
 use super::{
-    DeltaPartitionValues, KeyTypes, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files,
-    max_num_groups, non_overlapping_file_order, null_free_ordering_prefix,
+    DeltaPartitionValues, KeyTypes, MAX_PARTITION_DICT_CARDINALITY, OverlapPolicy,
+    arrange_non_overlapping_files, chunk_ordered_files, max_num_groups, null_free_ordering_prefix,
 };
 
 /// Outcome of planning a sort pushdown: the regrouped, range-ordered file groups
@@ -203,11 +203,14 @@ impl Bucket {
 ///   and the planned pushdown always uses the full file range.
 /// * `target_groups` – desired execution-partition count; the result may hold
 ///   more groups, up to [`group_budget`].
+/// * `overlap` – whether a bucket whose files cannot be proven non-overlapping
+///   on the suffix may still be ordered on the table's assertion.
 pub(super) fn plan_sort_pushdown(
     shape: &OrderShape,
     parquet_read_schema: &SchemaRef,
     files: &[&PartitionedFile],
     target_groups: usize,
+    overlap: OverlapPolicy,
 ) -> Result<Option<SortPushdownPlan>> {
     if files.is_empty() {
         return Ok(None);
@@ -275,7 +278,9 @@ pub(super) fn plan_sort_pushdown(
                 if null_free.is_none_or(|p| p.len() < suffix.len()) {
                     return Ok(None);
                 }
-                let Ok(bucket) = non_overlapping_file_order(bucket, |file| *file, suffix) else {
+                let Ok((bucket, _)) =
+                    arrange_non_overlapping_files(bucket, |file| *file, suffix, overlap)
+                else {
                     return Ok(None);
                 };
                 bucket
@@ -514,6 +519,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::Statistics;
 
+    use super::super::non_overlapping_file_order;
     use super::*;
     use crate::delta_datafusion::file_id::wrap_file_id_value;
 
@@ -613,6 +619,16 @@ mod tests {
             file_sort_order: Option<&LexOrdering>,
             target_groups: usize,
         ) -> Option<SortPushdownPlan> {
+            self.plan_with(order, file_sort_order, target_groups, OverlapPolicy::Prove)
+        }
+
+        fn plan_with(
+            &self,
+            order: &[PhysicalSortExpr],
+            file_sort_order: Option<&LexOrdering>,
+            target_groups: usize,
+            overlap: OverlapPolicy,
+        ) -> Option<SortPushdownPlan> {
             let order = LexOrdering::new(order.to_vec()).unwrap();
             let shape = analyze_order(
                 &order,
@@ -622,7 +638,14 @@ mod tests {
                 file_sort_order,
             )?;
             let files: Vec<&PartitionedFile> = self.files.iter().collect();
-            plan_sort_pushdown(&shape, &parquet_read_schema(), &files, target_groups).unwrap()
+            plan_sort_pushdown(
+                &shape,
+                &parquet_read_schema(),
+                &files,
+                target_groups,
+                overlap,
+            )
+            .unwrap()
         }
     }
 
@@ -701,6 +724,42 @@ mod tests {
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
         assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
+    }
+
+    /// The same files with the table asserting that they never overlap: the
+    /// bucket is ordered on its statistics alone and the pushdown succeeds.
+    #[test]
+    fn overlapping_files_within_a_partition_are_ordered_when_assumed_disjoint() {
+        let fixture = Fixture::new(&[
+            ("a0", utf8("A"), 0, 150),
+            ("a1", utf8("A"), 100, 199),
+            ("b0", utf8("B"), 0, 99),
+        ]);
+        let order = vec![asc(0, "part"), asc(1, "timestamp")];
+
+        let plan = fixture
+            .plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)
+            .expect("the assertion places every file");
+
+        assert_eq!(plan.file_groups.len(), 2);
+        assert_eq!(group_urls(&plan.file_groups[0]), vec!["a0", "a1"]);
+        assert_eq!(group_urls(&plan.file_groups[1]), vec!["b0"]);
+    }
+
+    /// The assertion covers overlap between files, not nulls within one, so a
+    /// bucket whose sort column may hold nulls is still refused.
+    #[test]
+    fn nullable_files_within_a_partition_are_refused_even_when_assumed_disjoint() {
+        let mut fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("a1", utf8("A"), 100, 199)]);
+        let stats = Arc::make_mut(fixture.files[1].statistics.as_mut().unwrap());
+        stats.column_statistics[0].null_count = Precision::Exact(1);
+        let order = vec![asc(0, "part"), asc(1, "timestamp")];
+
+        assert!(
+            fixture
+                .plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)
+                .is_none()
+        );
     }
 
     #[test]
@@ -946,7 +1005,14 @@ mod tests {
             None,
         )?;
         let files: Vec<&PartitionedFile> = files.iter().collect();
-        plan_sort_pushdown(&shape, &parquet_read_schema(), &files, target_groups).unwrap()
+        plan_sort_pushdown(
+            &shape,
+            &parquet_read_schema(),
+            &files,
+            target_groups,
+            OverlapPolicy::Prove,
+        )
+        .unwrap()
     }
 
     fn ordered_bucket(specs: &[(&str, i64, i64)], sort: PhysicalSortExpr) -> Option<Vec<String>> {
@@ -956,7 +1022,7 @@ mod tests {
             .collect();
         let ordering = LexOrdering::new(vec![sort]).unwrap();
         Some(
-            non_overlapping_file_order(files, |file| file, &ordering)
+            non_overlapping_file_order(files, |file| file, &ordering, OverlapPolicy::Prove)
                 .ok()?
                 .into_iter()
                 .map(|file| file.object_meta.location.to_string())
@@ -1039,7 +1105,10 @@ mod tests {
         ];
         files[1].statistics = None;
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
-        assert!(non_overlapping_file_order(files, |file| file, &ordering).is_err());
+        assert!(
+            non_overlapping_file_order(files, |file| file, &ordering, OverlapPolicy::Prove)
+                .is_err()
+        );
     }
 
     /// Statistics whose `ScalarValue` variant differs between files are
@@ -1062,7 +1131,10 @@ mod tests {
             })
             .collect();
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
-        assert!(non_overlapping_file_order(files, |file| file, &ordering).is_err());
+        assert!(
+            non_overlapping_file_order(files, |file| file, &ordering, OverlapPolicy::Prove)
+                .is_err()
+        );
     }
 
     fn three_two_column_files() -> Vec<PartitionedFile> {

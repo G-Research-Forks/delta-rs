@@ -16,8 +16,8 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Statistics;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Result, ScalarValue};
-use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -26,6 +26,7 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 
 use super::progressive_eval::ProgressiveEvalExec;
+use super::scan::DeltaScanExec;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -58,11 +59,19 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
             if contains_hash_join(input)? {
                 return Ok(Transformed::no(plan));
             }
-            let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
-                return Ok(Transformed::no(plan));
+            let ranges = match ordered_partition_ranges(input, merge.expr()) {
+                Some(ranges) => Some(ranges),
+                // Statistics could not prove the partitions ordered. A Delta
+                // scan whose table declares its files non-overlapping asserts
+                // it instead; the ranges are then only descriptive, so it does
+                // not matter that they may be unavailable.
+                None if partitions_assumed_disjoint(input, merge.expr())? => {
+                    leading_partition_ranges(input, merge.expr())
+                }
+                None => return Ok(Transformed::no(plan)),
             };
             let input = preserve_input_order(Arc::clone(input))?;
-            let replacement = ProgressiveEvalExec::new(input, Some(ranges), merge.fetch());
+            let replacement = ProgressiveEvalExec::new(input, ranges, merge.fetch());
             Ok(Transformed::yes(Arc::new(replacement) as _))
         })
         .data()
@@ -75,6 +84,48 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Whether `plan` is a Delta scan that *asserts* - rather than proves - that
+/// its execution partitions are mutually disjoint and arranged in range order,
+/// on an ordering that also covers `ordering`.
+///
+/// Only the merge's direct child is considered. Any operator in between would
+/// have to be shown to preserve both the partition boundaries and their order
+/// before the assertion could carry through it; not doing so costs a missed
+/// optimization, never a wrong result.
+fn partitions_assumed_disjoint(
+    plan: &Arc<dyn ExecutionPlan>,
+    ordering: &LexOrdering,
+) -> Result<bool> {
+    let Some(scan) = (plan.as_ref() as &dyn ExecutionPlan).downcast_ref::<DeltaScanExec>() else {
+        return Ok(false);
+    };
+    let Some(assumed) = scan.assumed_disjoint_ordering() else {
+        return Ok(false);
+    };
+    // Concatenating the partitions yields a stream ordered on `assumed`. That
+    // makes the merge redundant only if `assumed` also delivers what the merge
+    // was asked for - which it does when `ordering` is a prefix of it, and
+    // through equivalences in cases a plain prefix check would miss.
+    EquivalenceProperties::new_with_orderings(plan.schema(), vec![assumed.clone()])
+        .ordering_satisfy(ordering.iter().cloned())
+}
+
+/// The first sort column's `(start, end)` value per partition, with no ordering
+/// check. Reported by [`ProgressiveEvalExec`] as `input_ranges` for readers of
+/// the plan; `None` when the statistics do not yield them.
+fn leading_partition_ranges(
+    plan: &Arc<dyn ExecutionPlan>,
+    ordering: &LexOrdering,
+) -> Option<Vec<(ScalarValue, ScalarValue)>> {
+    (0..plan.output_partitioning().partition_count())
+        .map(|partition_idx| {
+            let stats = plan.partition_statistics(Some(partition_idx)).ok()?;
+            let (starts, ends, _) = get_ordering_stats(&stats, ordering)?;
+            Some((starts[0].clone(), ends[0].clone()))
+        })
+        .collect()
 }
 
 /// Whether any node of `plan` is a [`HashJoinExec`].
