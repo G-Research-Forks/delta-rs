@@ -17,9 +17,12 @@ use datafusion::common::stats::Statistics;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::coop::CooperativeExec;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
 use datafusion_datasource::file_scan_config::FileScanConfig;
@@ -86,30 +89,83 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     }
 }
 
-/// Whether `plan` is a Delta scan that *asserts* - rather than proves - that
-/// its execution partitions are mutually disjoint and arranged in range order,
-/// on an ordering that also covers `ordering`.
+/// Whether `plan` sits on a Delta scan that *asserts* - rather than proves -
+/// that its execution partitions are mutually disjoint and arranged in range
+/// order, on an ordering that also covers `ordering`.
 ///
-/// Only the merge's direct child is considered. Any operator in between would
-/// have to be shown to preserve both the partition boundaries and their order
-/// before the assertion could carry through it; not doing so costs a missed
-/// optimization, never a wrong result.
+/// The statistics proof beside this one reaches the scan through intervening
+/// operators for free, because per-partition statistics propagate up through
+/// them. An assertion is not a statistic, so it has to be fetched from the
+/// scan itself, and this walks down to find it - rewriting `ordering` over
+/// each child's schema on the way, since the columns it names are those of the
+/// plan it started from.
+///
+/// The walk descends only through operators that hand their input's partitions
+/// on untouched; see [`pass_through_ordering`]. Anything else ends it, at the
+/// cost of a missed optimization rather than a wrong result.
 fn partitions_assumed_disjoint(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
 ) -> Result<bool> {
-    let Some(scan) = (plan.as_ref() as &dyn ExecutionPlan).downcast_ref::<DeltaScanExec>() else {
+    let node = plan.as_ref() as &dyn ExecutionPlan;
+    if let Some(scan) = node.downcast_ref::<DeltaScanExec>() {
+        let Some(assumed) = scan.assumed_disjoint_ordering() else {
+            return Ok(false);
+        };
+        // Concatenating the partitions yields a stream ordered on `assumed`.
+        // That makes the merge redundant only if `assumed` also delivers what
+        // the merge was asked for - which it does when `ordering` is a prefix
+        // of it, and through equivalences in cases a plain prefix check would
+        // miss. Only `assumed` is offered: the scan's other orderings describe
+        // each partition on its own and say nothing about how they sit
+        // relative to each other.
+        return EquivalenceProperties::new_with_orderings(plan.schema(), vec![assumed.clone()])
+            .ordering_satisfy(ordering.iter().cloned());
+    }
+    let (Some(child_ordering), [child]) =
+        (pass_through_ordering(node, ordering), &node.children()[..])
+    else {
         return Ok(false);
     };
-    let Some(assumed) = scan.assumed_disjoint_ordering() else {
-        return Ok(false);
-    };
-    // Concatenating the partitions yields a stream ordered on `assumed`. That
-    // makes the merge redundant only if `assumed` also delivers what the merge
-    // was asked for - which it does when `ordering` is a prefix of it, and
-    // through equivalences in cases a plain prefix check would miss.
-    EquivalenceProperties::new_with_orderings(plan.schema(), vec![assumed.clone()])
-        .ordering_satisfy(ordering.iter().cloned())
+    partitions_assumed_disjoint(child, &child_ordering)
+}
+
+/// Rewrite `ordering`, whose columns index `plan`'s output schema, over the
+/// schema of its child, or `None` when `plan` is not an operator this can see
+/// through.
+///
+/// Seeing through one means its partitions are its child's: the same rows in
+/// the same partition, in the same order within it, so a claim about how the
+/// child's partitions sit relative to each other still holds of its own. A
+/// filter only drops rows, which leaves the survivors where they were; a
+/// projection and the cooperative yielding wrapper touch neither rows nor
+/// partitioning. Operators that repartition, sort, join or aggregate are not
+/// listed and end the walk.
+///
+/// A projection has the further job of carrying the sort columns down, and
+/// only a column passed straight through can be carried: one the projection
+/// computes is not the column the scan arranged its files on, whatever it is
+/// named.
+fn pass_through_ordering(plan: &dyn ExecutionPlan, ordering: &LexOrdering) -> Option<LexOrdering> {
+    if plan.downcast_ref::<FilterExec>().is_some()
+        || plan.downcast_ref::<CooperativeExec>().is_some()
+    {
+        return Some(ordering.clone());
+    }
+    let projection = plan.downcast_ref::<ProjectionExec>()?;
+    let mapped = ordering
+        .iter()
+        .map(|sort_expr| {
+            let column = sort_expr.expr.downcast_ref::<Column>()?;
+            let projected = projection.expr().get(column.index())?;
+            let passed = projected.expr.downcast_ref::<Column>()?;
+            Some(PhysicalSortExpr::new(
+                Arc::new(passed.clone()),
+                sort_expr.options,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    LexOrdering::new(mapped)
 }
 
 /// The first sort column's `(start, end)` value per partition, with no ordering

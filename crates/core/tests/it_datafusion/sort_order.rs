@@ -3294,3 +3294,44 @@ async fn delta_table_assumed_disjoint_interleaved_split_keeps_merge() -> TestRes
     assert_sorted(&keys, "(date, time)");
     Ok(())
 }
+
+/// An operator between the merge and the scan must not cost the concatenation.
+/// A computed column in the select list puts a projection there, and the
+/// statistics proof already reaches through such nodes because per-partition
+/// statistics propagate up them; the assertion reaches through them by walking
+/// down to the scan that makes it.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_reaches_through_a_projection() -> TestResult<()> {
+    let table = day_boundary_delta_table().await?;
+    let (rendered, batches) = run_query_assuming(
+        &table,
+        &[FileSortColumn::asc("date"), FileSortColumn::asc("time")],
+        &[("datafusion.execution.target_partitions", "2")],
+        "SELECT date, time, value + 1 AS v FROM test_table ORDER BY date, time",
+        true,
+    )
+    .await?;
+
+    assert!(
+        rendered.contains("ProjectionExec"),
+        "expected a projection between the merge and the scan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+
+    let mut keys = Vec::new();
+    for batch in &batches {
+        let dates = batch.column(0).as_primitive::<Int64Type>().values();
+        let times = batch.column(1).as_primitive::<Int64Type>().values();
+        keys.extend(dates.iter().copied().zip(times.iter().copied()));
+    }
+    assert_eq!(keys.len(), 2 * 17);
+    assert_sorted(&keys, "(date, time)");
+    Ok(())
+}
