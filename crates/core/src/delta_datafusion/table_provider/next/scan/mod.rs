@@ -336,11 +336,14 @@ pub(super) fn arrange_non_overlapping_files<T>(
 /// files on their endpoints alone; see [`assumed_range_cmp`] for how, and
 /// [`assumed_ranges_separate`] for the pairs it still refuses.
 ///
-/// Assuming also narrows which bounds can be read. `Prove` is free to widen a
-/// range, which only makes it refuse more often, so it takes the bounds at
-/// whatever precision they carry; `Assume` reads a range's position off those
-/// bounds directly, where a widened one can order two files the wrong way
-/// round, so it demands exact ones.
+/// Both read the bounds at whatever precision they carry; what differs is the
+/// consequence. Widening a range only makes `Prove` refuse more often, while
+/// `Assume` reads a file's position off the bounds and so follows a widened
+/// one to the wrong place. Delta records no way to tell a widened bound from a
+/// true one - every bound arrives marked exact whether or not a writer
+/// truncated it or the log reader rounded it up - so there is nothing here to
+/// screen on, and their fidelity is the table's to vouch for along with the
+/// rest of the assertion.
 fn non_overlapping_order<'a>(
     files: impl IntoIterator<Item = &'a PartitionedFile>,
     ordering: &LexOrdering,
@@ -356,24 +359,11 @@ fn non_overlapping_order<'a>(
         for sort_expr in ordering.iter() {
             let column = sort_expr.expr.downcast_ref::<Column>()?;
             let column_stats = stats.column_statistics.get(column.index())?;
-            // A bound that places the file wants to be the real one:
-            // widening it outwards moves the file, where widening it only
-            // makes an overlap check refuse more often. This rejects what
-            // DataFusion itself marks approximate; a bound the *writer* or
-            // the log reader widened - a truncated string minimum, a
-            // timestamp maximum rounded up to the millisecond - still arrives
-            // exact, and is the table's to vouch for along with the rest of
-            // the assertion.
-            if overlap == OverlapPolicy::Assume
-                && !(column_stats.min_value.is_exact()? && column_stats.max_value.is_exact()?)
-            {
-                return None;
-            }
-            // Otherwise read the bounds whatever their precision, as
-            // `MinMaxStatistics` does. A null bound is an absent one: stats
-            // parsed against a schema wider than the columns a writer indexed
-            // carry typed nulls for the rest, and `compare_rows` would place
-            // such a bound after every value rather than nowhere.
+            // Read the bounds whatever their precision, as `MinMaxStatistics`
+            // does. A null bound is an absent one: stats parsed against a
+            // schema wider than the columns a writer indexed carry typed
+            // nulls for the rest, and `compare_rows` would place such a bound
+            // after every value rather than nowhere.
             let min = column_stats.min_value.get_value()?;
             let max = column_stats.max_value.get_value()?;
             if min.is_null() || max.is_null() {
@@ -1734,17 +1724,19 @@ mod tests {
         );
     }
 
-    /// Inexact bounds can be widened outwards, which places a file where its
-    /// rows are not; only exact ones can be trusted to order the files.
+    /// A file with no statistics at all cannot be placed. One whose bounds are
+    /// merely marked inexact can be: Delta marks every bound exact whether or
+    /// not it was widened, so screening on the mark would catch nothing that
+    /// matters while refusing files that are fine.
     #[test]
-    fn test_assumed_order_refuses_without_exact_statistics() {
+    fn test_assumed_order_places_inexact_bounds_but_not_missing_ones() {
         let mut inexact = stats_file("b", 100, 199);
         let stats = Arc::make_mut(inexact.statistics.as_mut().expect("statistics"));
         stats.column_statistics[0].min_value = Precision::Inexact(ScalarValue::Int64(Some(100)));
 
         assert_eq!(
             assumed_order(vec![stats_file("a", 0, 99), inexact], &int64_asc_ordering()),
-            None
+            Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
         );
         assert_eq!(
             assumed_order(

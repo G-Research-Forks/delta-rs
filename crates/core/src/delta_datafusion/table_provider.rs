@@ -527,8 +527,8 @@ impl TableProviderBuilder {
     ///
     /// Overlap is all this relaxes. Sort columns that may contain nulls, sort
     /// keys whose types cannot be compared, and files whose sort-column
-    /// statistics are missing or inexact are all still handled exactly as they
-    /// are without it, as are two files that span the same range of a sort
+    /// statistics are missing are all still handled exactly as they are
+    /// without it, as are two files that span the same range of a sort
     /// column: files covering the same span of a column meet somewhere inside
     /// it, which the assertion cannot explain away.
     ///
@@ -539,11 +539,14 @@ impl TableProviderBuilder {
     /// statistics already prove the order keeps the splitting, since the
     /// assertion never comes into play there.
     ///
-    /// The bounds themselves are taken at face value, so the assertion extends
-    /// to them. A writer may record a truncated string minimum, and a
+    /// **The bounds are taken at face value, so the assertion covers their
+    /// fidelity too.** A writer may record a truncated string minimum, and a
     /// timestamp maximum is rounded up to the next millisecond when it lands
-    /// exactly on one; a bound widened that way can place a file where its
-    /// rows are not, and so put two files the wrong way round.
+    /// exactly on one. Delta records no way to tell a widened bound from a
+    /// true one, so nothing here screens for it. Rounding a maximum up is not
+    /// order preserving, which for a descending order on a timestamp column -
+    /// where the maximum is where a file's range begins - can put two files
+    /// the wrong way round even though they do not overlap.
     pub fn with_assume_no_overlap_on_sort(mut self, assume: bool) -> Self {
         self.assume_no_overlap_on_sort = assume;
         self
