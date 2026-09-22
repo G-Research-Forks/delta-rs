@@ -540,6 +540,15 @@ impl TableProviderBuilder {
     /// order preserving, which for a descending order on a timestamp column -
     /// where the maximum is where a file's range begins - can put two files
     /// the wrong way round even though they do not overlap.
+    ///
+    /// That takes a file whose whole span in the sort column falls inside a
+    /// single millisecond. A widened maximum only overtakes the file above it
+    /// if that file's entire range sits in the millisecond it was widened
+    /// into, and a maximum landing on a millisecond boundary is widened
+    /// alike, so a pair that both round move together. Files spanning more
+    /// than a millisecond of the sort column cannot be arranged wrongly this
+    /// way, and an ascending order cannot either, the maximum being where a
+    /// file's range ends there.
     pub fn with_assume_no_overlap_on_sort(mut self, assume: bool) -> Self {
         self.assume_no_overlap_on_sort = assume;
         self
