@@ -449,7 +449,12 @@ impl TableProviderBuilder {
     /// sort order.
     ///
     /// The declared order is trusted: files whose data is not actually sorted
-    /// this way will produce incorrectly ordered query results.
+    /// this way produce wrong query results, not merely misordered ones. The
+    /// ordering is advertised to DataFusion, which plans on it wherever an
+    /// operator can exploit sorted input: a `GROUP BY` on the sort columns
+    /// may be aggregated in streaming mode and emit a key twice, and a window
+    /// function or sort-merge join computed over the ordering gives wrong
+    /// values.
     ///
     /// Only regular top-level data columns are supported. Partition columns are
     /// injected above the parquet scan and cannot participate in a file-level
@@ -515,8 +520,13 @@ impl TableProviderBuilder {
     /// [`with_file_sort_order`](Self::with_file_sort_order)).
     ///
     /// **The assertion is trusted and unchecked.** If two files do overlap,
-    /// queries return rows in the wrong order and report no error. This does
-    /// nothing unless a file sort order is also declared.
+    /// queries report no error and return wrong results. Rows in the wrong
+    /// order is the mildest outcome: the arrangement is advertised as an
+    /// ordering of the scan, and DataFusion plans on that ordering wherever an
+    /// operator can exploit sorted input, so a `GROUP BY` on the sort columns
+    /// may be aggregated in streaming mode and emit a key twice, and a window
+    /// function or sort-merge join computed over the ordering gives wrong
+    /// values. This does nothing unless a file sort order is also declared.
     ///
     /// Overlap is all this relaxes. Sort columns that may contain nulls, sort
     /// keys whose types cannot be compared, and files whose sort-column
