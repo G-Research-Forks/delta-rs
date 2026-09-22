@@ -268,6 +268,20 @@ pub(super) enum OverlapPolicy {
     Assume,
 }
 
+/// Reorder `items` by a permutation of their indices.
+fn apply_order<T>(items: Vec<T>, order: Vec<usize>) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|index| slots[index].take().expect("a permutation of the items"))
+        .collect()
+}
+
+/// The sort options of `ordering`, column by column.
+fn sort_options(ordering: &LexOrdering) -> Vec<SortOptions> {
+    ordering.iter().map(|sort_expr| sort_expr.options).collect()
+}
+
 /// Arrange `items` in the order in which their files (`file` reads the
 /// `PartitionedFile` off an item) are mutually non-overlapping on `ordering`.
 /// When they overlap or cannot be ordered, `Err` hands the items back as they
@@ -283,41 +297,11 @@ pub(super) enum OverlapPolicy {
 /// than being ordered arbitrarily. Nulls among the sort columns are the
 /// caller's concern: the bounds say nothing about them.
 ///
-/// Under [`OverlapPolicy::Assume`] the overlap check is replaced by the
-/// table's assertion and the files are placed on their endpoints alone; see
-/// [`non_overlapping_order`] for what that changes.
-pub(super) fn non_overlapping_file_order<T>(
-    items: Vec<T>,
-    file: impl Fn(&T) -> &PartitionedFile,
-    ordering: &LexOrdering,
-    overlap: OverlapPolicy,
-) -> Result<Vec<T>, Vec<T>> {
-    let Some(ranges) = file_ranges(items.iter().map(file), ordering) else {
-        return Err(items);
-    };
-    match non_overlapping_order(&ranges, &sort_options(ordering), overlap) {
-        Some(order) => Ok(apply_order(items, order)),
-        None => Err(items),
-    }
-}
-
-/// Reorder `items` by a permutation of their indices.
-fn apply_order<T>(items: Vec<T>, order: Vec<usize>) -> Vec<T> {
-    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
-    order
-        .into_iter()
-        .map(|index| slots[index].take().expect("a permutation of the items"))
-        .collect()
-}
-
-/// The sort options of `ordering`, column by column.
-fn sort_options(ordering: &LexOrdering) -> Vec<SortOptions> {
-    ordering.iter().map(|sort_expr| sort_expr.options).collect()
-}
-
-/// Arrange `items` on `ordering` the way [`non_overlapping_file_order`] does,
-/// proving the files non-overlapping first and falling back on the table's
+/// The files are proven non-overlapping first, falling back on the table's
 /// assertion only when `overlap` allows it and the statistics could not.
+/// Under [`OverlapPolicy::Assume`] the overlap check is then replaced by the
+/// assertion and the files are placed on their endpoints alone; see
+/// [`non_overlapping_order`] for what that changes.
 ///
 /// `Ok` carries the arrangement and whether the assertion is what produced it;
 /// tables the proving path already handled keep their behaviour either way.
@@ -400,8 +384,8 @@ fn file_ranges<'a>(
     Some(ranges)
 }
 
-/// [`non_overlapping_file_order`] as a permutation of the files behind
-/// `ranges`, which [`file_ranges`] read off them.
+/// [`arrange_non_overlapping_files`] under one policy, as a permutation of
+/// the files behind `ranges`, which [`file_ranges`] read off them.
 ///
 /// [`OverlapPolicy::Prove`] sorts the files on the start of their range and
 /// refuses the whole set as soon as one range reaches into the next.
@@ -1536,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_overlapping_file_order_rejects_null_bounds() {
+    fn test_arrange_non_overlapping_files_rejects_null_bounds() {
         // `b` carries typed-null bounds, as a file whose statistics omit the
         // sort column does once parsed against the table schema. Its real
         // rows could fall anywhere, so no order is non-overlapping.
@@ -1553,7 +1537,7 @@ mod tests {
         }));
         let files = vec![stats_file("a", 0, 99), unbounded, stats_file("c", 100, 199)];
 
-        let result = non_overlapping_file_order(
+        let result = arrange_non_overlapping_files(
             files,
             |file| file,
             &int64_asc_ordering(),
@@ -1609,9 +1593,9 @@ mod tests {
     }
 
     fn assumed_order(files: Vec<PartitionedFile>, ordering: &LexOrdering) -> Option<Vec<String>> {
-        non_overlapping_file_order(files, |file| file, ordering, OverlapPolicy::Assume)
+        arrange_non_overlapping_files(files, |file| file, ordering, OverlapPolicy::Assume)
             .ok()
-            .map(|ordered| file_names(&ordered))
+            .map(|(ordered, _)| file_names(&ordered))
     }
 
     #[test]
@@ -1629,7 +1613,7 @@ mod tests {
         );
         // The same files are refused when the order has to be proven.
         assert!(
-            non_overlapping_file_order(
+            arrange_non_overlapping_files(
                 files,
                 |file| file,
                 &two_column_asc_ordering(),

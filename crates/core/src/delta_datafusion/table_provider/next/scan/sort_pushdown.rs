@@ -519,7 +519,6 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::Statistics;
 
-    use super::super::non_overlapping_file_order;
     use super::*;
     use crate::delta_datafusion::file_id::wrap_file_id_value;
 
@@ -1022,8 +1021,9 @@ mod tests {
             .collect();
         let ordering = LexOrdering::new(vec![sort]).unwrap();
         Some(
-            non_overlapping_file_order(files, |file| file, &ordering, OverlapPolicy::Prove)
+            arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
                 .ok()?
+                .0
                 .into_iter()
                 .map(|file| file.object_meta.location.to_string())
                 .collect(),
@@ -1106,7 +1106,7 @@ mod tests {
         files[1].statistics = None;
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
         assert!(
-            non_overlapping_file_order(files, |file| file, &ordering, OverlapPolicy::Prove)
+            arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
                 .is_err()
         );
     }
@@ -1132,7 +1132,7 @@ mod tests {
             .collect();
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
         assert!(
-            non_overlapping_file_order(files, |file| file, &ordering, OverlapPolicy::Prove)
+            arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
                 .is_err()
         );
     }
