@@ -1059,7 +1059,8 @@ async fn get_read_plan(
     // Sort order (over `parquet_read_schema`) that every data file adheres to.
     file_sort_order: Option<LexOrdering>,
     // Whether the files may be taken to be non-overlapping on `file_sort_order`
-    // without proving it from their statistics.
+    // without proving it from their statistics. Narrowed to
+    // [`OverlapPolicy::Prove`] below when the files span several stores.
     overlap: OverlapPolicy,
     // Returns the read plan, plus the ordering (over `parquet_read_schema`) its
     // partitions follow only by virtue of that assumption, if any.
@@ -1068,6 +1069,21 @@ async fn get_read_plan(
     // One entry per store plan; `None` where that plan's grouping was proven
     // rather than assumed.
     let mut assumed_orderings = Vec::new();
+
+    // The per-store plans are unioned, which interleaves their files, so an
+    // arrangement resting on the assertion could not be declared for the
+    // result whatever each store's grouping looks like (see the collapse of
+    // `assumed_orderings` below). Arranging on the assertion here would only
+    // displace the grouping DataFusion can certify by itself and leave the
+    // scan advertising no ordering at all, so this grouping keeps to what the
+    // statistics prove. The table's declaration is a separate matter, held by
+    // the exec: see [`DeltaScanExec::with_no_overlap_assumption`].
+    let files_by_store = files_by_store.into_iter().collect_vec();
+    let overlap = if files_by_store.len() > 1 {
+        OverlapPolicy::Prove
+    } else {
+        overlap
+    };
 
     let pq_options = table_parquet_options
         .cloned()
@@ -1209,7 +1225,8 @@ async fn get_read_plan(
     }
 
     // If there are multiple stores, the plans interleave files across stores
-    // so an assumed ordering is invalidated.
+    // so an assumed ordering is invalidated. Nothing above arranges on the
+    // assertion in that case, so this only holds the line.
     let assumed_ordering = match assumed_orderings.len() {
         1 => assumed_orderings.remove(0),
         _ => None,
@@ -2430,6 +2447,137 @@ mod tests {
             "+----+-------+-----------------------------+",
         ];
         assert_batches_sorted_eq!(&expected, &batches);
+
+        Ok(())
+    }
+
+    /// The file groups of every parquet scan in a plan, in plan order.
+    fn plan_file_groups(plan: &Arc<dyn ExecutionPlan>) -> Vec<Vec<String>> {
+        let mut groups = Vec::new();
+        if let Some(source) = plan.downcast_ref::<DataSourceExec>()
+            && let Some(config) = source
+                .data_source()
+                .as_ref()
+                .downcast_ref::<FileScanConfig>()
+        {
+            groups.extend(config.file_groups.iter().map(group_paths));
+        }
+        for child in plan.children() {
+            groups.extend(plan_file_groups(child));
+        }
+        groups
+    }
+
+    async fn read_plan_file_groups(
+        state: &dyn Session,
+        files_by_store: Vec<FilesByStore>,
+        parquet_read_schema: &SchemaRef,
+        file_id_field: &FieldRef,
+        overlap: OverlapPolicy,
+    ) -> TestResult<(Vec<Vec<String>>, Option<LexOrdering>)> {
+        let parquet_predicate_schema =
+            build_parquet_predicate_schema(parquet_read_schema, file_id_field);
+        let (plan, assumed_ordering) = get_read_plan(
+            state,
+            files_by_store,
+            parquet_read_schema,
+            &parquet_predicate_schema,
+            None,
+            file_id_field,
+            None,
+            None,
+            Some(int64_asc_ordering()),
+            overlap,
+        )
+        .await?;
+        Ok((plan_file_groups(&plan), assumed_ordering))
+    }
+
+    /// Files spanning several stores are grouped on their statistics alone,
+    /// whatever the table asserts: the per-store plans are unioned, so an
+    /// assumed arrangement could not be declared for the result and taking one
+    /// would only displace the grouping DataFusion can certify by itself.
+    #[tokio::test]
+    async fn test_multi_store_read_plan_ignores_no_overlap_assertion() -> TestResult {
+        let store_url_1 = Url::parse("first:///")?;
+        let store_url_2 = Url::parse("second:///")?;
+        let mut state = create_session().into_inner().state();
+        // Two groups per store, so an assumed arrangement and a proven one cut
+        // the same files differently.
+        state.config_mut().options_mut().execution.target_partitions = 2;
+        state
+            .runtime_env()
+            .register_object_store(&store_url_1, Arc::new(InMemory::new()));
+        state
+            .runtime_env()
+            .register_object_store(&store_url_2, Arc::new(InMemory::new()));
+
+        let file_id_field =
+            crate::delta_datafusion::file_id::file_id_field(Some(FILE_ID_COLUMN_DEFAULT));
+        let parquet_read_schema = int64_sort_schema();
+
+        // Ranges that overlap their neighbours, so no order can be proven and
+        // the assertion would otherwise place the files itself.
+        let store_files = |store: &str| {
+            [(0, 99), (50, 149), (100, 199), (150, 249)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (min, max))| {
+                    let name = format!("{store}-f{index}");
+                    let mut file = stats_file(&name, min, max);
+                    file.partition_values
+                        .push(wrap_file_id_value(format!("{store}:///{name}.parquet")));
+                    (file, None::<Vec<bool>>)
+                })
+                .collect_vec()
+        };
+        let one_store = vec![(store_url_1.as_object_store_url(), store_files("first"))];
+        let two_stores = vec![
+            (store_url_1.as_object_store_url(), store_files("first")),
+            (store_url_2.as_object_store_url(), store_files("second")),
+        ];
+
+        // These files are ones the assertion really does regroup, so the
+        // multi-store check below cannot pass for want of a difference.
+        let (proven, _) = read_plan_file_groups(
+            &state,
+            one_store.clone(),
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Prove,
+        )
+        .await?;
+        let (asserted, assumed_ordering) = read_plan_file_groups(
+            &state,
+            one_store,
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Assume,
+        )
+        .await?;
+        assert_ne!(proven, asserted);
+        assert!(assumed_ordering.is_some());
+
+        let (proven, _) = read_plan_file_groups(
+            &state,
+            two_stores.clone(),
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Prove,
+        )
+        .await?;
+        let (asserted, assumed_ordering) = read_plan_file_groups(
+            &state,
+            two_stores,
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Assume,
+        )
+        .await?;
+        assert_eq!(proven, asserted);
+        // And with nothing arranged on the assertion, nothing is left for the
+        // exec to re-declare.
+        assert!(assumed_ordering.is_none());
 
         Ok(())
     }
