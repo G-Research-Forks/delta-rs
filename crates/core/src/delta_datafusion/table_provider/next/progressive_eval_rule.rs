@@ -63,18 +63,20 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
             if contains_hash_join(input)? {
                 return Ok(Transformed::no(plan));
             }
-            let ranges = match ordered_partition_ranges(input, merge.expr()) {
-                Some(ranges) => Some(ranges),
-                // Statistics could not prove the partitions ordered. A Delta
-                // scan may know it anyway - from a sort pushdown that built
-                // the partitions that way, or from the table's assertion that
-                // its files never overlap; the ranges are then only
-                // descriptive, so it does not matter that they may be
-                // unavailable.
-                None if partitions_declared_disjoint(input, merge.expr())? => {
-                    leading_partition_ranges(input, merge.expr())
-                }
-                None => return Ok(Transformed::no(plan)),
+            // A Delta scan may declare the partitions disjoint outright - from
+            // a sort pushdown that built them that way, or from the table's
+            // assertion that its files never overlap. That is asked first: it
+            // is a walk over the plan, whereas the proof materialises every
+            // partition's statistics, which the declaration makes redundant.
+            // The ranges are then only descriptive, so it does not matter that
+            // they may be unavailable.
+            let ranges = if partitions_declared_disjoint(input, merge.expr())? {
+                leading_partition_ranges(input, merge.expr())
+            } else {
+                let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
+                    return Ok(Transformed::no(plan));
+                };
+                Some(ranges)
             };
             let input = preserve_input_order(Arc::clone(input))?;
             let replacement = ProgressiveEvalExec::new(input, ranges, merge.fetch());
