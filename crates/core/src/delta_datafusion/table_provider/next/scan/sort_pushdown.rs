@@ -339,8 +339,9 @@ pub(super) fn plan_sort_pushdown(
 /// describes both that range and where the run begins. Such a group publishes
 /// nothing, and `DeltaScanExec` describes it from the table-wide aggregate
 /// instead - exact for a lone execution partition, inexact otherwise, which
-/// cannot prove neighbouring partitions disjoint, so the merge above the scan
-/// stays while the sort is still gone.
+/// cannot prove neighbouring partitions disjoint. The scan declares them
+/// disjoint by construction regardless (see `DeltaScanExec::disjoint_ordering`),
+/// so only the ranges reported for the partitions are lost.
 fn group_prefix_stats(
     group: &[Bucket],
     prefix: &[PrefixColumn],
@@ -378,13 +379,14 @@ fn group_prefix_stats(
 ///
 /// The group count may exceed the target so that a group can be cut at every
 /// change of a leading partition column. That keeps each group's
-/// partition-column statistics exact, which lets `ProgressiveEvalRule` prove
-/// neighbouring groups disjoint and replace the `SortPreservingMergeExec`
-/// above with a `ProgressiveEvalExec`.
+/// partition-column statistics exact, so that `ProgressiveEvalRule` can
+/// replace the `SortPreservingMergeExec` above with a `ProgressiveEvalExec`
+/// that reports the range each partition covers.
 ///
-/// The replacement is not guaranteed, and a merge that is kept opens every
-/// partition at once, so the overshoot is capped at [`max_num_groups`], the
-/// same bound a scan with a declared file sort order already gets.
+/// The replacement is not guaranteed - an operator between the merge and the
+/// scan can prevent it - and a merge that is kept opens every partition at
+/// once, so the overshoot is capped at [`max_num_groups`], the same bound a
+/// scan with a declared file sort order already gets.
 pub(super) fn group_budget(target_groups: usize) -> usize {
     if target_groups <= 1 {
         // A single target group is the one case that cannot absorb any overshoot:
@@ -412,11 +414,11 @@ pub(super) fn group_budget(target_groups: usize) -> usize {
 ///
 /// Packing first cuts a group wherever a prefix column other than the last
 /// changes, so that every group's statistics can be read exactly off its
-/// endpoints (see [`group_prefix_stats`]) and `ProgressiveEvalRule` can prove
-/// the groups disjoint. When those cuts alone overrun the budget - many
-/// distinct leading values, or a single target group - the buckets are packed
-/// by file count alone instead. That still removes the sort; only the merge
-/// above it has to stay.
+/// endpoints (see [`group_prefix_stats`]). When those cuts alone overrun the
+/// budget - many distinct leading values, or a single target group - the
+/// buckets are packed by file count alone instead. The groups are still
+/// consecutive runs of key-ordered buckets, so they stay disjoint and
+/// range-ordered; only their exact statistics are lost.
 fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Option<Vec<Vec<Bucket>>> {
     let target = target.max(1);
     let max_groups = group_budget(target);
@@ -1783,7 +1785,7 @@ mod tests {
     /// Leading-prefix cuts may exceed the target group count, but only up to
     /// `group_budget`. Past that the buckets are packed by file count instead:
     /// the sort is still removed, and the groups that span a change in the
-    /// leading column publish no statistics, so the merge above them stays.
+    /// leading column publish no statistics.
     #[test]
     fn leading_prefix_cuts_fall_back_to_packing_past_the_budget() {
         let files = |parts: usize| -> Vec<PartitionedFile> {

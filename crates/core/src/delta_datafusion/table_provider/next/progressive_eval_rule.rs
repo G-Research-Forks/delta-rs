@@ -66,10 +66,12 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
             let ranges = match ordered_partition_ranges(input, merge.expr()) {
                 Some(ranges) => Some(ranges),
                 // Statistics could not prove the partitions ordered. A Delta
-                // scan whose table declares its files non-overlapping asserts
-                // it instead; the ranges are then only descriptive, so it does
-                // not matter that they may be unavailable.
-                None if partitions_assumed_disjoint(input, merge.expr())? => {
+                // scan may know it anyway - from a sort pushdown that built
+                // the partitions that way, or from the table's assertion that
+                // its files never overlap; the ranges are then only
+                // descriptive, so it does not matter that they may be
+                // unavailable.
+                None if partitions_declared_disjoint(input, merge.expr())? => {
                     leading_partition_ranges(input, merge.expr())
                 }
                 None => return Ok(Transformed::no(plan)),
@@ -90,13 +92,15 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     }
 }
 
-/// Whether `plan` sits on a Delta scan that *asserts* - rather than proves -
-/// that its execution partitions are mutually disjoint and arranged in range
-/// order, on an ordering that also covers `ordering`.
+/// Whether `plan` sits on a Delta scan that *declares* - rather than proves
+/// from statistics - that its execution partitions are mutually disjoint and
+/// arranged in range order, on an ordering that also covers `ordering`. See
+/// [`DeltaScanExec::disjoint_ordering`] for where such a declaration comes
+/// from.
 ///
 /// The statistics proof beside this one reaches the scan through intervening
 /// operators for free, because per-partition statistics propagate up through
-/// them. An assertion is not a statistic, so it has to be fetched from the
+/// them. A declaration is not a statistic, so it has to be fetched from the
 /// scan itself, and this walks down to find it - rewriting `ordering` over
 /// each child's schema on the way, since the columns it names are those of the
 /// plan it started from.
@@ -104,23 +108,23 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
 /// The walk descends only through operators that hand their input's partitions
 /// on as they are; see [`pass_through_ordering`]. Anything else ends it, at
 /// the cost of a missed optimization rather than a wrong result.
-fn partitions_assumed_disjoint(
+fn partitions_declared_disjoint(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
 ) -> Result<bool> {
     let node = plan.as_ref() as &dyn ExecutionPlan;
     if let Some(scan) = node.downcast_ref::<DeltaScanExec>() {
-        let Some(assumed) = scan.assumed_disjoint_ordering() else {
+        let Some(declared) = scan.disjoint_ordering() else {
             return Ok(false);
         };
-        // Concatenating the partitions yields a stream ordered on `assumed`.
-        // That makes the merge redundant only if `assumed` also delivers what
+        // Concatenating the partitions yields a stream ordered on `declared`.
+        // That makes the merge redundant only if `declared` also delivers what
         // the merge was asked for - which it does when `ordering` is a prefix
         // of it, and through equivalences in cases a plain prefix check would
-        // miss. Only `assumed` is offered: the scan's other orderings describe
-        // each partition on its own and say nothing about how they sit
-        // relative to each other.
-        return EquivalenceProperties::new_with_orderings(plan.schema(), vec![assumed.clone()])
+        // miss. Only `declared` is offered: the scan's other orderings
+        // describe each partition on its own and say nothing about how they
+        // sit relative to each other.
+        return EquivalenceProperties::new_with_orderings(plan.schema(), vec![declared.clone()])
             .ordering_satisfy(ordering.iter().cloned());
     }
     let (Some(child_ordering), [child]) =
@@ -128,7 +132,7 @@ fn partitions_assumed_disjoint(
     else {
         return Ok(false);
     };
-    partitions_assumed_disjoint(child, &child_ordering)
+    partitions_declared_disjoint(child, &child_ordering)
 }
 
 /// Rewrite `ordering`, whose columns index `plan`'s output schema, over the

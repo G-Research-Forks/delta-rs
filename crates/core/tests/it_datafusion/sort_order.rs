@@ -601,11 +601,13 @@ async fn delta_table_partition_prefix_exceeding_multi_partition_target_avoids_so
 
 /// Cutting a group at every change of a leading partition column is only
 /// attempted while it fits the group budget. A table with more distinct
-/// leading values than the budget allows is packed by file count instead: the
-/// `SortExec` is still removed, but the packed groups publish no partition
-/// statistics, so the `SortPreservingMergeExec` above them has to stay.
+/// leading values than the budget allows is packed by file count instead. The
+/// packed groups publish no partition statistics, but they are still
+/// consecutive runs of key-ordered buckets, which the scan declares, so the
+/// `SortPreservingMergeExec` above them is still replaced by a concatenation.
 #[tokio::test]
-async fn delta_table_partition_prefix_beyond_group_budget_keeps_merge_only() -> TestResult<()> {
+async fn delta_table_partition_prefix_beyond_group_budget_concatenates_packed_groups()
+-> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new("part", DataType::Utf8, false),
@@ -636,12 +638,12 @@ async fn delta_table_partition_prefix_beyond_group_budget_keeps_merge_only() -> 
         "expected no SortExec in plan:\n{rendered}"
     );
     assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected the merge to stay over packed groups:\n{rendered}"
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec over packed groups:\n{rendered}"
     );
     assert!(
-        !rendered.contains("ProgressiveEvalExec"),
-        "packed groups cannot be proven disjoint:\n{rendered}"
+        rendered.contains("ProgressiveEvalExec"),
+        "expected the packed groups to be concatenated:\n{rendered}"
     );
     assert_eq!(keys.len(), parts as usize);
     assert_sorted(&keys, "(part, sub)");

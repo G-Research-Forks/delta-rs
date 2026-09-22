@@ -455,18 +455,18 @@ impl DeltaScanExec {
         self
     }
 
-    /// The ordering on which this exec's execution partitions are taken to be
-    /// mutually disjoint and arranged in range order *by assumption* rather
-    /// than proven so from statistics, or `None` when no such claim is made.
+    /// The ordering on which this exec's execution partitions are known to be
+    /// mutually disjoint and arranged in range order other than through the
+    /// statistics they publish, or `None` when no such claim is made.
     ///
     /// After a sort pushdown the regrouped file groups are disjoint and ordered
-    /// on the pushed ordering by construction - group boundaries fall on
-    /// partition-prefix key changes or on cuts within one already-ordered
-    /// bucket - but that bucket ordering may itself rest on the assertion, so
-    /// the claim is reported whenever the table makes it.
-    pub(crate) fn assumed_disjoint_ordering(&self) -> Option<&LexOrdering> {
+    /// on the pushed ordering by construction, under either overlap policy:
+    /// group boundaries fall on partition-prefix key changes or on cuts within
+    /// one already-ordered bucket. Without one, the claim is the table's
+    /// assertion, when the file groups could be arranged on it.
+    pub(crate) fn disjoint_ordering(&self) -> Option<&LexOrdering> {
         match &self.pushed {
-            Some(pushed) => (self.overlap == OverlapPolicy::Assume).then_some(&pushed.ordering),
+            Some(pushed) => Some(&pushed.ordering),
             None => self.assumed_ordering.as_ref(),
         }
     }
