@@ -535,12 +535,18 @@ impl TableProviderBuilder {
     /// column: files covering the same span of a column meet somewhere inside
     /// it, which the assertion cannot explain away.
     ///
-    /// Applying the assertion costs some read parallelism. The arrangement is
-    /// a whole file list cut into contiguous groups, so the scan refuses to
-    /// have those groups split into byte ranges, and it refuses for every
-    /// query on the table rather than only the ordered ones. A table whose
-    /// statistics already prove the order keeps the splitting, since the
-    /// assertion never comes into play there.
+    /// The arrangement is made when the scan is planned and advertised as its
+    /// output ordering for every query on the table, not only the ordered
+    /// ones. That costs what any declared ordering costs in read parallelism,
+    /// which is that DataFusion does not round-robin the rows beneath an
+    /// ordered scan, and no more: files are still split into byte ranges to fill
+    /// `datafusion.execution.target_partitions`. The arrangement survives a
+    /// split that re-cuts the ordered file list into contiguous pieces, which
+    /// is what a table large enough to be worth splitting gets, and is
+    /// withdrawn when the pieces of a few files are dealt across the
+    /// partitions and interleave, leaving the sort-preserving merge in place.
+    /// The note on [`with_file_sort_order`](Self::with_file_sort_order) about
+    /// `datafusion.optimizer.repartition_file_scans` applies here too.
     ///
     /// **The bounds are taken at face value, so the assertion covers their
     /// fidelity too.** A writer may record a truncated string minimum, and a
