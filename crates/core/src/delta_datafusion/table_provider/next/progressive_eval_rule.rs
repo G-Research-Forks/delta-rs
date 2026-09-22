@@ -145,22 +145,39 @@ fn partitions_assumed_disjoint(
 /// A projection has the further job of carrying the sort columns down, and
 /// only a column passed straight through can be carried: one the projection
 /// computes is not the column the scan arranged its files on, whatever it is
-/// named.
+/// named. A filter carries them too when `ProjectionPushdown` has embedded a
+/// projection in it, which selects columns by index and so only moves them.
 fn pass_through_ordering(plan: &dyn ExecutionPlan, ordering: &LexOrdering) -> Option<LexOrdering> {
-    if plan.downcast_ref::<FilterExec>().is_some()
-        || plan.downcast_ref::<CooperativeExec>().is_some()
-    {
+    if plan.downcast_ref::<CooperativeExec>().is_some() {
         return Some(ordering.clone());
     }
+    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        let Some(projection) = filter.projection() else {
+            return Some(ordering.clone());
+        };
+        return map_ordering_columns(ordering, |column| {
+            Some(Column::new(column.name(), *projection.get(column.index())?))
+        });
+    }
     let projection = plan.downcast_ref::<ProjectionExec>()?;
+    map_ordering_columns(ordering, |column| {
+        let projected = projection.expr().get(column.index())?;
+        projected.expr.downcast_ref::<Column>().cloned()
+    })
+}
+
+/// Rewrite `ordering` with each of its columns replaced by the child column
+/// `carry` reads it from, or `None` when any of them does not come from one.
+fn map_ordering_columns(
+    ordering: &LexOrdering,
+    carry: impl Fn(&Column) -> Option<Column>,
+) -> Option<LexOrdering> {
     let mapped = ordering
         .iter()
         .map(|sort_expr| {
             let column = sort_expr.expr.downcast_ref::<Column>()?;
-            let projected = projection.expr().get(column.index())?;
-            let passed = projected.expr.downcast_ref::<Column>()?;
             Some(PhysicalSortExpr::new(
-                Arc::new(passed.clone()),
+                Arc::new(carry(column)?),
                 sort_expr.options,
             ))
         })
@@ -357,8 +374,10 @@ mod tests {
     use datafusion::common::stats::{ColumnStatistics, Precision};
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion::physical_expr::expressions::Literal;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::filter::FilterExecBuilder;
     use datafusion::physical_plan::joins::PartitionMode;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
 
@@ -805,6 +824,44 @@ mod tests {
                 .is_some(),
             "expected SortPreservingMergeExec, got {}",
             optimized.name()
+        );
+    }
+
+    /// A filter over ordered partitions, with a projection embedded in it the
+    /// way `ProjectionPushdown` leaves one.
+    fn filter_exec(projection: Option<Vec<usize>>) -> FilterExec {
+        FilterExecBuilder::new(
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+            ordered_partitions(),
+        )
+        .apply_projection(projection)
+        .unwrap()
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn filter_passes_the_ordering_through_unchanged() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        assert_eq!(
+            pass_through_ordering(&filter_exec(None), &ordering),
+            Some(ordering)
+        );
+    }
+
+    #[test]
+    fn filter_carries_the_ordering_through_an_embedded_projection() {
+        // The filter emits `id` then `t`, so the sort column it is asked about
+        // is not the one its child holds under that index.
+        let filter = filter_exec(Some(vec![1, 0]));
+        assert_eq!(filter.schema().field(1).name(), "t");
+
+        let ordering = LexOrdering::new(vec![asc(1, "t")]).unwrap();
+
+        assert_eq!(
+            pass_through_ordering(&filter, &ordering),
+            LexOrdering::new(vec![asc(0, "t")])
         );
     }
 
