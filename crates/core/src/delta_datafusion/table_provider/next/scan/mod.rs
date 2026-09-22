@@ -292,16 +292,27 @@ pub(super) fn non_overlapping_file_order<T>(
     ordering: &LexOrdering,
     overlap: OverlapPolicy,
 ) -> Result<Vec<T>, Vec<T>> {
-    match non_overlapping_order(items.iter().map(file), ordering, overlap) {
-        Some(order) => {
-            let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
-            Ok(order
-                .into_iter()
-                .map(|index| slots[index].take().expect("a permutation of the items"))
-                .collect())
-        }
+    let Some(ranges) = file_ranges(items.iter().map(file), ordering) else {
+        return Err(items);
+    };
+    match non_overlapping_order(&ranges, &sort_options(ordering), overlap) {
+        Some(order) => Ok(apply_order(items, order)),
         None => Err(items),
     }
+}
+
+/// Reorder `items` by a permutation of their indices.
+fn apply_order<T>(items: Vec<T>, order: Vec<usize>) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|index| slots[index].take().expect("a permutation of the items"))
+        .collect()
+}
+
+/// The sort options of `ordering`, column by column.
+fn sort_options(ordering: &LexOrdering) -> Vec<SortOptions> {
+    ordering.iter().map(|sort_expr| sort_expr.options).collect()
 }
 
 /// Arrange `items` on `ordering` the way [`non_overlapping_file_order`] does,
@@ -312,40 +323,46 @@ pub(super) fn non_overlapping_file_order<T>(
 /// tables the proving path already handled keep their behaviour either way.
 pub(super) fn arrange_non_overlapping_files<T>(
     items: Vec<T>,
-    file: impl Fn(&T) -> &PartitionedFile + Copy,
+    file: impl Fn(&T) -> &PartitionedFile,
     ordering: &LexOrdering,
     overlap: OverlapPolicy,
 ) -> Result<(Vec<T>, bool), Vec<T>> {
-    let items = match non_overlapping_file_order(items, file, ordering, OverlapPolicy::Prove) {
-        Ok(ordered) => return Ok((ordered, false)),
-        Err(items) => items,
+    // Reading the ranges walks every file's statistics and clones two bounds
+    // per sort column, so both policies run over the one reading. A table that
+    // asserts non-overlap is one the proving pass is expected to fail, so that
+    // walk would otherwise be paid for twice on every query against it.
+    let Some(ranges) = file_ranges(items.iter().map(file), ordering) else {
+        return Err(items);
     };
+    let options = sort_options(ordering);
+    if let Some(order) = non_overlapping_order(&ranges, &options, OverlapPolicy::Prove) {
+        return Ok((apply_order(items, order), false));
+    }
     if overlap == OverlapPolicy::Prove {
         return Err(items);
     }
-    non_overlapping_file_order(items, file, ordering, OverlapPolicy::Assume)
-        .map(|ordered| (ordered, true))
+    match non_overlapping_order(&ranges, &options, OverlapPolicy::Assume) {
+        Some(order) => Ok((apply_order(items, order), true)),
+        None => Err(items),
+    }
 }
 
-/// [`non_overlapping_file_order`] as a permutation of `files`.
+/// Each file's range endpoints under `ordering`, in the order the files came
+/// in; see [`FileRange`]. `None` when a file carries no usable bounds for the
+/// sort columns, which refuses the whole set.
 ///
-/// [`OverlapPolicy::Prove`] sorts the files on the start of their range and
-/// refuses the whole set as soon as one range reaches into the next.
+/// Values that cannot be compared, and null bounds, refuse the files rather
+/// than being ordered arbitrarily.
 ///
-/// [`OverlapPolicy::Assume`] takes the ranges to be disjoint and so orders the
-/// files on their endpoints alone; see [`assumed_range_cmp`] for how, and
-/// [`assumed_ranges_separate`] for the pairs it still refuses.
-///
-/// Both paths assume the column bounds are exact. Wider ranges only make `Prove`
-/// refuse more often and are safe there, but can make `Assume` order files incorrectly.
-/// Asserting the non-overlapping property also asserts that the min/max statistics
-/// can be used to compute the sorted file order.
-fn non_overlapping_order<'a>(
+/// The bounds are taken to be exact. Wider ones only make
+/// [`OverlapPolicy::Prove`] refuse more often and are safe there, but can make
+/// [`OverlapPolicy::Assume`] order files incorrectly. Asserting the
+/// non-overlapping property also asserts that the min/max statistics can be
+/// used to compute the sorted file order.
+fn file_ranges<'a>(
     files: impl IntoIterator<Item = &'a PartitionedFile>,
     ordering: &LexOrdering,
-    overlap: OverlapPolicy,
-) -> Option<Vec<usize>> {
-    // Each file's range endpoints under the ordering; see [`FileRange`].
+) -> Option<Vec<FileRange>> {
     let mut ranges: Vec<FileRange> = Vec::new();
     let mut key_types = KeyTypes::default();
     for (index, file) in files.into_iter().enumerate() {
@@ -380,30 +397,49 @@ fn non_overlapping_order<'a>(
         }
         ranges.push((starts, ends, index));
     }
+    Some(ranges)
+}
 
-    let options: Vec<SortOptions> = ordering.iter().map(|sort_expr| sort_expr.options).collect();
+/// [`non_overlapping_file_order`] as a permutation of the files behind
+/// `ranges`, which [`file_ranges`] read off them.
+///
+/// [`OverlapPolicy::Prove`] sorts the files on the start of their range and
+/// refuses the whole set as soon as one range reaches into the next.
+///
+/// [`OverlapPolicy::Assume`] takes the ranges to be disjoint and so orders the
+/// files on their endpoints alone; see [`assumed_range_cmp`] for how, and
+/// [`assumed_ranges_separate`] for the pairs it still refuses.
+///
+/// The ranges are read rather than consumed, so one reading of the statistics
+/// serves both policies; see [`arrange_non_overlapping_files`].
+fn non_overlapping_order(
+    ranges: &[FileRange],
+    options: &[SortOptions],
+    overlap: OverlapPolicy,
+) -> Option<Vec<usize>> {
     let cmp = |a: &[ScalarValue], b: &[ScalarValue]| {
-        compare_rows(a, b, &options).expect("endpoints share a non-nested type per column")
+        compare_rows(a, b, options).expect("endpoints share a non-nested type per column")
     };
+    let mut ordered: Vec<&FileRange> = ranges.iter().collect();
     match overlap {
         OverlapPolicy::Prove => {
-            ranges.sort_by(|a, b| cmp(&a.0, &b.0));
-            for pair in ranges.windows(2) {
+            ordered.sort_by(|a, b| cmp(&a.0, &b.0));
+            for pair in ordered.windows(2) {
                 if cmp(&pair[0].1, &pair[1].0) == Ordering::Greater {
                     return None;
                 }
             }
         }
         OverlapPolicy::Assume => {
-            ranges.sort_by(|a, b| assumed_range_cmp(a, b, &options));
-            for pair in ranges.windows(2) {
-                if !assumed_ranges_separate(&pair[0], &pair[1], &options) {
+            ordered.sort_by(|a, b| assumed_range_cmp(a, b, options));
+            for pair in ordered.windows(2) {
+                if !assumed_ranges_separate(pair[0], pair[1], options) {
                     return None;
                 }
             }
         }
     }
-    Some(ranges.into_iter().map(|(_, _, index)| index).collect())
+    Some(ordered.into_iter().map(|(_, _, index)| *index).collect())
 }
 
 /// One file's range under the sort ordering: where it begins and where it ends
