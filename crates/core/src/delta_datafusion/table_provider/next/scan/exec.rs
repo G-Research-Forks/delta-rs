@@ -236,18 +236,9 @@ fn coalesced_extents(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<FileExtent<'_>
     Some(merged)
 }
 
-/// Whether `new` reads the same rows as `old` in the same order, cut into
-/// partitions wherever it likes.
-///
-/// `EnforceDistribution` re-cuts a scan's files by byte size to reach the
-/// target partition count, walking the existing groups in order and handing
-/// consecutive ranges to consecutive partitions. Reading a parquet byte range
-/// yields that file's rows in file order, so the re-cut stream is the one the
-/// old grouping would have produced, each new partition a contiguous slice of
-/// it. An arrangement that made the concatenation sorted therefore survives,
-/// which a grouping comparison demanding the same cuts would throw away - and
-/// this is the re-cut every table large enough to be worth splitting gets.
-fn grouping_is_refined(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
+/// Whether `new` reads the same rows as `old` in the same order, independent
+/// of how partitions are cut.
+fn grouping_retains_row_order(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
     match (coalesced_extents(old), coalesced_extents(new)) {
         (Some(old), Some(new)) => old == new,
         _ => false,
@@ -551,25 +542,15 @@ impl DeltaScanExec {
         Ok(self
             .input
             .try_pushdown_sort(&child_order)?
-            // The child answers by reading its files differently, and the file
-            // grouping does not say how. Its `Inexact` path reverses the row
-            // groups inside each file, or ranks them on a column of its own
-            // choosing, which leaves every group's files and byte ranges
-            // exactly as they were while the rows come back in another order.
-            // Nothing here can tell that from an untouched read, so the
-            // arrangement this exec claimed is withdrawn either way.
             .map(|inner| self.with_input(inner, None, None)))
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-        // Only a claim about the current grouping is worth walking the input's
-        // files for; an exec holding neither is rebuilt by half the optimizer
-        // and should not pay for a comparison nothing reads.
-        let unchanged =
+        let grouping_unchanged =
             || Arc::ptr_eq(&self.input, &input) || grouping_is_unchanged(&self.input, &input);
         if let Some(pushed) = &self.pushed
-            && !unchanged()
+            && !grouping_unchanged()
         {
             // The file grouping used for sort-pushdown is no longer valid, so the removal
             // of the `SortExec` may be unsafe and lead to out-of-order results.
@@ -584,8 +565,7 @@ impl DeltaScanExec {
         }
         // The assumed arrangement rides on the order the rows come out in, not
         // on where the partition boundaries fall, so it survives a replacement
-        // that re-cuts the same ordered stream and is withdrawn only by one
-        // that reads something else.
+        // that re-cuts the same ordered stream.
         //
         // Withdrawing rather than failing, as the pushed sort does, because
         // this claim is advertised to rules that have not committed to it yet:
@@ -596,7 +576,7 @@ impl DeltaScanExec {
         let assumed = self
             .assumed_ordering
             .clone()
-            .filter(|_| unchanged() || grouping_is_refined(&self.input, &input));
+            .filter(|_| grouping_unchanged() || grouping_retains_row_order(&self.input, &input));
         Ok(self.with_input(input, self.pushed.clone(), assumed))
     }
 
@@ -805,19 +785,14 @@ impl ExecutionPlan for DeltaScanExec {
         }
 
         if self.assumed_ordering.is_some() {
-            // Asking for more partitions than the scan below has file groups
-            // gets DataFusion's order-preserving repartitioner, which appends
-            // the new groups and deals each file's byte ranges across them.
-            // That interleaves the files - the first group takes the front of
-            // one, the second the front of the next - so reading the
-            // partitions in order no longer walks the ordered stream.
+            // Repartitioning would interleave files and invalidate an
+            // assumed order.
             //
             // Refusing here does not on its own keep the files whole: the
             // same request reaches the parquet scan directly from
-            // `EnforceDistribution`, which this cannot intercept. What
-            // decides is `with_new_input`, keeping the claim through a re-cut
-            // that leaves the stream intact and withdrawing it through one
-            // that does not. This only declines to ask for the latter.
+            // `EnforceDistribution`, which this cannot intercept.
+            // If that partitions files, `with_new_input` verifies whether
+            // the assumed ordering is still valid.
             return Ok(None);
         }
 

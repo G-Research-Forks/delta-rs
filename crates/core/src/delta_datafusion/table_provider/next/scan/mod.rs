@@ -336,14 +336,10 @@ pub(super) fn arrange_non_overlapping_files<T>(
 /// files on their endpoints alone; see [`assumed_range_cmp`] for how, and
 /// [`assumed_ranges_separate`] for the pairs it still refuses.
 ///
-/// Both read the bounds at whatever precision they carry; what differs is the
-/// consequence. Widening a range only makes `Prove` refuse more often, while
-/// `Assume` reads a file's position off the bounds and so follows a widened
-/// one to the wrong place. Delta records no way to tell a widened bound from a
-/// true one - every bound arrives marked exact whether or not a writer
-/// truncated it or the log reader rounded it up - so there is nothing here to
-/// screen on, and their fidelity is the table's to vouch for along with the
-/// rest of the assertion.
+/// Both paths assume the column bounds are exact. Wider ranges only make `Prove`
+/// refuse more often and are safe there, but can make `Assume` order files incorrectly.
+/// Asserting the non-overlapping property also asserts that the min/max statistics
+/// can be used to compute the sorted file order.
 fn non_overlapping_order<'a>(
     files: impl IntoIterator<Item = &'a PartitionedFile>,
     ordering: &LexOrdering,
@@ -415,7 +411,8 @@ fn non_overlapping_order<'a>(
 ///
 /// Only the *leading* column's pair is the file's true first and last key. A
 /// file is sorted on that column first, so its minimum and maximum there are
-/// the values its first and last rows carry. On any later column the minimum
+/// the values its first and last rows carry (potentially flipped for a
+/// descending order). On any later column the minimum
 /// and maximum are taken across the whole file and need not sit at its ends:
 /// a file running from `(5, 20)` to `(6, 1)` reports the second column as
 /// `[1, 20]`, neither end of which is where the file starts or stops.
@@ -438,27 +435,22 @@ fn compare_endpoints(
 }
 
 /// Order two files taken to be disjoint, on their range endpoints alone.
-///
-/// Walks the sort columns and stops at the first one whose range differs,
-/// comparing where a file's range begins before where it ends so that a file
-/// pinned inside another's span of that column still lands first. Files whose
-/// ranges coincide on every column compare `Equal`.
-///
-/// Reading a later column is only sound once every earlier one holds a single
-/// value; [`assumed_ranges_separate`] is what enforces that, and the sort is
-/// arranged to leave any pair it rejects sitting next to each other.
 fn assumed_range_cmp(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> Ordering {
     (0..options.len())
         .find_map(|column| {
+            // Compare start values
             match compare_endpoints(&a.0[column], &b.0[column], column, options) {
                 Ordering::Equal => {}
                 order => return Some(order),
             }
+            // Compare end values in the case of equal starts. A file with a range
+            // inside another's span is ordered first.
             match compare_endpoints(&a.1[column], &b.1[column], column, options) {
                 Ordering::Equal => None,
                 order => Some(order),
             }
         })
+        // All sort columns are equal so the files are considered equal:
         .unwrap_or(Ordering::Equal)
 }
 
@@ -467,26 +459,16 @@ fn assumed_range_cmp(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> O
 ///
 /// Walks the sort columns until one of them settles the pair:
 ///
-/// * Ranges that begin at different values on a column are settled there. The
-///   file beginning earlier is the earlier file: were it the later one, its
-///   range would have to end at or before the other's beginning, which is at
-///   or before its own.
-/// * Ranges beginning at the same value `v` are settled only if one of them
-///   is *pinned* to `v` - that file's range begins and ends there. Of two
-///   disjoint files starting at `v`, the earlier one has to be pinned: its
-///   last key precedes a key holding `v`, so it holds nothing past `v`. The
-///   pinned file has the earlier range end, which is how
-///   [`assumed_range_cmp`] puts it first. When *neither* is pinned, both
-///   files span past `v` from the same start and so must meet somewhere,
-///   whatever the table asserts - nothing settles them and the later columns
-///   cannot help, their minima and maxima not being the files' endpoints (see
-///   [`FileRange`]).
-/// * When *both* are pinned to `v`, every row of both files carries `v` on
-///   this column, which makes the next column's minima and maxima their true
-///   endpoints there; the walk moves on to it.
+/// * When ranges begin at different values, the file beginning earlier is
+///   ordered first.
+/// * Both ranges beginning with the same value can be ordered if one file
+///   has a constant value. The constant values file is ordered first.
+/// * If both are constant, move on to the next column.
+/// * If neither file holds a constant value, the files can't be ordered and
+///   we return false.
 ///
 /// Running out of columns leaves both files pinned to the same key on every
-/// one of them, holding nothing but that key, so either order is sorted.
+/// one of them, so either ordering is valid, and we return true.
 fn assumed_ranges_separate(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> bool {
     let pinned = |range: &FileRange, column: usize| {
         compare_endpoints(&range.0[column], &range.1[column], column, options) == Ordering::Equal
@@ -1191,12 +1173,8 @@ async fn get_read_plan(
                     }
                     null_free_prefix.clone()
                 };
-                // The assertion covers overlap between files, not nulls within
-                // one, so it rides on the null-free prefix however much of the
-                // ordering the scan itself declares. A file's nulls sit at its
-                // own end of the order; reading the files back to back would
-                // surface them mid-stream, which is a claim about the files
-                // together and so exactly what this one is taken to make.
+                // Nulls within files prevent ordering even when the table asserts
+                // an ordering, so we can only declare the null-free prefix as an assumed order.
                 assumed_orderings.push(assumed.then_some(null_free_prefix).flatten());
                 (file_groups, store_sort_order)
             }
@@ -1230,9 +1208,8 @@ async fn get_read_plan(
         plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
     }
 
-    // Files were ordered within each store's plan. A union across stores
-    // interleaves those plans' partitions, which the assumption says nothing
-    // about, so only a single-store plan can carry the claim.
+    // If there are multiple stores, the plans interleave files across stores
+    // so an assumed ordering is invalidated.
     let assumed_ordering = match assumed_orderings.len() {
         1 => assumed_orderings.remove(0),
         _ => None,

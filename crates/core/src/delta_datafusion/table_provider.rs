@@ -497,9 +497,9 @@ impl TableProviderBuilder {
     ///
     /// Delta statistics are per column, not lexicographic, so a multi-column
     /// sort order can leave files that do not really overlap looking as though
-    /// they might. Two files sorted by `(date, time)` covering
-    /// `(0, 17)..(1, 9)` and `(1, 17)..(2, 9)` report `date` in `[0, 1]` and
-    /// `[1, 2]` and `time` in `[0, 23]` for both: the tie on `date` falls
+    /// they might. Two files sorted by `(day, time)` covering
+    /// `(0, 17)..(1, 9)` and `(1, 17)..(2, 9)` report `day` in `[0, 1]` and
+    /// `[1, 2]` and `time` in `[0, 23]` for both: the tie on `day` falls
     /// through to `time`, where the second file's minimum sits below the
     /// first's maximum. Nothing in the statistics rules out an overlap, so
     /// scans keep the files in separate groups and merge them.
@@ -513,13 +513,6 @@ impl TableProviderBuilder {
     /// back-to-back, letting the sort-preserving merge be replaced by a plain
     /// concatenation (see
     /// [`with_file_sort_order`](Self::with_file_sort_order)).
-    ///
-    /// Arranging them walks the sort columns and stops at the first one whose
-    /// `[min, max]` range differs between the two files, which is what places
-    /// one before the other. A later column is only read once every earlier
-    /// one holds a single value in both files, because only the leading
-    /// column's minimum and maximum are the values the file's first and last
-    /// rows carry.
     ///
     /// **The assertion is trusted and unchecked.** If two files do overlap,
     /// queries return rows in the wrong order and report no error. This does
