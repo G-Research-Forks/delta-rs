@@ -17,9 +17,10 @@ use datafusion::common::stats::Statistics;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
+};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -101,8 +102,8 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
 /// plan it started from.
 ///
 /// The walk descends only through operators that hand their input's partitions
-/// on untouched; see [`pass_through_ordering`]. Anything else ends it, at the
-/// cost of a missed optimization rather than a wrong result.
+/// on as they are; see [`pass_through_ordering`]. Anything else ends it, at
+/// the cost of a missed optimization rather than a wrong result.
 fn partitions_assumed_disjoint(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
@@ -134,36 +135,69 @@ fn partitions_assumed_disjoint(
 /// schema of its child, or `None` when `plan` is not an operator this can see
 /// through.
 ///
-/// Seeing through one means its partitions are its child's: the same rows in
-/// the same partition, in the same order within it, so a claim about how the
-/// child's partitions sit relative to each other still holds of its own. A
-/// filter only drops rows, which leaves the survivors where they were; a
-/// projection and the cooperative yielding wrapper touch neither rows nor
-/// partitioning. Operators that repartition, sort, join or aggregate are not
-/// listed and end the walk.
+/// Seeing through one means its partitions are its child's: each output
+/// partition holds rows of the input partition with the same index, possibly
+/// fewer of them, in the order they had there, so a claim about how the
+/// child's partitions sit relative to each other still holds of its own. An
+/// operator is taken to keep its partitions that way when it
 ///
-/// A projection has the further job of carrying the sort columns down, and
-/// only a column passed straight through can be carried: one the projection
-/// computes is not the column the scan arranged its files on, whatever it is
-/// named. A filter carries them too when `ProjectionPushdown` has embedded a
-/// projection in it, which selects columns by index and so only moves them.
+/// - has a single child;
+/// - reports that it maintains its input order;
+/// - has as many partitions as its child and declares no distribution scheme
+///   for them. The flag alone does not rule out an order-preserving
+///   `RepartitionExec`, which keeps every output partition ordered while
+///   dealing rows *between* partitions, and may keep their number. But a
+///   repartition always declares the scheme it dealt by, whereas an operator
+///   that forwards its input's partitions leaves them `UnknownPartitioning`
+///   as the scan declared them; and the other exchanges, merges and
+///   coalesces, end at a single partition;
+/// - and can carry the sort columns down: unchanged when its schema is its
+///   child's, or through its projection when it is a `ProjectionExec` or a
+///   `FilterExec` in which `ProjectionPushdown` embedded one. Only a column
+///   passed straight through can be carried - one the projection computes is
+///   not the column the scan arranged its files on, whatever it is named -
+///   and any other change to the schema ends the walk, which is what keeps
+///   out the order-maintaining operators that build new rows, such as
+///   aggregates and window functions.
+///
+/// Filters, projections, limits, batch coalescing, the buffer DataFusion's
+/// sort pushdown puts under a merge, and cooperative yielding all pass.
+/// Operators that repartition, sort, join or aggregate end the walk.
 fn pass_through_ordering(plan: &dyn ExecutionPlan, ordering: &LexOrdering) -> Option<LexOrdering> {
-    if plan.downcast_ref::<CooperativeExec>().is_some() {
-        return Some(ordering.clone());
+    let [child] = plan.children()[..] else {
+        return None;
+    };
+    if !plan
+        .maintains_input_order()
+        .first()
+        .copied()
+        .unwrap_or(false)
+    {
+        return None;
     }
-    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-        let Some(projection) = filter.projection() else {
-            return Some(ordering.clone());
-        };
+    let partition_count = child.output_partitioning().partition_count();
+    let forwards_partitions = matches!(
+        plan.output_partitioning(),
+        Partitioning::UnknownPartitioning(count) if *count == partition_count
+    );
+    if !forwards_partitions {
+        return None;
+    }
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        return map_ordering_columns(ordering, |column| {
+            let projected = projection.expr().get(column.index())?;
+            projected.expr.downcast_ref::<Column>().cloned()
+        });
+    }
+    if let Some(projection) = plan
+        .downcast_ref::<FilterExec>()
+        .and_then(|filter| filter.projection().as_ref())
+    {
         return map_ordering_columns(ordering, |column| {
             Some(Column::new(column.name(), *projection.get(column.index())?))
         });
     }
-    let projection = plan.downcast_ref::<ProjectionExec>()?;
-    map_ordering_columns(ordering, |column| {
-        let projected = projection.expr().get(column.index())?;
-        projected.expr.downcast_ref::<Column>().cloned()
-    })
+    (plan.schema() == child.schema()).then(|| ordering.clone())
 }
 
 /// Rewrite `ordering` with each of its columns replaced by the child column
@@ -374,11 +408,15 @@ mod tests {
     use datafusion::common::stats::{ColumnStatistics, Precision};
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-    use datafusion::physical_expr::expressions::Literal;
-    use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
+    use datafusion::physical_plan::buffer::BufferExec;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::filter::FilterExecBuilder;
     use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion::physical_plan::limit::LocalLimitExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
 
     /// Leaf plan reporting fixed per-partition statistics; never executed.
@@ -390,8 +428,17 @@ mod tests {
 
     impl StatsExec {
         fn new(stats: Vec<Statistics>) -> Arc<dyn ExecutionPlan> {
+            Self::declaring(stats, None)
+        }
+
+        /// A leaf that also declares `ordering` as the order of each of its
+        /// partitions.
+        fn declaring(
+            stats: Vec<Statistics>,
+            ordering: Option<LexOrdering>,
+        ) -> Arc<dyn ExecutionPlan> {
             let cache = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(test_schema()),
+                EquivalenceProperties::new_with_orderings(test_schema(), ordering),
                 Partitioning::UnknownPartitioning(stats.len()),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
@@ -863,6 +910,65 @@ mod tests {
             pass_through_ordering(&filter, &ordering),
             LexOrdering::new(vec![asc(0, "t")])
         );
+    }
+
+    /// Operators that hand their input's partitions on as they are, with the
+    /// same schema, need no special knowledge to be seen through.
+    #[test]
+    fn buffer_and_limit_pass_the_ordering_through() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        let buffer = BufferExec::new(ordered_partitions(), 1024);
+        assert_eq!(
+            pass_through_ordering(&buffer, &ordering),
+            Some(ordering.clone())
+        );
+
+        let limit = LocalLimitExec::new(ordered_partitions(), 5);
+        assert_eq!(pass_through_ordering(&limit, &ordering), Some(ordering));
+    }
+
+    /// A column the projection computes is not the one the scan arranged its
+    /// files on, whatever it is called.
+    #[test]
+    fn computed_projection_column_is_not_carried() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        let t_plus_zero: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("t", 0)),
+            Operator::Plus,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
+        ));
+        let projection =
+            ProjectionExec::try_new(vec![(t_plus_zero, "t".to_string())], ordered_partitions())
+                .unwrap();
+
+        assert_eq!(pass_through_ordering(&projection, &ordering), None);
+    }
+
+    /// An order-preserving repartition keeps each output partition ordered,
+    /// and here keeps the partition count too, so the order-maintenance flag
+    /// and the count alone would let it through. It deals rows between the
+    /// partitions, and the hash scheme it declares is what keeps it out.
+    #[test]
+    fn order_preserving_repartition_is_not_seen_through() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        let input = StatsExec::declaring(
+            vec![
+                partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+                partition(vec![exact_i64(101, 200, 0), exact_i64(11, 20, 0)]),
+            ],
+            Some(ordering.clone()),
+        );
+        let repartition = RepartitionExec::try_new(
+            input,
+            Partitioning::Hash(vec![Arc::new(Column::new("id", 1))], 2),
+        )
+        .unwrap()
+        .with_preserve_order();
+        assert!(repartition.maintains_input_order()[0]);
+        assert_eq!(repartition.properties().partitioning.partition_count(), 2);
+
+        assert_eq!(pass_through_ordering(&repartition, &ordering), None);
     }
 
     /// A parquet scan over one file, order-sensitive or not.
