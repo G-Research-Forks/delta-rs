@@ -264,9 +264,15 @@ pub(super) enum OverlapPolicy {
     Prove,
     /// Take the ranges to be disjoint on the table's say-so
     /// ([`DeltaScanConfig::assume_no_overlap_on_sort`]), ordering the files on
-    /// their range endpoints alone.
+    /// their range endpoints alone. Two files whose statistics show them
+    /// overlapping regardless contradict the table and are an error.
     Assume,
 }
+
+/// What [`arrange_non_overlapping_files`] made of its items: `Ok` carries
+/// them arranged, with whether the assertion is what arranged them, and `Err`
+/// hands them back as they came when they cannot be ordered.
+pub(super) type Arrangement<T> = Result<(Vec<T>, bool), Vec<T>>;
 
 /// Reorder `items` by a permutation of their indices.
 fn apply_order<T>(items: Vec<T>, order: Vec<usize>) -> Vec<T> {
@@ -297,37 +303,58 @@ fn sort_options(ordering: &LexOrdering) -> Vec<SortOptions> {
 /// than being ordered arbitrarily. Nulls among the sort columns are the
 /// caller's concern: the bounds say nothing about them.
 ///
-/// The files are proven non-overlapping first, falling back on the table's
-/// assertion only when `overlap` allows it and the statistics could not.
-/// Under [`OverlapPolicy::Assume`] the overlap check is then replaced by the
-/// assertion and the files are placed on their endpoints alone; see
-/// [`non_overlapping_order`] for what that changes.
+/// The files are proven non-overlapping first (see [`proven_file_order`]),
+/// falling back on the table's assertion only when `overlap` allows it and the
+/// statistics could not. Under [`OverlapPolicy::Assume`] the files are then
+/// placed on their endpoints alone (see [`assumed_file_order`]), and a pair
+/// the statistics show overlapping all the same is an error: the table's
+/// declaration is contradicted by its data, and arranging the files anyway
+/// would return wrong results with no warning.
 ///
-/// `Ok` carries the arrangement and whether the assertion is what produced it;
-/// tables the proving path already handled keep their behaviour either way.
+/// See [`Arrangement`] for the result; tables the proving path already
+/// handled keep their behaviour either way.
 pub(super) fn arrange_non_overlapping_files<T>(
     items: Vec<T>,
     file: impl Fn(&T) -> &PartitionedFile,
     ordering: &LexOrdering,
     overlap: OverlapPolicy,
-) -> Result<(Vec<T>, bool), Vec<T>> {
+) -> Result<Arrangement<T>> {
     // Reading the ranges walks every file's statistics and clones two bounds
     // per sort column, so both policies run over the one reading. A table that
     // asserts non-overlap is one the proving pass is expected to fail, so that
     // walk would otherwise be paid for twice on every query against it.
-    let Some(ranges) = file_ranges(items.iter().map(file), ordering) else {
-        return Err(items);
+    let Some(ranges) = file_ranges(items.iter().map(&file), ordering) else {
+        return Ok(Err(items));
     };
     let options = sort_options(ordering);
-    if let Some(order) = non_overlapping_order(&ranges, &options, OverlapPolicy::Prove) {
-        return Ok((apply_order(items, order), false));
+    if let Some(order) = proven_file_order(&ranges, &options) {
+        return Ok(Ok((apply_order(items, order), false)));
     }
     if overlap == OverlapPolicy::Prove {
-        return Err(items);
+        return Ok(Err(items));
     }
-    match non_overlapping_order(&ranges, &options, OverlapPolicy::Assume) {
-        Some(order) => Ok((apply_order(items, order), true)),
-        None => Err(items),
+    match assumed_file_order(&ranges, &options) {
+        Ok(order) => Ok(Ok((apply_order(items, order), true))),
+        Err(ProvenOverlap { a, b, column }) => {
+            let path = |index: usize| file(&items[index]).object_meta.location.to_string();
+            let span = |index: usize| {
+                let (start, end, _) = &ranges[index];
+                format!("{} to {}", start[column], end[column])
+            };
+            let sort_expr = &ordering[column].expr;
+            let column_name = sort_expr
+                .downcast_ref::<Column>()
+                .map_or_else(|| sort_expr.to_string(), |column| column.name().to_string());
+            plan_err!(
+                "the table asserts that its files never overlap on the file sort order, \
+                 but the statistics of `{}` (running from {}) and `{}` (running from {}) \
+                 show them overlapping on `{column_name}`",
+                path(a),
+                span(a),
+                path(b),
+                span(b)
+            )
+        }
     }
 }
 
@@ -384,46 +411,63 @@ fn file_ranges<'a>(
     Some(ranges)
 }
 
-/// [`arrange_non_overlapping_files`] under one policy, as a permutation of
-/// the files behind `ranges`, which [`file_ranges`] read off them.
-///
-/// [`OverlapPolicy::Prove`] sorts the files on the start of their range and
-/// refuses the whole set as soon as one range reaches into the next.
-///
-/// [`OverlapPolicy::Assume`] takes the ranges to be disjoint and so orders the
-/// files on their endpoints alone; see [`assumed_range_cmp`] for how, and
-/// [`assumed_ranges_separate`] for the pairs it still refuses.
+/// [`arrange_non_overlapping_files`] under [`OverlapPolicy::Prove`], as a
+/// permutation of the files behind `ranges`, which [`file_ranges`] read off
+/// them: the files sorted on the start of their range, or `None` as soon as
+/// one range reaches into the next.
 ///
 /// The ranges are read rather than consumed, so one reading of the statistics
 /// serves both policies; see [`arrange_non_overlapping_files`].
-fn non_overlapping_order(
-    ranges: &[FileRange],
-    options: &[SortOptions],
-    overlap: OverlapPolicy,
-) -> Option<Vec<usize>> {
+fn proven_file_order(ranges: &[FileRange], options: &[SortOptions]) -> Option<Vec<usize>> {
     let cmp = |a: &[ScalarValue], b: &[ScalarValue]| {
         compare_rows(a, b, options).expect("endpoints share a non-nested type per column")
     };
     let mut ordered: Vec<&FileRange> = ranges.iter().collect();
-    match overlap {
-        OverlapPolicy::Prove => {
-            ordered.sort_by(|a, b| cmp(&a.0, &b.0));
-            for pair in ordered.windows(2) {
-                if cmp(&pair[0].1, &pair[1].0) == Ordering::Greater {
-                    return None;
-                }
-            }
-        }
-        OverlapPolicy::Assume => {
-            ordered.sort_by(|a, b| assumed_range_cmp(a, b, options));
-            for pair in ordered.windows(2) {
-                if !assumed_ranges_separate(pair[0], pair[1], options) {
-                    return None;
-                }
-            }
+    ordered.sort_by(|a, b| cmp(&a.0, &b.0));
+    for pair in ordered.windows(2) {
+        if cmp(&pair[0].1, &pair[1].0) == Ordering::Greater {
+            return None;
         }
     }
     Some(ordered.into_iter().map(|(_, _, index)| *index).collect())
+}
+
+/// [`arrange_non_overlapping_files`] under [`OverlapPolicy::Assume`]: the
+/// files taken to be disjoint and ordered on their endpoints alone (see
+/// [`assumed_range_cmp`]), or the pair of neighbours whose statistics show
+/// them overlapping anyway (see [`assumed_ranges_overlap`]).
+///
+/// Neighbours are enough to check. The files are sorted on where they begin,
+/// so a file that overlaps one further along - reaching past its start while
+/// that file reaches past its own - reaches past the start of every file in
+/// between as well; and each of those reaches past this file's start too,
+/// unless it is pinned to that very value, in which case the sort on ends
+/// has already placed it before this file rather than between.
+fn assumed_file_order(
+    ranges: &[FileRange],
+    options: &[SortOptions],
+) -> Result<Vec<usize>, ProvenOverlap> {
+    let mut ordered: Vec<&FileRange> = ranges.iter().collect();
+    ordered.sort_by(|a, b| assumed_range_cmp(a, b, options));
+    for pair in ordered.windows(2) {
+        if let Some(column) = assumed_ranges_overlap(pair[0], pair[1], options) {
+            return Err(ProvenOverlap {
+                a: pair[0].2,
+                b: pair[1].2,
+                column,
+            });
+        }
+    }
+    Ok(ordered.into_iter().map(|(_, _, index)| *index).collect())
+}
+
+/// Two files whose statistics show them overlapping on sort column `column`,
+/// by their index among the files handed in, found where the table asserts
+/// that no two files do.
+struct ProvenOverlap {
+    a: usize,
+    b: usize,
+    column: usize,
 }
 
 /// One file's range under the sort ordering: where it begins and where it ends
@@ -463,8 +507,8 @@ fn assumed_range_cmp(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> O
                 Ordering::Equal => {}
                 order => return Some(order),
             }
-            // Compare end values in the case of equal starts. A file with a range
-            // inside another's span is ordered first.
+            // Compare end values in the case of equal starts, so that a file
+            // pinned to the value another begins at is ordered first.
             match compare_endpoints(&a.1[column], &b.1[column], column, options) {
                 Ordering::Equal => None,
                 order => Some(order),
@@ -474,35 +518,40 @@ fn assumed_range_cmp(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> O
         .unwrap_or(Ordering::Equal)
 }
 
-/// Whether the statistics place `a` and `b` apart at all, so that
-/// [`assumed_range_cmp`] ordering them means something.
+/// The sort column on which the statistics show `a` and `b` overlapping, or
+/// `None` when they are consistent with the two files being disjoint.
 ///
-/// Walks the sort columns until one of them settles the pair:
+/// A file's bounds on a column are values its rows carry, and on the leading
+/// sort column they are its first and last key. So when each file's last key
+/// lies past the other's first, neither file can come wholly before the
+/// other: they overlap, whatever the later columns say. Ranges that merely
+/// meet at a value are consistent with disjoint files - the tie falls through
+/// to the later columns, where the statistics see nothing - and that is the
+/// case the assertion exists for.
 ///
-/// * When ranges begin at different values, the file beginning earlier is
-///   ordered first.
-/// * Both ranges beginning with the same value can be ordered if one file
-///   has a constant value. The constant values file is ordered first.
-/// * If both are constant, move on to the next column.
-/// * If neither file holds a constant value, the files can't be ordered and
-///   we return false.
-///
-/// Running out of columns leaves both files pinned to the same key on every
-/// one of them, so either ordering is valid, and we return true.
-fn assumed_ranges_separate(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> bool {
-    let pinned = |range: &FileRange, column: usize| {
-        compare_endpoints(&range.0[column], &range.1[column], column, options) == Ordering::Equal
+/// A column pinned to the same single value in both files says nothing and
+/// hands the question to the next, which is then the leading column of what
+/// remains of both files' keys. Any other column settles the pair, since past
+/// it the bounds are no longer endpoints (see [`FileRange`]). Running out of
+/// columns leaves both files on one key throughout, and either order is
+/// sorted.
+fn assumed_ranges_overlap(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> Option<usize> {
+    let same = |x: &ScalarValue, y: &ScalarValue, column: usize| {
+        compare_endpoints(x, y, column, options) == Ordering::Equal
     };
-    for column in 0..options.len() {
-        if compare_endpoints(&a.0[column], &b.0[column], column, options) != Ordering::Equal {
-            return true;
-        }
-        match (pinned(a, column), pinned(b, column)) {
-            (true, true) => continue,
-            (a_pinned, b_pinned) => return a_pinned || b_pinned,
-        }
-    }
-    true
+    let later = |x: &ScalarValue, y: &ScalarValue, column: usize| {
+        compare_endpoints(x, y, column, options) == Ordering::Greater
+    };
+    let pinned_together = |column: usize| {
+        same(&a.0[column], &b.0[column], column)
+            && same(&a.0[column], &a.1[column], column)
+            && same(&b.0[column], &b.1[column], column)
+    };
+    (0..options.len())
+        .find(|&column| !pinned_together(column))
+        .filter(|&column| {
+            later(&a.1[column], &b.0[column], column) && later(&b.1[column], &a.0[column], column)
+        })
 }
 
 /// Cut a globally ordered, mutually non-overlapping file list into contiguous
@@ -557,8 +606,10 @@ fn chunk_ordered_files(files: Vec<PartitionedFile>, target_partitions: usize) ->
 /// failed to rule out an overlap. The files are then placed on those
 /// statistics alone, so there is always exactly one ordered run and the
 /// grouping below - along with its group cap - is reached only when a file
-/// cannot be placed at all. The caller is then responsible for re-declaring
-/// the ordering that DataFusion's validation drops; see
+/// carries no statistics to place it by. Statistics that show two files
+/// overlapping contradict the assertion and fail the scan instead; see
+/// [`arrange_non_overlapping_files`]. The caller is responsible for
+/// re-declaring the ordering that DataFusion's validation drops; see
 /// [`DeltaScanExec::with_no_overlap_assumption`].
 ///
 /// The returned flag reports whether the assertion was actually used; it is
@@ -569,22 +620,22 @@ fn split_file_groups_for_ordering(
     table_schema: &SchemaRef,
     target_partitions: usize,
     overlap: OverlapPolicy,
-) -> (Vec<FileGroup>, bool) {
+) -> Result<(Vec<FileGroup>, bool)> {
     let max_groups = max_num_groups(target_partitions);
 
     // Missing/unusable statistics fall through: the grouping below fails the
     // same way and takes its default-grouping fallback.
-    let files = match arrange_non_overlapping_files(files, |file| file, ordering, overlap) {
+    let files = match arrange_non_overlapping_files(files, |file| file, ordering, overlap)? {
         Ok((ordered_files, assumed)) => {
-            return (
+            return Ok((
                 chunk_ordered_files(ordered_files, target_partitions),
                 assumed,
-            );
+            ));
         }
         Err(files) => {
             if overlap == OverlapPolicy::Assume {
                 debug!(
-                    "file statistics cannot place every file in the declared sort order; ignoring the no-overlap assertion"
+                    "file statistics are missing for a sort column; ignoring the no-overlap assertion"
                 );
             }
             files
@@ -631,7 +682,7 @@ fn split_file_groups_for_ordering(
             default_grouping(flat)
         }
     };
-    (groups, false)
+    Ok((groups, false))
 }
 
 /// Materialize deletion vector keep masks for every file in the scan that has one.
@@ -1194,7 +1245,7 @@ async fn get_read_plan(
                     &full_table_schema,
                     state.config().options().execution.target_partitions,
                     overlap,
-                );
+                )?;
                 // A single sorted file per group upholds the full ordering even
                 // when sort columns contain nulls; multi-file groups only
                 // uphold the prefix of the ordering that is provably null-free
@@ -1444,7 +1495,8 @@ mod tests {
             &int64_sort_schema(),
             2,
             OverlapPolicy::Prove,
-        );
+        )
+        .expect("the files do not contradict the table");
         assert!(!assumed);
 
         assert_eq!(groups.len(), 2);
@@ -1462,7 +1514,8 @@ mod tests {
             &int64_sort_schema(),
             8,
             OverlapPolicy::Prove,
-        );
+        )
+        .expect("the files do not contradict the table");
         assert!(!assumed);
 
         assert_eq!(groups.len(), 2);
@@ -1483,7 +1536,8 @@ mod tests {
             &int64_sort_schema(),
             2,
             OverlapPolicy::Prove,
-        );
+        )
+        .expect("the files do not contradict the table");
         assert!(!assumed);
 
         // Files within each group must still be non-overlapping.
@@ -1542,7 +1596,8 @@ mod tests {
             |file| file,
             &int64_asc_ordering(),
             OverlapPolicy::Prove,
-        );
+        )
+        .expect("proving never contradicts the table");
 
         assert!(result.is_err());
     }
@@ -1592,10 +1647,36 @@ mod tests {
         .expect("non-empty ordering")
     }
 
+    /// The files as the assertion arranges them, or `None` when it cannot
+    /// place them. Files whose statistics contradict the assertion are an
+    /// error instead; see [`assumed_order_error`].
     fn assumed_order(files: Vec<PartitionedFile>, ordering: &LexOrdering) -> Option<Vec<String>> {
         arrange_non_overlapping_files(files, |file| file, ordering, OverlapPolicy::Assume)
+            .expect("the statistics do not contradict the assertion")
             .ok()
             .map(|(ordered, _)| file_names(&ordered))
+    }
+
+    /// The error the assertion raises for `files`, which must contradict it.
+    fn assumed_order_error(files: Vec<PartitionedFile>, ordering: &LexOrdering) -> String {
+        arrange_non_overlapping_files(files, |file| file, ordering, OverlapPolicy::Assume)
+            .expect_err("the statistics contradict the assertion")
+            .to_string()
+    }
+
+    /// The assertion's error names both files, the column they overlap on and
+    /// where each runs on it.
+    fn assert_overlap_error(message: &str, a: &str, b: &str, column: &str) {
+        assert!(
+            message.contains("asserts that its files never overlap"),
+            "unexpected error: {message}"
+        );
+        for expected in [a, b, &format!("overlapping on `{column}`")] {
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in error: {message}"
+            );
+        }
     }
 
     #[test]
@@ -1619,6 +1700,45 @@ mod tests {
                 &two_column_asc_ordering(),
                 OverlapPolicy::Prove
             )
+            .expect("proving never contradicts the table")
+            .is_err()
+        );
+    }
+
+    /// One file's range reaching into another's is an overlap the statistics
+    /// prove, whichever way the column sorts. The assertion says otherwise,
+    /// so the files are not arranged: the contradiction is reported. Without
+    /// the assertion the same files are merely handed back for grouping.
+    #[test]
+    fn test_assumed_order_errors_on_a_file_inside_another() {
+        let files = vec![stats_file("wide", 0, 10), stats_file("inner", 5, 5)];
+
+        let message = assumed_order_error(files.clone(), &int64_asc_ordering());
+        assert_overlap_error(&message, "wide.parquet", "inner.parquet", "t");
+        assert!(
+            message.contains("running from 0 to 10") && message.contains("running from 5 to 5"),
+            "expected both files' ranges in error: {message}"
+        );
+
+        let descending = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("t", 0)),
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )])
+        .expect("non-empty ordering");
+        let message = assumed_order_error(files.clone(), &descending);
+        assert_overlap_error(&message, "wide.parquet", "inner.parquet", "t");
+
+        assert!(
+            arrange_non_overlapping_files(
+                files,
+                |file| file,
+                &int64_asc_ordering(),
+                OverlapPolicy::Prove
+            )
+            .expect("proving never contradicts the table")
             .is_err()
         );
     }
@@ -1662,16 +1782,18 @@ mod tests {
     }
 
     /// Identical bounds on a column the files span describe an overlap however
-    /// the table is declared, so the files are refused rather than ordered
-    /// arbitrarily.
+    /// the table is declared. With the leading column pinned to one value in
+    /// both files, the second column is where their keys run, and that is the
+    /// column the error names.
     #[test]
-    fn test_assumed_order_refuses_files_sharing_both_endpoints() {
+    fn test_assumed_order_errors_on_files_sharing_both_endpoints() {
         let files = vec![
             two_column_stats_file("a", (5, 5), (0, 23)),
             two_column_stats_file("b", (5, 5), (0, 23)),
         ];
 
-        assert_eq!(assumed_order(files, &two_column_asc_ordering()), None);
+        let message = assumed_order_error(files, &two_column_asc_ordering());
+        assert_overlap_error(&message, "a.parquet", "b.parquet", "time");
     }
 
     /// A file sitting inside one value of the leading column, followed by one
@@ -1694,15 +1816,30 @@ mod tests {
     }
 
     /// Two files covering the same span of the leading column meet somewhere
-    /// inside it, so nothing the later columns say can place them.
+    /// inside it, so nothing the later columns say can place them - not even
+    /// second-column ranges that would order them if the leading column were
+    /// pinned.
     #[test]
-    fn test_assumed_order_refuses_files_spanning_the_same_leading_range() {
+    fn test_assumed_order_errors_on_files_spanning_the_same_leading_range() {
         let files = vec![
             two_column_stats_file("a", (5, 6), (0, 9)),
             two_column_stats_file("b", (5, 6), (10, 20)),
         ];
 
-        assert_eq!(assumed_order(files, &two_column_asc_ordering()), None);
+        let message = assumed_order_error(files, &two_column_asc_ordering());
+        assert_overlap_error(&message, "a.parquet", "b.parquet", "date");
+    }
+
+    /// A file that begins where another ends is not an overlap: the tie on
+    /// that key is what the later columns, and the assertion, are for.
+    #[test]
+    fn test_assumed_order_keeps_files_meeting_at_a_value() {
+        let files = vec![stats_file("b", 10, 20), stats_file("a", 0, 10)];
+
+        assert_eq!(
+            assumed_order(files, &int64_asc_ordering()),
+            Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
+        );
     }
 
     /// With the leading column pinned to one value in both files, the second
@@ -1779,7 +1916,8 @@ mod tests {
             &two_column_schema(),
             1,
             OverlapPolicy::Prove,
-        );
+        )
+        .expect("the files do not contradict the table");
         assert!(!assumed);
         assert_eq!(proven.len(), 2);
 
@@ -1789,7 +1927,8 @@ mod tests {
             &two_column_schema(),
             1,
             OverlapPolicy::Assume,
-        );
+        )
+        .expect("the files do not contradict the table");
         assert!(assumed);
         assert_eq!(groups.len(), 1);
         assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "b.parquet"]);
@@ -1808,7 +1947,8 @@ mod tests {
             &int64_sort_schema(),
             2,
             OverlapPolicy::Assume,
-        );
+        )
+        .expect("the files do not contradict the table");
 
         assert!(!assumed, "the assertion must not be reported as applied");
         assert_eq!(groups.len(), 1);
@@ -1828,7 +1968,8 @@ mod tests {
             &int64_sort_schema(),
             2,
             OverlapPolicy::Prove,
-        );
+        )
+        .expect("the files do not contradict the table");
         assert!(!assumed);
 
         assert_eq!(groups.len(), 1);
@@ -2536,10 +2677,13 @@ mod tests {
             crate::delta_datafusion::file_id::file_id_field(Some(FILE_ID_COLUMN_DEFAULT));
         let parquet_read_schema = int64_sort_schema();
 
-        // Ranges that overlap their neighbours, so no order can be proven and
-        // the assertion would otherwise place the files itself.
+        // Ranges that meet at a value, with the file pinned to that value
+        // listed after the one it meets: the proving pass sorts on starts
+        // alone and sees the wider file reach into the pinned one, so no
+        // order is proven, while the assertion would place the pinned file
+        // first.
         let store_files = |store: &str| {
-            [(0, 99), (50, 149), (100, 199), (150, 249)]
+            [(100, 199), (100, 100), (200, 299), (200, 200)]
                 .into_iter()
                 .enumerate()
                 .map(|(index, (min, max))| {

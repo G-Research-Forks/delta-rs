@@ -519,12 +519,16 @@ impl TableProviderBuilder {
     /// concatenation (see
     /// [`with_file_sort_order`](Self::with_file_sort_order)).
     ///
-    /// **The assertion is trusted and unchecked.** If two files do overlap,
-    /// queries report no error and return wrong results. Rows in the wrong
-    /// order is the mildest outcome: the arrangement is advertised as an
-    /// ordering of the scan, and DataFusion plans on that ordering wherever an
-    /// operator can exploit sorted input, so a `GROUP BY` on the sort columns
-    /// may be aggregated in streaming mode and emit a key twice, and a window
+    /// **The assertion is checked only as far as the statistics allow.** Two
+    /// files whose statistics show them overlapping - each one's last key on
+    /// a sort column lying past the other's first - contradict it, and a query
+    /// that would arrange them fails with a planning error naming both files.
+    /// An overlap the statistics cannot see goes undetected, and queries then
+    /// report no error and return wrong results. Rows in the wrong order is
+    /// the mildest outcome: the arrangement is advertised as an ordering of
+    /// the scan, and DataFusion plans on that ordering wherever an operator
+    /// can exploit sorted input, so a `GROUP BY` on the sort columns may be
+    /// aggregated in streaming mode and emit a key twice, and a window
     /// function or sort-merge join computed over the ordering gives wrong
     /// values. This does nothing unless a file sort order is also declared.
     ///
