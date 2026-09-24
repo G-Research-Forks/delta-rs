@@ -549,11 +549,16 @@ impl TableProviderBuilder {
     /// `datafusion.optimizer.repartition_file_scans` applies here too.
     ///
     /// **The bounds are taken at face value, so the assertion covers their
-    /// fidelity too.** A writer may record a truncated string minimum, and a
-    /// timestamp maximum is rounded up to the next millisecond when it lands
-    /// exactly on one. Delta records no way to tell a widened bound from a
-    /// true one, so nothing here screens for it. Rounding a maximum up is not
-    /// order preserving, which for a descending order on a timestamp column -
+    /// fidelity too.** A writer may truncate a long string bound, cutting a
+    /// minimum back to a prefix and raising a maximum to a value above every
+    /// string that starts with its prefix, and a timestamp maximum is rounded
+    /// up to the next millisecond when it lands exactly on one. Delta records
+    /// no way to tell a widened bound from a true one, so nothing here screens
+    /// for it. Truncation keeps string bounds in order, so at worst it makes
+    /// two files' bounds equal, and files it cannot tell apart that way fall
+    /// back to the merge as they would without the assertion. Rounding a
+    /// timestamp maximum up is not order preserving, which for a descending
+    /// order on a timestamp column -
     /// where the maximum is where a file's range begins - can put two files
     /// the wrong way round even though they do not overlap.
     ///
