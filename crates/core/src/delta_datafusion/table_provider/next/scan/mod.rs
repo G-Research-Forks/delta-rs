@@ -1631,6 +1631,31 @@ mod tests {
         );
     }
 
+    /// Files meeting at a millisecond boundary, as the log reports them: `a`
+    /// truly ends at 100ms, but a timestamp maximum landing exactly on a
+    /// millisecond is read back rounded up to the next one. The widened bound
+    /// makes the files overlap, which the proof refuses, but under an
+    /// ascending order the files are placed on where they start, so the
+    /// widened maximum cannot put them the wrong way round.
+    #[test]
+    fn test_assumed_order_places_files_meeting_at_a_widened_maximum() {
+        let files = vec![stats_file("b", 100, 200), stats_file("a", 0, 101)];
+
+        assert!(
+            arrange_non_overlapping_files(
+                files.clone(),
+                |file| file,
+                &int64_asc_ordering(),
+                OverlapPolicy::Prove
+            )
+            .is_err()
+        );
+        assert_eq!(
+            assumed_order(files, &int64_asc_ordering()),
+            Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
+        );
+    }
+
     #[test]
     fn test_assumed_order_reverses_for_a_descending_ordering() {
         let files = vec![
