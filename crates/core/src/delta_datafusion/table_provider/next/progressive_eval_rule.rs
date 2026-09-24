@@ -232,10 +232,13 @@ fn leading_partition_ranges(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
 ) -> Option<Vec<(ScalarValue, ScalarValue)>> {
+    // Only the leading column is reported, so statistics missing on a later
+    // one must not withhold it.
+    let leading = LexOrdering::new([ordering.first().clone()])?;
     (0..plan.output_partitioning().partition_count())
         .map(|partition_idx| {
             let stats = plan.partition_statistics(Some(partition_idx)).ok()?;
-            let (starts, ends, _) = get_ordering_stats(&stats, ordering)?;
+            let (starts, ends, _) = get_ordering_stats(&stats, &leading)?;
             Some((starts[0].clone(), ends[0].clone()))
         })
         .collect()
@@ -805,6 +808,32 @@ mod tests {
         let ordering = LexOrdering::new(vec![asc(1, "id")]).unwrap();
 
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    #[test]
+    fn leading_ranges_ignore_statistics_on_later_sort_columns() {
+        // The second sort column's statistics are inexact in one partition
+        // and missing from the other, neither of which touches the leading
+        // column the ranges report.
+        let inexact = ColumnStatistics {
+            null_count: Precision::Exact(0),
+            min_value: Precision::Inexact(ScalarValue::Int64(Some(0))),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(10))),
+            ..Default::default()
+        };
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 99, 0), inexact]),
+            partition(vec![exact_i64(100, 200, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert_eq!(
+            leading_partition_ranges(&plan, &ordering),
+            Some(vec![
+                (ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(99))),
+                (ScalarValue::Int64(Some(100)), ScalarValue::Int64(Some(200))),
+            ])
+        );
     }
 
     /// Two partitions with disjoint `t` ranges: a merge on `t` over them is
