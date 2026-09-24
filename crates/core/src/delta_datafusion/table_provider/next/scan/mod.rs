@@ -1086,18 +1086,18 @@ async fn get_read_plan(
     // partitions follow only by virtue of that assumption, if any.
 ) -> Result<(Arc<dyn ExecutionPlan>, Option<LexOrdering>)> {
     let mut plans = Vec::new();
-    // One entry per store plan; `None` where that plan's grouping was proven
-    // rather than assumed.
-    let mut assumed_orderings = Vec::new();
+    // Set when the grouping used relies on a non-overlapping assertion
+    // being set on the table.
+    let mut assumed_ordering = None;
 
     // The per-store plans are unioned, which interleaves their files, so an
-    // arrangement resting on the assertion could not be declared for the
-    // result whatever each store's grouping looks like (see the collapse of
-    // `assumed_orderings` below). Arranging on the assertion here would only
-    // displace the grouping DataFusion can certify by itself and leave the
-    // scan advertising no ordering at all, so this grouping keeps to what the
-    // statistics prove. The table's declaration is a separate matter, held by
-    // the exec: see [`DeltaScanExec::with_no_overlap_assumption`].
+    // arrangement resting on the non-overlapping assertion could not be
+    // declared for the result whatever each store's grouping looks like.
+    // Arranging on the assertion here would only displace the grouping DataFusion
+    // can certify by itself and leave the scan advertising no ordering at all,
+    // so this grouping keeps to what the statistics prove. The table's
+    // declaration is a separate matter, held by the exec: see
+    // [`DeltaScanExec::with_no_overlap_assumption`].
     let files_by_store = files_by_store.into_iter().collect_vec();
     let overlap = if files_by_store.len() > 1 {
         OverlapPolicy::Prove
@@ -1211,13 +1211,12 @@ async fn get_read_plan(
                 };
                 // Nulls within files prevent ordering even when the table asserts
                 // an ordering, so we can only declare the null-free prefix as an assumed order.
-                assumed_orderings.push(assumed.then_some(null_free_prefix).flatten());
+                if assumed {
+                    assumed_ordering = null_free_prefix;
+                }
                 (file_groups, store_sort_order)
             }
-            None => {
-                assumed_orderings.push(None);
-                (partitioned_files_to_file_groups(files), None)
-            }
+            None => (partitioned_files_to_file_groups(files), None),
         };
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
@@ -1243,14 +1242,6 @@ async fn get_read_plan(
 
         plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
     }
-
-    // If there are multiple stores, the plans interleave files across stores
-    // so an assumed ordering is invalidated. Nothing above arranges on the
-    // assertion in that case, so this only holds the line.
-    let assumed_ordering = match assumed_orderings.len() {
-        1 => assumed_orderings.remove(0),
-        _ => None,
-    };
 
     Ok((
         match plans.len() {
