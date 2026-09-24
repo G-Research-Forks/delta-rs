@@ -204,8 +204,7 @@ impl Bucket {
 /// * `target_groups` – desired execution-partition count; the result may hold
 ///   more groups, up to [`group_budget`].
 /// * `overlap` – whether a bucket whose files cannot be proven non-overlapping
-///   on the suffix may still be ordered on the table's assertion. Files the
-///   statistics show overlapping are then an error rather than a refusal.
+///   on the suffix may still be ordered on the table's assertion.
 pub(super) fn plan_sort_pushdown(
     shape: &OrderShape,
     parquet_read_schema: &SchemaRef,
@@ -280,7 +279,7 @@ pub(super) fn plan_sort_pushdown(
                     return Ok(None);
                 }
                 let Ok((bucket, _)) =
-                    arrange_non_overlapping_files(bucket, |file| *file, suffix, overlap)?
+                    arrange_non_overlapping_files(bucket, |file| *file, suffix, overlap)
                 else {
                     return Ok(None);
                 };
@@ -631,29 +630,14 @@ mod tests {
             target_groups: usize,
             overlap: OverlapPolicy,
         ) -> Option<SortPushdownPlan> {
-            self.try_plan_with(order, file_sort_order, target_groups, overlap)
-                .unwrap()
-        }
-
-        /// [`Self::plan_with`] surfacing the planning error, which the
-        /// assertion raises when the statistics contradict it.
-        fn try_plan_with(
-            &self,
-            order: &[PhysicalSortExpr],
-            file_sort_order: Option<&LexOrdering>,
-            target_groups: usize,
-            overlap: OverlapPolicy,
-        ) -> Result<Option<SortPushdownPlan>> {
             let order = LexOrdering::new(order.to_vec()).unwrap();
-            let Some(shape) = analyze_order(
+            let shape = analyze_order(
                 &order,
                 &output_schema(),
                 &parquet_read_schema(),
                 &["part".to_string()],
                 file_sort_order,
-            ) else {
-                return Ok(None);
-            };
+            )?;
             let files: Vec<&PartitionedFile> = self.files.iter().collect();
             plan_sort_pushdown(
                 &shape,
@@ -662,6 +646,7 @@ mod tests {
                 target_groups,
                 overlap,
             )
+            .unwrap()
         }
     }
 
@@ -743,10 +728,9 @@ mod tests {
     }
 
     /// The same files with the table asserting that they never overlap: the
-    /// statistics show `a0` and `a1` overlapping regardless, which contradicts
-    /// the table, so the pushdown fails rather than being refused.
+    /// bucket is ordered on its statistics alone and the pushdown succeeds.
     #[test]
-    fn overlapping_files_within_a_partition_are_an_error_when_assumed_disjoint() {
+    fn overlapping_files_within_a_partition_are_ordered_when_assumed_disjoint() {
         let fixture = Fixture::new(&[
             ("a0", utf8("A"), 0, 150),
             ("a1", utf8("A"), 100, 199),
@@ -754,40 +738,12 @@ mod tests {
         ]);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
-        let message = fixture
-            .try_plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)
-            .err()
-            .expect("the statistics contradict the assertion")
-            .to_string();
-        assert!(
-            message.contains("asserts that its files never overlap")
-                && message.contains("a0")
-                && message.contains("a1"),
-            "unexpected error: {message}"
-        );
-    }
-
-    /// Files the statistics cannot prove apart but do not show overlapping:
-    /// `a1` is pinned to the key `a0` ends on, which the proving path refuses
-    /// (it sorts on starts alone, and `a0` then reaches into `a1`) and the
-    /// assertion places, `a1` first.
-    #[test]
-    fn pinned_file_within_a_partition_is_ordered_when_assumed_disjoint() {
-        let fixture = Fixture::new(&[
-            ("a0", utf8("A"), 100, 150),
-            ("a1", utf8("A"), 100, 100),
-            ("b0", utf8("B"), 0, 99),
-        ]);
-        let order = vec![asc(0, "part"), asc(1, "timestamp")];
-
-        assert!(fixture.plan(&order, Some(&file_sort_order()), 2).is_none());
-
         let plan = fixture
             .plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)
             .expect("the assertion places every file");
 
         assert_eq!(plan.file_groups.len(), 2);
-        assert_eq!(group_urls(&plan.file_groups[0]), vec!["a1", "a0"]);
+        assert_eq!(group_urls(&plan.file_groups[0]), vec!["a0", "a1"]);
         assert_eq!(group_urls(&plan.file_groups[1]), vec!["b0"]);
     }
 
@@ -1068,7 +1024,6 @@ mod tests {
         let ordering = LexOrdering::new(vec![sort]).unwrap();
         Some(
             arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
-                .expect("proving never contradicts the table")
                 .ok()?
                 .0
                 .into_iter()
@@ -1154,7 +1109,6 @@ mod tests {
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
         assert!(
             arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
-                .expect("proving never contradicts the table")
                 .is_err()
         );
     }
@@ -1181,7 +1135,6 @@ mod tests {
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
         assert!(
             arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
-                .expect("proving never contradicts the table")
                 .is_err()
         );
     }

@@ -2889,25 +2889,28 @@ async fn delta_table_assumed_disjoint_with_nulls_still_degrades() -> TestResult<
     Ok(())
 }
 
-/// Declaring the assertion on files whose statistics show them overlapping
-/// fails the query when it is planned, naming the files, rather than
-/// arranging them anyway and returning rows in the wrong order.
+/// Declaring the assertion on files that really do overlap produces rows in
+/// the wrong order, with no error. This documents the hazard the option warns
+/// about rather than endorsing it.
 #[tokio::test]
-async fn delta_table_assumed_disjoint_on_overlapping_files_is_an_error() -> TestResult<()> {
+async fn delta_table_assumed_disjoint_on_overlapping_files_misorders_rows() -> TestResult<()> {
     let table = overlapping_delta_table(chain_overlapping_files()).await?;
-    let message = query_sorted_assuming(
+    let (rendered, timestamps) = query_sorted_assuming(
         &table,
         &[("datafusion.execution.target_partitions", "2")],
         true,
     )
-    .await
-    .expect_err("expected the contradicted assertion to fail the query")
-    .to_string();
+    .await?;
 
     assert!(
-        message.contains("asserts that its files never overlap")
-            && message.contains("overlapping on `timestamp`"),
-        "unexpected error: {message}"
+        !rendered.contains("SortExec"),
+        "expected the assertion to remove the sort:\n{rendered}"
+    );
+    // Every row is still returned - only the order is wrong.
+    assert_eq!(timestamps.len(), 4 * 110);
+    assert!(
+        !timestamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "expected the false assertion to misorder rows"
     );
     Ok(())
 }
