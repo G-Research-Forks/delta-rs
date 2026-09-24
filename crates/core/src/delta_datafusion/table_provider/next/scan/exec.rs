@@ -547,10 +547,10 @@ impl DeltaScanExec {
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-        let grouping_unchanged =
-            || Arc::ptr_eq(&self.input, &input) || grouping_is_unchanged(&self.input, &input);
+        let same_input = Arc::ptr_eq(&self.input, &input);
         if let Some(pushed) = &self.pushed
-            && !grouping_unchanged()
+            && !same_input
+            && !grouping_is_unchanged(&self.input, &input)
         {
             // The file grouping used for sort-pushdown is no longer valid, so the removal
             // of the `SortExec` may be unsafe and lead to out-of-order results.
@@ -573,10 +573,12 @@ impl DeltaScanExec {
         // scan underneath during `EnforceDistribution`, well before any sort
         // is removed on its strength. Failing there would refuse plans that
         // are merely losing an optimization.
-        let assumed = self
-            .assumed_ordering
-            .clone()
-            .filter(|_| grouping_unchanged() || grouping_retains_row_order(&self.input, &input));
+        //
+        // A pushed sort that got this far has already shown the grouping to
+        // be unchanged, which retains the row order too.
+        let assumed = self.assumed_ordering.clone().filter(|_| {
+            same_input || self.pushed.is_some() || grouping_retains_row_order(&self.input, &input)
+        });
         Ok(self.with_input(input, self.pushed.clone(), assumed))
     }
 
