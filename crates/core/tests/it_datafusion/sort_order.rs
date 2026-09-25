@@ -76,6 +76,17 @@ async fn run_query(
     options: &[(&str, &str)],
     sql: &str,
 ) -> TestResult<(String, Vec<RecordBatch>)> {
+    run_query_assuming(table, file_sort_order, options, sql, false).await
+}
+
+/// [`run_query`] with the no-overlap assertion optionally declared.
+async fn run_query_assuming(
+    table: &DeltaTable,
+    file_sort_order: &[FileSortColumn],
+    options: &[(&str, &str)],
+    sql: &str,
+    assume_no_overlap: bool,
+) -> TestResult<(String, Vec<RecordBatch>)> {
     let ctx = create_session().into_inner();
     for (key, value) in options {
         ctx.sql(&format!("SET {key} = {value}")).await?;
@@ -83,6 +94,7 @@ async fn run_query(
     let provider = table
         .table_provider()
         .with_file_sort_order(file_sort_order.iter().cloned())
+        .with_assume_no_overlap_on_sort(assume_no_overlap)
         .await?;
     ctx.register_table("test_table", provider)?;
 
@@ -589,11 +601,13 @@ async fn delta_table_partition_prefix_exceeding_multi_partition_target_avoids_so
 
 /// Cutting a group at every change of a leading partition column is only
 /// attempted while it fits the group budget. A table with more distinct
-/// leading values than the budget allows is packed by file count instead: the
-/// `SortExec` is still removed, but the packed groups publish no partition
-/// statistics, so the `SortPreservingMergeExec` above them has to stay.
+/// leading values than the budget allows is packed by file count instead. The
+/// packed groups publish no partition statistics, but they are still
+/// consecutive runs of key-ordered buckets, which the scan declares, so the
+/// `SortPreservingMergeExec` above them is still replaced by a concatenation.
 #[tokio::test]
-async fn delta_table_partition_prefix_beyond_group_budget_keeps_merge_only() -> TestResult<()> {
+async fn delta_table_partition_prefix_beyond_group_budget_concatenates_packed_groups()
+-> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new("part", DataType::Utf8, false),
@@ -624,12 +638,12 @@ async fn delta_table_partition_prefix_beyond_group_budget_keeps_merge_only() -> 
         "expected no SortExec in plan:\n{rendered}"
     );
     assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected the merge to stay over packed groups:\n{rendered}"
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec over packed groups:\n{rendered}"
     );
     assert!(
-        !rendered.contains("ProgressiveEvalExec"),
-        "packed groups cannot be proven disjoint:\n{rendered}"
+        rendered.contains("ProgressiveEvalExec"),
+        "expected the packed groups to be concatenated:\n{rendered}"
     );
     assert_eq!(keys.len(), parts as usize);
     assert_sorted(&keys, "(part, sub)");
@@ -1235,11 +1249,22 @@ async fn query_sorted_with_session_options(
     table: &DeltaTable,
     options: &[(&str, &str)],
 ) -> TestResult<(String, Vec<i64>)> {
-    let (rendered, batches) = run_query(
+    query_sorted_assuming(table, options, false).await
+}
+
+/// [`query_sorted_with_session_options`] with the no-overlap assertion
+/// optionally declared.
+async fn query_sorted_assuming(
+    table: &DeltaTable,
+    options: &[(&str, &str)],
+    assume_no_overlap: bool,
+) -> TestResult<(String, Vec<i64>)> {
+    let (rendered, batches) = run_query_assuming(
         table,
         &[FileSortColumn::asc("timestamp")],
         options,
         "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+        assume_no_overlap,
     )
     .await?;
     Ok((rendered, collect_timestamps(&batches)))
@@ -1554,6 +1579,15 @@ async fn query_nullable_sorted(
     table: &DeltaTable,
     target_partitions: usize,
 ) -> TestResult<(String, Vec<Option<i64>>)> {
+    query_nullable_sorted_assuming(table, target_partitions, false).await
+}
+
+/// [`query_nullable_sorted`] with the no-overlap assertion optionally declared.
+async fn query_nullable_sorted_assuming(
+    table: &DeltaTable,
+    target_partitions: usize,
+    assume_no_overlap: bool,
+) -> TestResult<(String, Vec<Option<i64>>)> {
     let ctx = create_session().into_inner();
     ctx.sql(&format!(
         "SET datafusion.execution.target_partitions = {target_partitions}"
@@ -1562,6 +1596,7 @@ async fn query_nullable_sorted(
     let provider = table
         .table_provider()
         .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .with_assume_no_overlap_on_sort(assume_no_overlap)
         .await?;
     ctx.register_table("test_table", provider)?;
 
@@ -2552,5 +2587,753 @@ async fn delta_table_with_deletion_vectors_keeps_limit_above_scan() -> TestResul
             "`{sql}` lost rows to the deletion vector:\n{rendered}"
         );
     }
+    Ok(())
+}
+
+// --- Files disjoint on the sort order, but not provably so from statistics ---
+
+const HOURS_PER_DAY: i64 = 24;
+
+fn date_time_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("date", DataType::Int64, false),
+        Field::new("time", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+/// One row per hour over the half-open `(date, time)` range `start..end`,
+/// in (date, time) order.
+fn date_time_rows(start: (i64, i64), end: (i64, i64)) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    let mut dates = Vec::new();
+    let mut times = Vec::new();
+    let mut values = Vec::new();
+    let (mut date, mut time) = start;
+    while (date, time) < end {
+        dates.push(date);
+        times.push(time);
+        values.push(date * HOURS_PER_DAY + time);
+        time += 1;
+        if time == HOURS_PER_DAY {
+            date += 1;
+            time = 0;
+        }
+    }
+    (dates, times, values)
+}
+
+fn date_time_batch(start: (i64, i64), end: (i64, i64)) -> TestResult<RecordBatch> {
+    let (dates, times, values) = date_time_rows(start, end);
+    Ok(RecordBatch::try_new(
+        date_time_schema(),
+        vec![
+            Arc::new(Int64Array::from(dates)),
+            Arc::new(Int64Array::from(times)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+/// [`date_time_batch`] with a constant "part" partition column appended.
+fn partitioned_date_time_batch(
+    part: &str,
+    start: (i64, i64),
+    end: (i64, i64),
+) -> TestResult<RecordBatch> {
+    let (dates, times, values) = date_time_rows(start, end);
+    let parts: Vec<&str> = vec![part; dates.len()];
+    let mut fields = date_time_schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("part", DataType::Utf8, false)));
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        vec![
+            Arc::new(Int64Array::from(dates)),
+            Arc::new(Int64Array::from(times)),
+            Arc::new(Int64Array::from(values)),
+            Arc::new(StringArray::from(parts)),
+        ],
+    )?)
+}
+
+/// Create an unpartitioned table of two files sorted by (date, time), each
+/// spanning a day boundary: file a covers (0, 17)..=(1, 9) and file b covers
+/// (1, 17)..=(2, 9).
+///
+/// The files do not overlap on (date, time), but that cannot be proven from
+/// per-column min/max statistics: both files report `time` in [0, 23], so the
+/// tie on `date` at the boundary (max(a.date) = min(b.date) = 1) falls
+/// through to a `time` comparison of min(b.time) = 0 against
+/// max(a.time) = 23, which reads as an overlap.
+async fn day_boundary_delta_table() -> TestResult<DeltaTable> {
+    day_boundary_delta_table_with_files(2).await
+}
+
+/// [`day_boundary_delta_table`] widened to `files` files: file *k* covers
+/// `(k, 17)..=(k + 1, 9)`, so every adjacent pair shares a date and needs the
+/// same unprovable non-overlap.
+async fn day_boundary_delta_table_with_files(files: i64) -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "date".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "time".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for file in 0..files {
+        table = table
+            .write(vec![date_time_batch((file, 17), (file + 1, 10))?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(
+        table.snapshot()?.log_data().num_files(),
+        usize::try_from(files)?
+    );
+    Ok(table)
+}
+
+/// Run `ORDER BY date, time` against the day-boundary table with the given
+/// session options applied, returning the rendered plan and the (date, time)
+/// keys of every result row.
+async fn query_day_boundary_sorted(
+    table: &DeltaTable,
+    options: &[(&str, &str)],
+    assume_no_overlap: bool,
+) -> TestResult<(String, Vec<(i64, i64)>)> {
+    let (rendered, batches) = run_query_assuming(
+        table,
+        &[FileSortColumn::asc("date"), FileSortColumn::asc("time")],
+        options,
+        "SELECT date, time, value FROM test_table ORDER BY date, time",
+        assume_no_overlap,
+    )
+    .await?;
+
+    let mut keys = Vec::new();
+    for batch in &batches {
+        let dates = batch.column(0).as_primitive::<Int64Type>().values();
+        let times = batch.column(1).as_primitive::<Int64Type>().values();
+        keys.extend(dates.iter().copied().zip(times.iter().copied()));
+    }
+    Ok((rendered, keys))
+}
+
+/// Each file is internally sorted by (date, time) and the two files are
+/// disjoint on that ordering, but the per-column statistics cannot show it:
+/// the scan keeps the files in separate groups and the query needs a
+/// `SortPreservingMergeExec` to interleave them.
+#[tokio::test]
+async fn delta_table_day_boundary_files_keep_merge() -> TestResult<()> {
+    let table = day_boundary_delta_table().await?;
+    let (rendered, keys) = query_day_boundary_sorted(
+        &table,
+        &[("datafusion.execution.target_partitions", "2")],
+        false,
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("2 groups"),
+        "expected the two files in separate groups:\n{rendered}"
+    );
+
+    // Two files x (7 hours on the first date + 10 on the second).
+    assert_eq!(keys.len(), 2 * 17);
+    assert_sorted(&keys, "(date, time)");
+    Ok(())
+}
+
+/// The same files with the no-overlap assertion declared: the scan orders them
+/// on their statistics alone and the merge gives way to the `ProgressiveEvalExec`
+/// concatenation.
+#[tokio::test]
+async fn delta_table_day_boundary_files_assumed_disjoint_use_progressive_eval() -> TestResult<()> {
+    let table = day_boundary_delta_table().await?;
+    let (rendered, keys) = query_day_boundary_sorted(
+        &table,
+        &[("datafusion.execution.target_partitions", "2")],
+        true,
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+
+    assert_eq!(keys.len(), 2 * 17);
+    assert_sorted(&keys, "(date, time)");
+    Ok(())
+}
+
+/// Four day-boundary files into two scan partitions, so each group holds two
+/// files that DataFusion's statistics-based validation of scan orderings
+/// rejects. The declared ordering is dropped from the file scan and
+/// re-declared by `DeltaScanExec`, so the query still avoids a sort and the
+/// groups still concatenate.
+#[tokio::test]
+async fn delta_table_day_boundary_assumed_disjoint_multi_file_groups() -> TestResult<()> {
+    let table = day_boundary_delta_table_with_files(4).await?;
+    let (rendered, keys) = query_day_boundary_sorted(
+        &table,
+        &[("datafusion.execution.target_partitions", "2")],
+        true,
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("2 groups"),
+        "expected two multi-file groups:\n{rendered}"
+    );
+    // The file scan cannot prove its own groups sorted, so only the re-declared
+    // ordering above it can be keeping the sort away.
+    assert!(
+        !rendered.contains("output_ordering="),
+        "expected the file scan's declared ordering to be dropped:\n{rendered}"
+    );
+
+    assert_eq!(keys.len(), 4 * 17);
+    assert_sorted(&keys, "(date, time)");
+    Ok(())
+}
+
+/// With more target partitions than files but a scan too small for DataFusion
+/// to judge the extra partitions worth having, the files stay whole and the
+/// concatenation holds. See
+/// [`delta_table_assumed_disjoint_interleaved_split_keeps_merge`] for what
+/// happens once they are worth splitting.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_unsplit_files_concatenate() -> TestResult<()> {
+    let table = day_boundary_delta_table().await?;
+    let (rendered, keys) = query_day_boundary_sorted(
+        &table,
+        &[("datafusion.execution.target_partitions", "4")],
+        true,
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("2 groups"),
+        "expected the two files left unsplit:\n{rendered}"
+    );
+
+    assert_eq!(keys.len(), 2 * 17);
+    assert_sorted(&keys, "(date, time)");
+    Ok(())
+}
+
+/// The assertion is about overlap *between* files, so it does not license
+/// concatenating files whose sort column may contain nulls: each file's nulls
+/// sort to its own end and would surface mid-stream. The full sort stays.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_with_nulls_still_degrades() -> TestResult<()> {
+    let table = nullable_sorted_delta_table().await?;
+    // A single target partition forces both files into one group.
+    let (rendered, timestamps) = query_nullable_sorted_assuming(&table, 1, true).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    assert_sorted_nulls_last(&timestamps);
+    Ok(())
+}
+
+/// Declaring the assertion on files that really do overlap produces rows in
+/// the wrong order, with no error. This documents the hazard the option warns
+/// about rather than endorsing it.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_on_overlapping_files_misorders_rows() -> TestResult<()> {
+    let table = overlapping_delta_table(chain_overlapping_files()).await?;
+    let (rendered, timestamps) = query_sorted_assuming(
+        &table,
+        &[("datafusion.execution.target_partitions", "2")],
+        true,
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected the assertion to remove the sort:\n{rendered}"
+    );
+    // Every row is still returned - only the order is wrong.
+    assert_eq!(timestamps.len(), 4 * 110);
+    assert!(
+        !timestamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "expected the false assertion to misorder rows"
+    );
+    Ok(())
+}
+
+// --- The assertion under a partition-column sort pushdown ---
+
+/// Create a table partitioned by "part" holding the day-boundary files: two of
+/// them under `part = "A"`, so ordering within that partition needs the
+/// non-overlap that statistics cannot show, plus one under `part = "B"` that
+/// carries on past both.
+async fn partitioned_day_boundary_delta_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "date".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "time".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "part".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::String),
+                false,
+            ),
+        ])
+        .with_partition_columns(vec!["part"])
+        .await?;
+
+    // The three files tile one (date, time) range without overlapping, so the
+    // assertion holds of the table as a whole and not merely within a
+    // partition - which is what it claims (see
+    // `with_assume_no_overlap_on_sort`).
+    for (part, start, end) in [
+        ("A", (0i64, 17i64), (1i64, 10i64)),
+        ("A", (1, 17), (2, 10)),
+        ("B", (2, 17), (3, 10)),
+    ] {
+        table = table
+            .write(vec![partitioned_date_time_batch(part, start, end)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 3);
+    Ok(table)
+}
+
+/// Run `ORDER BY part, date, time` against the partitioned day-boundary table,
+/// returning the rendered plan and the (part, date, time) keys of every row.
+async fn query_partitioned_day_boundary_sorted(
+    table: &DeltaTable,
+    assume_no_overlap: bool,
+) -> TestResult<(String, Vec<(String, i64, i64)>)> {
+    let (rendered, batches) = run_query_assuming(
+        table,
+        &[FileSortColumn::asc("date"), FileSortColumn::asc("time")],
+        &[],
+        "SELECT part, date, time FROM test_table ORDER BY part, date, time",
+        assume_no_overlap,
+    )
+    .await?;
+
+    let mut keys: Vec<(String, i64, i64)> = Vec::new();
+    for batch in &batches {
+        let parts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
+        let parts = parts.as_string::<i32>();
+        let dates = batch.column(1).as_primitive::<Int64Type>().values();
+        let times = batch.column(2).as_primitive::<Int64Type>().values();
+        for i in 0..batch.num_rows() {
+            keys.push((parts.value(i).to_string(), dates[i], times[i]));
+        }
+    }
+    Ok((rendered, keys))
+}
+
+/// The day-boundary files inside one value of a partition column.
+/// `DeltaScanExec::try_pushdown_sort` orders each partition bucket on the file
+/// sort order suffix, which needs the same unprovable non-overlap - so the
+/// pushdown refuses and the `SortExec` stays.
+#[tokio::test]
+async fn delta_table_partitioned_day_boundary_files_keep_sort() -> TestResult<()> {
+    let table = partitioned_day_boundary_delta_table().await?;
+    let (rendered, keys) = query_partitioned_day_boundary_sorted(&table, false).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+
+    assert_eq!(keys.len(), 3 * 17);
+    assert_sorted(&keys, "(part, date, time)");
+    Ok(())
+}
+
+/// With the no-overlap assertion declared, the pushdown can order the two
+/// files of the `part = "A"` bucket and the `SortExec` goes away.
+#[tokio::test]
+async fn delta_table_partitioned_day_boundary_files_assumed_disjoint_avoid_sort() -> TestResult<()>
+{
+    let table = partitioned_day_boundary_delta_table().await?;
+    let (rendered, keys) = query_partitioned_day_boundary_sorted(&table, true).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+
+    assert_eq!(keys.len(), 3 * 17);
+    assert_sorted(&keys, "(part, date, time)");
+    Ok(())
+}
+
+// --- Descending sort order under the assertion ---
+
+/// One row per hour over `start..end`, in *descending* (date, time) order.
+fn descending_date_time_batch(start: (i64, i64), end: (i64, i64)) -> TestResult<RecordBatch> {
+    let (mut dates, mut times, mut values) = date_time_rows(start, end);
+    dates.reverse();
+    times.reverse();
+    values.reverse();
+    Ok(RecordBatch::try_new(
+        date_time_schema(),
+        vec![
+            Arc::new(Int64Array::from(dates)),
+            Arc::new(Int64Array::from(times)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+/// The day-boundary layout mirrored for a descending `(date, time)` order: the
+/// later range is written first, and each file's rows run downwards.
+async fn descending_day_boundary_delta_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "date".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "time".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for start in [1i64, 0] {
+        table = table
+            .write(vec![descending_date_time_batch(
+                (start, 17),
+                (start + 1, 10),
+            )?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+    Ok(table)
+}
+
+/// A descending sort order takes each file's range from its maximum down to
+/// its minimum, so the assertion must order the files the other way round.
+#[tokio::test]
+async fn delta_table_descending_day_boundary_assumed_disjoint_avoids_sort() -> TestResult<()> {
+    let table = descending_day_boundary_delta_table().await?;
+    let (rendered, batches) = run_query_assuming(
+        &table,
+        &[FileSortColumn::desc("date"), FileSortColumn::desc("time")],
+        &[("datafusion.execution.target_partitions", "2")],
+        "SELECT date, time FROM test_table ORDER BY date DESC, time DESC",
+        true,
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+
+    let mut keys: Vec<(i64, i64)> = Vec::new();
+    for batch in &batches {
+        let dates = batch.column(0).as_primitive::<Int64Type>().values();
+        let times = batch.column(1).as_primitive::<Int64Type>().values();
+        keys.extend(dates.iter().copied().zip(times.iter().copied()));
+    }
+    assert_eq!(keys.len(), 2 * 17);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] >= pair[1]),
+        "results are not sorted by (date, time) descending"
+    );
+    Ok(())
+}
+
+/// The day-boundary layout with a nullable `time` column, each file carrying a
+/// null-timed row at its end. The null-free prefix of the declared order is
+/// therefore `date` alone.
+async fn nullable_day_boundary_delta_table() -> TestResult<DeltaTable> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("date", DataType::Int64, false),
+        Field::new("time", DataType::Int64, true),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "date".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "time".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                true,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for file in 0i64..2 {
+        let (mut dates, times, mut values) = date_time_rows((file, 17), (file + 1, 10));
+        let mut times: Vec<Option<i64>> = times.into_iter().map(Some).collect();
+        // One null-timed row on the file's last date, which is where a null
+        // sorts under `nulls last`.
+        dates.push(file + 1);
+        times.push(None);
+        values.push(-1);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(dates)),
+                Arc::new(Int64Array::from(times)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )?;
+        table = table
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+    Ok(table)
+}
+
+/// One file per scan partition lets the file scan declare the whole order,
+/// because a single sorted file upholds it nulls and all. Reading the files
+/// back to back does not: each file's nulls sit at its own end and would
+/// surface in the middle of the stream. The assertion covers overlap between
+/// files, not that, so the claim it licenses stops at the null-free prefix and
+/// the merge stays.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_single_file_groups_with_nulls_keep_merge() -> TestResult<()> {
+    let table = nullable_day_boundary_delta_table().await?;
+    let (rendered, batches) = run_query_assuming(
+        &table,
+        &[FileSortColumn::asc("date"), FileSortColumn::asc("time")],
+        &[("datafusion.execution.target_partitions", "2")],
+        "SELECT date, time FROM test_table ORDER BY date, time",
+        true,
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+
+    let mut keys: Vec<(i64, bool, Option<i64>)> = Vec::new();
+    for batch in &batches {
+        let dates = batch.column(0).as_primitive::<Int64Type>().values();
+        let times = batch.column(1).as_primitive::<Int64Type>();
+        for row in 0..batch.num_rows() {
+            let time = times.is_valid(row).then(|| times.value(row));
+            keys.push((dates[row], time.is_none(), time));
+        }
+    }
+    assert_eq!(keys.len(), 2 * 18);
+    assert_sorted(&keys, "(date, time) with nulls last");
+    Ok(())
+}
+
+/// DataFusion splits a scan's files into byte ranges to fill its target
+/// partitions once the table is worth the trouble, which for these fixtures
+/// means lowering `repartition_file_min_size` to reach the same path a real
+/// table reaches on size alone. The split is a contiguous re-cut of the same
+/// ordered file list, so the arrangement survives it and the concatenation
+/// should too.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_survives_byte_range_splitting() -> TestResult<()> {
+    let table = day_boundary_delta_table_with_files(8).await?;
+    let (rendered, keys) = query_day_boundary_sorted(
+        &table,
+        &[
+            ("datafusion.execution.target_partitions", "4"),
+            ("datafusion.execution.batch_size", "10"),
+            ("datafusion.optimizer.repartition_file_min_size", "1"),
+        ],
+        true,
+    )
+    .await?;
+
+    // The files were re-cut mid-file to fill the four partitions, which is
+    // what a table large enough to be worth splitting gets on size alone.
+    assert!(
+        rendered.contains(".parquet:0..") && rendered.contains("4 groups"),
+        "expected the files split into four byte-range groups:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+
+    assert_eq!(keys.len(), 8 * 17);
+    assert_sorted(&keys, "(date, time)");
+    Ok(())
+}
+
+/// Once DataFusion judges the extra partitions worth having, a scan with one
+/// file per group gets its order-preserving repartitioner, which appends the
+/// new groups and deals each file's byte ranges across them. That interleaves
+/// the files - the first group takes the front of one and the second the front
+/// of the next - so reading the partitions in order no longer walks the ordered
+/// stream and the arrangement is rightly withdrawn. The merge keeps the rows in
+/// order; only the concatenation is lost.
+///
+/// The scan refusing to repartition itself does not prevent this: the same
+/// request reaches the parquet scan directly from `EnforceDistribution`.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_interleaved_split_keeps_merge() -> TestResult<()> {
+    let table = day_boundary_delta_table().await?;
+    let (rendered, keys) = query_day_boundary_sorted(
+        &table,
+        &[
+            ("datafusion.execution.target_partitions", "4"),
+            ("datafusion.execution.batch_size", "10"),
+        ],
+        true,
+    )
+    .await?;
+
+    assert!(
+        rendered.contains(".parquet:0..") && rendered.contains("4 groups"),
+        "expected the files dealt across four groups:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected the interleaving to withdraw the arrangement:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected the merge to keep the rows ordered:\n{rendered}"
+    );
+
+    assert_eq!(keys.len(), 2 * 17);
+    assert_sorted(&keys, "(date, time)");
+    Ok(())
+}
+
+/// An operator between the merge and the scan must not cost the concatenation.
+/// A computed column in the select list puts a projection there, and the
+/// statistics proof already reaches through such nodes because per-partition
+/// statistics propagate up them; the assertion reaches through them by walking
+/// down to the scan that makes it.
+#[tokio::test]
+async fn delta_table_assumed_disjoint_reaches_through_a_projection() -> TestResult<()> {
+    let table = day_boundary_delta_table().await?;
+    let (rendered, batches) = run_query_assuming(
+        &table,
+        &[FileSortColumn::asc("date"), FileSortColumn::asc("time")],
+        &[("datafusion.execution.target_partitions", "2")],
+        "SELECT date, time, value + 1 AS v FROM test_table ORDER BY date, time",
+        true,
+    )
+    .await?;
+
+    assert!(
+        rendered.contains("ProjectionExec"),
+        "expected a projection between the merge and the scan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+    );
+
+    let mut keys = Vec::new();
+    for batch in &batches {
+        let dates = batch.column(0).as_primitive::<Int64Type>().values();
+        let times = batch.column(1).as_primitive::<Int64Type>().values();
+        keys.extend(dates.iter().copied().zip(times.iter().copied()));
+    }
+    assert_eq!(keys.len(), 2 * 17);
+    assert_sorted(&keys, "(date, time)");
     Ok(())
 }

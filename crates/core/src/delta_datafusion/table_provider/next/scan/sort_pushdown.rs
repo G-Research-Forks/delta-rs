@@ -32,8 +32,8 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 
 use super::{
-    DeltaPartitionValues, KeyTypes, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files,
-    max_num_groups, non_overlapping_file_order, null_free_ordering_prefix,
+    DeltaPartitionValues, KeyTypes, MAX_PARTITION_DICT_CARDINALITY, OverlapPolicy,
+    arrange_non_overlapping_files, chunk_ordered_files, max_num_groups, null_free_ordering_prefix,
 };
 
 /// Outcome of planning a sort pushdown: the regrouped, range-ordered file groups
@@ -203,11 +203,14 @@ impl Bucket {
 ///   and the planned pushdown always uses the full file range.
 /// * `target_groups` – desired execution-partition count; the result may hold
 ///   more groups, up to [`group_budget`].
+/// * `overlap` – whether a bucket whose files cannot be proven non-overlapping
+///   on the suffix may still be ordered on the table's assertion.
 pub(super) fn plan_sort_pushdown(
     shape: &OrderShape,
     parquet_read_schema: &SchemaRef,
     files: &[&PartitionedFile],
     target_groups: usize,
+    overlap: OverlapPolicy,
 ) -> Result<Option<SortPushdownPlan>> {
     if files.is_empty() {
         return Ok(None);
@@ -275,7 +278,9 @@ pub(super) fn plan_sort_pushdown(
                 if null_free.is_none_or(|p| p.len() < suffix.len()) {
                     return Ok(None);
                 }
-                let Ok(bucket) = non_overlapping_file_order(bucket, |file| *file, suffix) else {
+                let Ok((bucket, _)) =
+                    arrange_non_overlapping_files(bucket, |file| *file, suffix, overlap)
+                else {
                     return Ok(None);
                 };
                 bucket
@@ -334,8 +339,9 @@ pub(super) fn plan_sort_pushdown(
 /// describes both that range and where the run begins. Such a group publishes
 /// nothing, and `DeltaScanExec` describes it from the table-wide aggregate
 /// instead - exact for a lone execution partition, inexact otherwise, which
-/// cannot prove neighbouring partitions disjoint, so the merge above the scan
-/// stays while the sort is still gone.
+/// cannot prove neighbouring partitions disjoint. The scan declares them
+/// disjoint by construction regardless (see `DeltaScanExec::disjoint_ordering`),
+/// so only the ranges reported for the partitions are lost.
 fn group_prefix_stats(
     group: &[Bucket],
     prefix: &[PrefixColumn],
@@ -373,13 +379,14 @@ fn group_prefix_stats(
 ///
 /// The group count may exceed the target so that a group can be cut at every
 /// change of a leading partition column. That keeps each group's
-/// partition-column statistics exact, which lets `ProgressiveEvalRule` prove
-/// neighbouring groups disjoint and replace the `SortPreservingMergeExec`
-/// above with a `ProgressiveEvalExec`.
+/// partition-column statistics exact, so that `ProgressiveEvalRule` can
+/// replace the `SortPreservingMergeExec` above with a `ProgressiveEvalExec`
+/// that reports the range each partition covers.
 ///
-/// The replacement is not guaranteed, and a merge that is kept opens every
-/// partition at once, so the overshoot is capped at [`max_num_groups`], the
-/// same bound a scan with a declared file sort order already gets.
+/// The replacement is not guaranteed - an operator between the merge and the
+/// scan can prevent it - and a merge that is kept opens every partition at
+/// once, so the overshoot is capped at [`max_num_groups`], the same bound a
+/// scan with a declared file sort order already gets.
 pub(super) fn group_budget(target_groups: usize) -> usize {
     if target_groups <= 1 {
         // A single target group is the one case that cannot absorb any overshoot:
@@ -407,11 +414,11 @@ pub(super) fn group_budget(target_groups: usize) -> usize {
 ///
 /// Packing first cuts a group wherever a prefix column other than the last
 /// changes, so that every group's statistics can be read exactly off its
-/// endpoints (see [`group_prefix_stats`]) and `ProgressiveEvalRule` can prove
-/// the groups disjoint. When those cuts alone overrun the budget - many
-/// distinct leading values, or a single target group - the buckets are packed
-/// by file count alone instead. That still removes the sort; only the merge
-/// above it has to stay.
+/// endpoints (see [`group_prefix_stats`]). When those cuts alone overrun the
+/// budget - many distinct leading values, or a single target group - the
+/// buckets are packed by file count alone instead. The groups are still
+/// consecutive runs of key-ordered buckets, so they stay disjoint and
+/// range-ordered; only their exact statistics are lost.
 fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Option<Vec<Vec<Bucket>>> {
     let target = target.max(1);
     let max_groups = group_budget(target);
@@ -613,6 +620,16 @@ mod tests {
             file_sort_order: Option<&LexOrdering>,
             target_groups: usize,
         ) -> Option<SortPushdownPlan> {
+            self.plan_with(order, file_sort_order, target_groups, OverlapPolicy::Prove)
+        }
+
+        fn plan_with(
+            &self,
+            order: &[PhysicalSortExpr],
+            file_sort_order: Option<&LexOrdering>,
+            target_groups: usize,
+            overlap: OverlapPolicy,
+        ) -> Option<SortPushdownPlan> {
             let order = LexOrdering::new(order.to_vec()).unwrap();
             let shape = analyze_order(
                 &order,
@@ -622,7 +639,14 @@ mod tests {
                 file_sort_order,
             )?;
             let files: Vec<&PartitionedFile> = self.files.iter().collect();
-            plan_sort_pushdown(&shape, &parquet_read_schema(), &files, target_groups).unwrap()
+            plan_sort_pushdown(
+                &shape,
+                &parquet_read_schema(),
+                &files,
+                target_groups,
+                overlap,
+            )
+            .unwrap()
         }
     }
 
@@ -701,6 +725,42 @@ mod tests {
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
         assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
+    }
+
+    /// The same files with the table asserting that they never overlap: the
+    /// bucket is ordered on its statistics alone and the pushdown succeeds.
+    #[test]
+    fn overlapping_files_within_a_partition_are_ordered_when_assumed_disjoint() {
+        let fixture = Fixture::new(&[
+            ("a0", utf8("A"), 0, 150),
+            ("a1", utf8("A"), 100, 199),
+            ("b0", utf8("B"), 0, 99),
+        ]);
+        let order = vec![asc(0, "part"), asc(1, "timestamp")];
+
+        let plan = fixture
+            .plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)
+            .expect("the assertion places every file");
+
+        assert_eq!(plan.file_groups.len(), 2);
+        assert_eq!(group_urls(&plan.file_groups[0]), vec!["a0", "a1"]);
+        assert_eq!(group_urls(&plan.file_groups[1]), vec!["b0"]);
+    }
+
+    /// The assertion covers overlap between files, not nulls within one, so a
+    /// bucket whose sort column may hold nulls is still refused.
+    #[test]
+    fn nullable_files_within_a_partition_are_refused_even_when_assumed_disjoint() {
+        let mut fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("a1", utf8("A"), 100, 199)]);
+        let stats = Arc::make_mut(fixture.files[1].statistics.as_mut().unwrap());
+        stats.column_statistics[0].null_count = Precision::Exact(1);
+        let order = vec![asc(0, "part"), asc(1, "timestamp")];
+
+        assert!(
+            fixture
+                .plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)
+                .is_none()
+        );
     }
 
     #[test]
@@ -946,7 +1006,14 @@ mod tests {
             None,
         )?;
         let files: Vec<&PartitionedFile> = files.iter().collect();
-        plan_sort_pushdown(&shape, &parquet_read_schema(), &files, target_groups).unwrap()
+        plan_sort_pushdown(
+            &shape,
+            &parquet_read_schema(),
+            &files,
+            target_groups,
+            OverlapPolicy::Prove,
+        )
+        .unwrap()
     }
 
     fn ordered_bucket(specs: &[(&str, i64, i64)], sort: PhysicalSortExpr) -> Option<Vec<String>> {
@@ -956,8 +1023,9 @@ mod tests {
             .collect();
         let ordering = LexOrdering::new(vec![sort]).unwrap();
         Some(
-            non_overlapping_file_order(files, |file| file, &ordering)
+            arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
                 .ok()?
+                .0
                 .into_iter()
                 .map(|file| file.object_meta.location.to_string())
                 .collect(),
@@ -1039,7 +1107,10 @@ mod tests {
         ];
         files[1].statistics = None;
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
-        assert!(non_overlapping_file_order(files, |file| file, &ordering).is_err());
+        assert!(
+            arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
+                .is_err()
+        );
     }
 
     /// Statistics whose `ScalarValue` variant differs between files are
@@ -1062,7 +1133,10 @@ mod tests {
             })
             .collect();
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
-        assert!(non_overlapping_file_order(files, |file| file, &ordering).is_err());
+        assert!(
+            arrange_non_overlapping_files(files, |file| file, &ordering, OverlapPolicy::Prove)
+                .is_err()
+        );
     }
 
     fn three_two_column_files() -> Vec<PartitionedFile> {
@@ -1711,7 +1785,7 @@ mod tests {
     /// Leading-prefix cuts may exceed the target group count, but only up to
     /// `group_budget`. Past that the buckets are packed by file count instead:
     /// the sort is still removed, and the groups that span a change in the
-    /// leading column publish no statistics, so the merge above them stays.
+    /// leading column publish no statistics.
     #[test]
     fn leading_prefix_cuts_fall_back_to_packing_past_the_budget() {
         let files = |parts: usize| -> Vec<PartitionedFile> {

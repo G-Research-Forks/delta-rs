@@ -164,6 +164,7 @@ impl DeltaScanConfigBuilder {
             table_parquet_options,
             schema_force_view_types: true,
             file_sort_order: Vec::new(),
+            assume_no_overlap_on_sort: false,
         })
     }
 }
@@ -231,6 +232,12 @@ pub struct DeltaScanConfig {
     /// adheres to, if any. Empty means no ordering is declared.
     #[serde(default)]
     pub file_sort_order: Vec<FileSortColumn>,
+    /// Assume data files never overlap on [`Self::file_sort_order`], rather
+    /// than proving it from file statistics.
+    ///
+    /// See [`TableProviderBuilder::with_assume_no_overlap_on_sort`].
+    #[serde(default)]
+    pub assume_no_overlap_on_sort: bool,
 }
 
 impl Default for DeltaScanConfig {
@@ -250,6 +257,7 @@ impl DeltaScanConfig {
             schema: None,
             table_parquet_options: None,
             file_sort_order: Vec::new(),
+            assume_no_overlap_on_sort: false,
         }
     }
 
@@ -263,6 +271,7 @@ impl DeltaScanConfig {
             schema: None,
             table_parquet_options: None,
             file_sort_order: Vec::new(),
+            assume_no_overlap_on_sort: false,
         }
     }
 
@@ -303,6 +312,14 @@ impl DeltaScanConfig {
         self.file_sort_order = columns.into_iter().collect();
         self
     }
+
+    /// Assume data files never overlap on the declared file sort order.
+    ///
+    /// See [`TableProviderBuilder::with_assume_no_overlap_on_sort`].
+    pub fn with_assume_no_overlap_on_sort(mut self, assume: bool) -> Self {
+        self.assume_no_overlap_on_sort = assume;
+        self
+    }
 }
 
 /// Builder for a datafusion [TableProvider] for a Delta table
@@ -320,6 +337,7 @@ pub struct TableProviderBuilder {
     /// Predicates used only for file skipping in kernel log replay
     file_skipping_predicates: Option<Vec<Expr>>,
     file_sort_order: Option<Vec<FileSortColumn>>,
+    assume_no_overlap_on_sort: bool,
 }
 
 impl fmt::Debug for TableProviderBuilder {
@@ -333,6 +351,7 @@ impl fmt::Debug for TableProviderBuilder {
             .field("table_version", &self.table_version)
             .field("file_skipping_predicates", &self.file_skipping_predicates)
             .field("file_sort_order", &self.file_sort_order)
+            .field("assume_no_overlap_on_sort", &self.assume_no_overlap_on_sort)
             .finish()
     }
 }
@@ -354,6 +373,7 @@ impl TableProviderBuilder {
             table_version: None,
             file_skipping_predicates: None,
             file_sort_order: None,
+            assume_no_overlap_on_sort: false,
         }
     }
 
@@ -429,7 +449,12 @@ impl TableProviderBuilder {
     /// sort order.
     ///
     /// The declared order is trusted: files whose data is not actually sorted
-    /// this way will produce incorrectly ordered query results.
+    /// this way produce wrong query results, not merely misordered ones. The
+    /// ordering is advertised to DataFusion, which plans on it wherever an
+    /// operator can exploit sorted input: a `GROUP BY` on the sort columns
+    /// may be aggregated in streaming mode and emit a key twice, and a window
+    /// function or sort-merge join computed over the ordering gives wrong
+    /// values.
     ///
     /// Only regular top-level data columns are supported. Partition columns are
     /// injected above the parquet scan and cannot participate in a file-level
@@ -472,6 +497,84 @@ impl TableProviderBuilder {
         self
     }
 
+    /// Assume data files never overlap on the declared file sort order, instead
+    /// of proving it from their statistics.
+    ///
+    /// Delta statistics are per column, not lexicographic, so a multi-column
+    /// sort order can leave files that do not really overlap looking as though
+    /// they might. Two files sorted by `(day, time)` covering
+    /// `(0, 17)..(1, 9)` and `(1, 17)..(2, 9)` report `day` in `[0, 1]` and
+    /// `[1, 2]` and `time` in `[0, 23]` for both: the tie on `day` falls
+    /// through to `time`, where the second file's minimum sits below the
+    /// first's maximum. Nothing in the statistics rules out an overlap, so
+    /// scans keep the files in separate groups and merge them.
+    ///
+    /// Setting this asserts that no two files overlap on the declared order.
+    /// The claim is about the table, not about each partition of it: files in
+    /// different partitions have to be non-overlapping too, since a query that
+    /// does not order by the partition columns arranges every file together.
+    /// Where the statistics already rule out an overlap nothing changes; where
+    /// they cannot, the files are arranged on those statistics alone and read
+    /// back-to-back, letting the sort-preserving merge be replaced by a plain
+    /// concatenation (see
+    /// [`with_file_sort_order`](Self::with_file_sort_order)).
+    ///
+    /// **The assertion is trusted and unchecked.** If two files do overlap,
+    /// queries report no error and return wrong results. Rows in the wrong
+    /// order is the mildest outcome: the arrangement is advertised as an
+    /// ordering of the scan, and DataFusion plans on that ordering wherever an
+    /// operator can exploit sorted input, so a `GROUP BY` on the sort columns
+    /// may be aggregated in streaming mode and emit a key twice, and a window
+    /// function or sort-merge join computed over the ordering gives wrong
+    /// values. This does nothing unless a file sort order is also declared.
+    ///
+    /// Overlap is all this relaxes. Sort columns that may contain nulls, sort
+    /// keys whose types cannot be compared, and files whose sort-column
+    /// statistics are missing are all still handled exactly as they are
+    /// without it, as are two files that span the same range of a sort
+    /// column: files covering the same span of a column meet somewhere inside
+    /// it, which the assertion cannot explain away.
+    ///
+    /// The arrangement is made when the scan is planned and advertised as its
+    /// output ordering for every query on the table, not only the ordered
+    /// ones. That costs what any declared ordering costs in read parallelism,
+    /// which is that DataFusion does not round-robin the rows beneath an
+    /// ordered scan, and no more: files are still split into byte ranges to fill
+    /// `datafusion.execution.target_partitions`. The arrangement survives a
+    /// split that re-cuts the ordered file list into contiguous pieces, which
+    /// is what a table large enough to be worth splitting gets, and is
+    /// withdrawn when the pieces of a few files are dealt across the
+    /// partitions and interleave, leaving the sort-preserving merge in place.
+    /// The note on [`with_file_sort_order`](Self::with_file_sort_order) about
+    /// `datafusion.optimizer.repartition_file_scans` applies here too.
+    ///
+    /// **The bounds are taken at face value, so the assertion covers their
+    /// fidelity too.** A writer may truncate a long string bound, cutting a
+    /// minimum back to a prefix and raising a maximum to a value above every
+    /// string that starts with its prefix, and a timestamp maximum is rounded
+    /// up to the next millisecond when it lands exactly on one. Delta records
+    /// no way to tell a widened bound from a true one, so nothing here screens
+    /// for it. Truncation keeps string bounds in order, so at worst it makes
+    /// two files' bounds equal, and files it cannot tell apart that way fall
+    /// back to the merge as they would without the assertion. Rounding a
+    /// timestamp maximum up is not order preserving, which for a descending
+    /// order on a timestamp column -
+    /// where the maximum is where a file's range begins - can put two files
+    /// the wrong way round even though they do not overlap.
+    ///
+    /// That takes a file whose whole span in the sort column falls inside a
+    /// single millisecond. A widened maximum only overtakes the file above it
+    /// if that file's entire range sits in the millisecond it was widened
+    /// into, and a maximum landing on a millisecond boundary is widened
+    /// alike, so a pair that both round move together. Files spanning more
+    /// than a millisecond of the sort column cannot be arranged wrongly this
+    /// way, and an ascending order cannot either, the maximum being where a
+    /// file's range ends there.
+    pub fn with_assume_no_overlap_on_sort(mut self, assume: bool) -> Self {
+        self.assume_no_overlap_on_sort = assume;
+        self
+    }
+
     pub async fn build(self) -> Result<next::DeltaScan> {
         let TableProviderBuilder {
             log_store,
@@ -482,6 +585,7 @@ impl TableProviderBuilder {
             table_version,
             file_skipping_predicates,
             file_sort_order,
+            assume_no_overlap_on_sort,
         } = self;
 
         let mut config = session
@@ -495,6 +599,7 @@ impl TableProviderBuilder {
         if let Some(file_sort_order) = file_sort_order {
             config = config.with_file_sort_order(file_sort_order);
         }
+        config = config.with_assume_no_overlap_on_sort(assume_no_overlap_on_sort);
 
         let snapshot = match snapshot {
             Some(wrapper) => wrapper,

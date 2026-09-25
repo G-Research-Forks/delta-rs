@@ -16,16 +16,21 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Statistics;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Result, ScalarValue};
-use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
+};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 
 use super::progressive_eval::ProgressiveEvalExec;
+use super::scan::DeltaScanExec;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -58,11 +63,23 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
             if contains_hash_join(input)? {
                 return Ok(Transformed::no(plan));
             }
-            let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
-                return Ok(Transformed::no(plan));
+            // A Delta scan may declare the partitions disjoint outright - from
+            // a sort pushdown that built them that way, or from the table's
+            // assertion that its files never overlap. That is asked first: it
+            // is a walk over the plan, whereas the proof materialises every
+            // partition's statistics, which the declaration makes redundant.
+            // The ranges are then only descriptive, so it does not matter that
+            // they may be unavailable.
+            let ranges = if partitions_declared_disjoint(input, merge.expr())? {
+                leading_partition_ranges(input, merge.expr())
+            } else {
+                let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
+                    return Ok(Transformed::no(plan));
+                };
+                Some(ranges)
             };
             let input = preserve_input_order(Arc::clone(input))?;
-            let replacement = ProgressiveEvalExec::new(input, Some(ranges), merge.fetch());
+            let replacement = ProgressiveEvalExec::new(input, ranges, merge.fetch());
             Ok(Transformed::yes(Arc::new(replacement) as _))
         })
         .data()
@@ -75,6 +92,156 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Whether `plan` sits on a Delta scan that *declares* - rather than proves
+/// from statistics - that its execution partitions are mutually disjoint and
+/// arranged in range order, on an ordering that also covers `ordering`. See
+/// [`DeltaScanExec::disjoint_ordering`] for where such a declaration comes
+/// from.
+///
+/// The statistics proof beside this one reaches the scan through intervening
+/// operators for free, because per-partition statistics propagate up through
+/// them. A declaration is not a statistic, so it has to be fetched from the
+/// scan itself, and this walks down to find it - rewriting `ordering` over
+/// each child's schema on the way, since the columns it names are those of the
+/// plan it started from.
+///
+/// The walk descends only through operators that hand their input's partitions
+/// on as they are; see [`pass_through_ordering`]. Anything else ends it, at
+/// the cost of a missed optimization rather than a wrong result.
+fn partitions_declared_disjoint(
+    plan: &Arc<dyn ExecutionPlan>,
+    ordering: &LexOrdering,
+) -> Result<bool> {
+    let node = plan.as_ref() as &dyn ExecutionPlan;
+    if let Some(scan) = node.downcast_ref::<DeltaScanExec>() {
+        let Some(declared) = scan.disjoint_ordering() else {
+            return Ok(false);
+        };
+        // Concatenating the partitions yields a stream ordered on `declared`.
+        // That makes the merge redundant only if `declared` also delivers what
+        // the merge was asked for - which it does when `ordering` is a prefix
+        // of it, and through equivalences in cases a plain prefix check would
+        // miss. Only `declared` is offered: the scan's other orderings
+        // describe each partition on its own and say nothing about how they
+        // sit relative to each other.
+        return EquivalenceProperties::new_with_orderings(plan.schema(), vec![declared.clone()])
+            .ordering_satisfy(ordering.iter().cloned());
+    }
+    let (Some(child_ordering), [child]) =
+        (pass_through_ordering(node, ordering), &node.children()[..])
+    else {
+        return Ok(false);
+    };
+    partitions_declared_disjoint(child, &child_ordering)
+}
+
+/// Rewrite `ordering`, whose columns index `plan`'s output schema, over the
+/// schema of its child, or `None` when `plan` is not an operator this can see
+/// through.
+///
+/// Seeing through one means its partitions are its child's: each output
+/// partition holds rows of the input partition with the same index, possibly
+/// fewer of them, in the order they had there, so a claim about how the
+/// child's partitions sit relative to each other still holds of its own. An
+/// operator is taken to keep its partitions that way when it
+///
+/// - has a single child;
+/// - reports that it maintains its input order;
+/// - has as many partitions as its child and declares no distribution scheme
+///   for them. The flag alone does not rule out an order-preserving
+///   `RepartitionExec`, which keeps every output partition ordered while
+///   dealing rows *between* partitions, and may keep their number. But a
+///   repartition always declares the scheme it dealt by, whereas an operator
+///   that forwards its input's partitions leaves them `UnknownPartitioning`
+///   as the scan declared them; and the other exchanges, merges and
+///   coalesces, end at a single partition;
+/// - and can carry the sort columns down: unchanged when its schema is its
+///   child's, or through its projection when it is a `ProjectionExec` or a
+///   `FilterExec` in which `ProjectionPushdown` embedded one. Only a column
+///   passed straight through can be carried - one the projection computes is
+///   not the column the scan arranged its files on, whatever it is named -
+///   and any other change to the schema ends the walk, which is what keeps
+///   out the order-maintaining operators that build new rows, such as
+///   aggregates and window functions.
+///
+/// Filters, projections, limits, batch coalescing, the buffer DataFusion's
+/// sort pushdown puts under a merge, and cooperative yielding all pass.
+/// Operators that repartition, sort, join or aggregate end the walk.
+fn pass_through_ordering(plan: &dyn ExecutionPlan, ordering: &LexOrdering) -> Option<LexOrdering> {
+    let [child] = plan.children()[..] else {
+        return None;
+    };
+    if !plan
+        .maintains_input_order()
+        .first()
+        .copied()
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let partition_count = child.output_partitioning().partition_count();
+    let forwards_partitions = matches!(
+        plan.output_partitioning(),
+        Partitioning::UnknownPartitioning(count) if *count == partition_count
+    );
+    if !forwards_partitions {
+        return None;
+    }
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        return map_ordering_columns(ordering, |column| {
+            let projected = projection.expr().get(column.index())?;
+            projected.expr.downcast_ref::<Column>().cloned()
+        });
+    }
+    if let Some(projection) = plan
+        .downcast_ref::<FilterExec>()
+        .and_then(|filter| filter.projection().as_ref())
+    {
+        return map_ordering_columns(ordering, |column| {
+            Some(Column::new(column.name(), *projection.get(column.index())?))
+        });
+    }
+    (plan.schema() == child.schema()).then(|| ordering.clone())
+}
+
+/// Rewrite `ordering` with each of its columns replaced by the child column
+/// `carry` reads it from, or `None` when any of them does not come from one.
+fn map_ordering_columns(
+    ordering: &LexOrdering,
+    carry: impl Fn(&Column) -> Option<Column>,
+) -> Option<LexOrdering> {
+    let mapped = ordering
+        .iter()
+        .map(|sort_expr| {
+            let column = sort_expr.expr.downcast_ref::<Column>()?;
+            Some(PhysicalSortExpr::new(
+                Arc::new(carry(column)?),
+                sort_expr.options,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    LexOrdering::new(mapped)
+}
+
+/// The first sort column's `(start, end)` value per partition, with no ordering
+/// check. Reported by [`ProgressiveEvalExec`] as `input_ranges` for readers of
+/// the plan; `None` when the statistics do not yield them.
+fn leading_partition_ranges(
+    plan: &Arc<dyn ExecutionPlan>,
+    ordering: &LexOrdering,
+) -> Option<Vec<(ScalarValue, ScalarValue)>> {
+    // Only the leading column is reported, so statistics missing on a later
+    // one must not withhold it.
+    let leading = LexOrdering::new([ordering.first().clone()])?;
+    (0..plan.output_partitioning().partition_count())
+        .map(|partition_idx| {
+            let stats = plan.partition_statistics(Some(partition_idx)).ok()?;
+            let (starts, ends, _) = get_ordering_stats(&stats, &leading)?;
+            Some((starts[0].clone(), ends[0].clone()))
+        })
+        .collect()
 }
 
 /// Whether any node of `plan` is a [`HashJoinExec`].
@@ -250,9 +417,15 @@ mod tests {
     use datafusion::common::stats::{ColumnStatistics, Precision};
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-    use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
+    use datafusion::physical_plan::buffer::BufferExec;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::filter::FilterExecBuilder;
     use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion::physical_plan::limit::LocalLimitExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
 
     /// Leaf plan reporting fixed per-partition statistics; never executed.
@@ -264,8 +437,17 @@ mod tests {
 
     impl StatsExec {
         fn new(stats: Vec<Statistics>) -> Arc<dyn ExecutionPlan> {
+            Self::declaring(stats, None)
+        }
+
+        /// A leaf that also declares `ordering` as the order of each of its
+        /// partitions.
+        fn declaring(
+            stats: Vec<Statistics>,
+            ordering: Option<LexOrdering>,
+        ) -> Arc<dyn ExecutionPlan> {
             let cache = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(test_schema()),
+                EquivalenceProperties::new_with_orderings(test_schema(), ordering),
                 Partitioning::UnknownPartitioning(stats.len()),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
@@ -628,6 +810,32 @@ mod tests {
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
     }
 
+    #[test]
+    fn leading_ranges_ignore_statistics_on_later_sort_columns() {
+        // The second sort column's statistics are inexact in one partition
+        // and missing from the other, neither of which touches the leading
+        // column the ranges report.
+        let inexact = ColumnStatistics {
+            null_count: Precision::Exact(0),
+            min_value: Precision::Inexact(ScalarValue::Int64(Some(0))),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(10))),
+            ..Default::default()
+        };
+        let plan = StatsExec::new(vec![
+            partition(vec![exact_i64(0, 99, 0), inexact]),
+            partition(vec![exact_i64(100, 200, 0)]),
+        ]);
+        let ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+
+        assert_eq!(
+            leading_partition_ranges(&plan, &ordering),
+            Some(vec![
+                (ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(99))),
+                (ScalarValue::Int64(Some(100)), ScalarValue::Int64(Some(200))),
+            ])
+        );
+    }
+
     /// Two partitions with disjoint `t` ranges: a merge on `t` over them is
     /// replaceable by a progressive eval.
     fn ordered_partitions() -> Arc<dyn ExecutionPlan> {
@@ -699,6 +907,103 @@ mod tests {
             "expected SortPreservingMergeExec, got {}",
             optimized.name()
         );
+    }
+
+    /// A filter over ordered partitions, with a projection embedded in it the
+    /// way `ProjectionPushdown` leaves one.
+    fn filter_exec(projection: Option<Vec<usize>>) -> FilterExec {
+        FilterExecBuilder::new(
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+            ordered_partitions(),
+        )
+        .apply_projection(projection)
+        .unwrap()
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn filter_passes_the_ordering_through_unchanged() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        assert_eq!(
+            pass_through_ordering(&filter_exec(None), &ordering),
+            Some(ordering)
+        );
+    }
+
+    #[test]
+    fn filter_carries_the_ordering_through_an_embedded_projection() {
+        // The filter emits `id` then `t`, so the sort column it is asked about
+        // is not the one its child holds under that index.
+        let filter = filter_exec(Some(vec![1, 0]));
+        assert_eq!(filter.schema().field(1).name(), "t");
+
+        let ordering = LexOrdering::new(vec![asc(1, "t")]).unwrap();
+
+        assert_eq!(
+            pass_through_ordering(&filter, &ordering),
+            LexOrdering::new(vec![asc(0, "t")])
+        );
+    }
+
+    /// Operators that hand their input's partitions on as they are, with the
+    /// same schema, need no special knowledge to be seen through.
+    #[test]
+    fn buffer_and_limit_pass_the_ordering_through() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        let buffer = BufferExec::new(ordered_partitions(), 1024);
+        assert_eq!(
+            pass_through_ordering(&buffer, &ordering),
+            Some(ordering.clone())
+        );
+
+        let limit = LocalLimitExec::new(ordered_partitions(), 5);
+        assert_eq!(pass_through_ordering(&limit, &ordering), Some(ordering));
+    }
+
+    /// A column the projection computes is not the one the scan arranged its
+    /// files on, whatever it is called.
+    #[test]
+    fn computed_projection_column_is_not_carried() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        let t_plus_zero: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("t", 0)),
+            Operator::Plus,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
+        ));
+        let projection =
+            ProjectionExec::try_new(vec![(t_plus_zero, "t".to_string())], ordered_partitions())
+                .unwrap();
+
+        assert_eq!(pass_through_ordering(&projection, &ordering), None);
+    }
+
+    /// An order-preserving repartition keeps each output partition ordered,
+    /// and here keeps the partition count too, so the order-maintenance flag
+    /// and the count alone would let it through. It deals rows between the
+    /// partitions, and the hash scheme it declares is what keeps it out.
+    #[test]
+    fn order_preserving_repartition_is_not_seen_through() {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        let input = StatsExec::declaring(
+            vec![
+                partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+                partition(vec![exact_i64(101, 200, 0), exact_i64(11, 20, 0)]),
+            ],
+            Some(ordering.clone()),
+        );
+        let repartition = RepartitionExec::try_new(
+            input,
+            Partitioning::Hash(vec![Arc::new(Column::new("id", 1))], 2),
+        )
+        .unwrap()
+        .with_preserve_order();
+        assert!(repartition.maintains_input_order()[0]);
+        assert_eq!(repartition.properties().partitioning.partition_count(), 2);
+
+        assert_eq!(pass_through_ordering(&repartition, &ordering), None);
     }
 
     /// A parquet scan over one file, order-sensitive or not.

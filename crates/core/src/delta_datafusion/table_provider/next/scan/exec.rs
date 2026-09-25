@@ -49,6 +49,7 @@ use futures::stream::{Stream, StreamExt};
 use indexmap::IndexMap;
 use object_store::path::Path as ObjectStorePath;
 
+use super::OverlapPolicy;
 use super::plan::KernelScanPlan;
 use crate::delta_datafusion::file_id::file_id_field;
 use crate::kernel::ARROW_HANDLER;
@@ -124,35 +125,40 @@ fn derive_output_orderings(
     scan_plan: &KernelScanPlan,
     input: &Arc<dyn ExecutionPlan>,
 ) -> Vec<LexOrdering> {
-    let output_schema = &scan_plan.contract.output_schema;
-    let mut orderings = Vec::new();
-    for ordering in input
+    input
         .properties()
         .equivalence_properties()
         .oeq_class()
         .iter()
-    {
-        let mut mapped = Vec::new();
-        for sort_expr in ordering.iter() {
-            let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
-                break;
-            };
-            let Some(logical_name) = input_to_logical_column_name(scan_plan, column.name()) else {
-                break;
-            };
-            let Ok(index) = output_schema.index_of(&logical_name) else {
-                break;
-            };
-            mapped.push(PhysicalSortExpr::new(
-                Arc::new(Column::new(&logical_name, index)),
-                sort_expr.options,
-            ));
-        }
-        if let Some(ordering) = LexOrdering::new(mapped) {
-            orderings.push(ordering);
-        }
+        .filter_map(|ordering| map_ordering_to_output(scan_plan, ordering))
+        .collect()
+}
+
+/// Rewrite an ordering over the input's physical columns as one over this
+/// exec's logical output schema, truncating at the first sort column that does
+/// not survive into the output. Returns `None` when nothing survives.
+fn map_ordering_to_output(
+    scan_plan: &KernelScanPlan,
+    ordering: &LexOrdering,
+) -> Option<LexOrdering> {
+    let output_schema = &scan_plan.contract.output_schema;
+    let mut mapped = Vec::new();
+    for sort_expr in ordering.iter() {
+        let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
+            break;
+        };
+        let Some(logical_name) = input_to_logical_column_name(scan_plan, column.name()) else {
+            break;
+        };
+        let Ok(index) = output_schema.index_of(&logical_name) else {
+            break;
+        };
+        mapped.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(&logical_name, index)),
+            sort_expr.options,
+        ));
     }
-    orderings
+    LexOrdering::new(mapped)
 }
 
 /// Whether `stat` describes a column holding exactly one non-null value:
@@ -199,9 +205,41 @@ fn file_group_extents(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<FileExten
 
 /// Whether `new` reads exactly the file groups `old` did, in the same order.
 ///
-/// Required for a [`PushedSort`] to remain compatible when the input changes.
+/// Required for a [`PushedSort`] to remain compatible when the input changes:
+/// it publishes statistics per execution partition, so the partitions have to
+/// be the very ones it was computed against.
 fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
     match (file_group_extents(old), file_group_extents(new)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
+}
+
+/// What a plan reads, flattened across its groups in partition order, with
+/// pieces of one file that sit back to back merged into the range they cover
+/// together.
+///
+/// This is the row sequence the plan hands on when its partitions are read in
+/// index order, with the partition boundaries deliberately dropped: two plans
+/// agreeing here read the same rows in the same order and differ only in
+/// where they cut.
+fn coalesced_extents(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<FileExtent<'_>>> {
+    let mut merged: Vec<FileExtent<'_>> = Vec::new();
+    for (path, (start, end)) in file_group_extents(plan)?.into_iter().flatten() {
+        match merged.last_mut() {
+            Some((last_path, (_, last_end))) if *last_path == path && *last_end == start => {
+                *last_end = end;
+            }
+            _ => merged.push((path, (start, end))),
+        }
+    }
+    Some(merged)
+}
+
+/// Whether `new` reads the same rows as `old` in the same order, independent
+/// of how partitions are cut.
+fn grouping_retains_row_order(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
+    match (coalesced_extents(old), coalesced_extents(new)) {
         (Some(old), Some(new)) => old == new,
         _ => false,
     }
@@ -293,6 +331,20 @@ pub struct DeltaScanExec {
     /// Result of a successful sort pushdown, or `None` without one. Valid only
     /// for the file grouping it was computed against.
     pushed: Option<Arc<PushedSort>>,
+    /// Whether the table asserts that its files never overlap on the file sort
+    /// order (`DeltaScanConfig::assume_no_overlap_on_sort`) or leaves that to
+    /// be proven from their statistics.
+    overlap: OverlapPolicy,
+    /// Ordering over the logical output schema that this exec's execution
+    /// partitions follow *by assumption*, set when the input's file groups were
+    /// arranged under [`OverlapPolicy::Assume`] instead of being proven
+    /// non-overlapping.
+    ///
+    /// DataFusion validates a file scan's declared ordering against per-group
+    /// min/max statistics and drops it for any group of several files that
+    /// cannot be proven sorted - which is exactly the case the assumption
+    /// exists to cover - so this exec re-declares it.
+    assumed_ordering: Option<LexOrdering>,
     /// Whether any scanned file carries a deletion vector
     has_selection_vectors: bool,
 }
@@ -343,7 +395,7 @@ impl DeltaScanExec {
             .contract
             .retain_file_id
             .then(|| scan_plan.contract.file_id_field.name().to_owned());
-        let properties = Self::build_properties(&scan_plan, &input, None);
+        let properties = Self::build_properties(&scan_plan, &input, None, None);
         let has_selection_vectors = !selection_vectors.is_empty();
         Self {
             scan_plan,
@@ -357,14 +409,66 @@ impl DeltaScanExec {
             properties,
             file_sort_order: None,
             pushed: None,
+            overlap: OverlapPolicy::Prove,
+            assumed_ordering: None,
             has_selection_vectors,
         }
     }
 
     /// Declare the resolved per-file sort order (over the parquet read schema).
+    ///
+    /// This is the table's full declaration, kept for
+    /// [`Self::try_pushdown_sort`], which discards the current file grouping and
+    /// builds its own. It is deliberately not narrowed the way
+    /// [`Self::with_no_overlap_assumption`] narrows its argument.
     pub(crate) fn with_file_sort_order(mut self, file_sort_order: Option<LexOrdering>) -> Self {
         self.file_sort_order = file_sort_order;
         self
+    }
+
+    /// Record the table's no-overlap assertion and the arrangement it produced.
+    ///
+    /// `overlap` is the table's declaration, which holds whatever became of the
+    /// current file grouping: [`Self::try_pushdown_sort`] regroups from scratch
+    /// and may use the assertion even when this grouping could not.
+    ///
+    /// `arrangement` is the ordering (over the parquet read schema) the input's
+    /// file groups were *actually* arranged under - absent when the assertion
+    /// could not be applied, and narrowed to the null-free prefix the groups
+    /// really uphold. Declaring it is what recovers the ordering DataFusion
+    /// drops.
+    pub(super) fn with_no_overlap_assumption(
+        mut self,
+        overlap: OverlapPolicy,
+        arrangement: Option<LexOrdering>,
+    ) -> Self {
+        self.overlap = overlap;
+        self.assumed_ordering = arrangement
+            .as_ref()
+            .and_then(|ordering| map_ordering_to_output(&self.scan_plan, ordering));
+        self.properties = Self::build_properties(
+            &self.scan_plan,
+            &self.input,
+            None,
+            self.assumed_ordering.as_ref(),
+        );
+        self
+    }
+
+    /// The ordering on which this exec's execution partitions are known to be
+    /// mutually disjoint and arranged in range order other than through the
+    /// statistics they publish, or `None` when no such claim is made.
+    ///
+    /// After a sort pushdown the regrouped file groups are disjoint and ordered
+    /// on the pushed ordering by construction, under either overlap policy:
+    /// group boundaries fall on partition-prefix key changes or on cuts within
+    /// one already-ordered bucket. Without one, the claim is the table's
+    /// assertion, when the file groups could be arranged on it.
+    pub(crate) fn disjoint_ordering(&self) -> Option<&LexOrdering> {
+        match &self.pushed {
+            Some(pushed) => Some(&pushed.ordering),
+            None => self.assumed_ordering.as_ref(),
+        }
     }
 
     /// Build [`PlanProperties`], optionally advertising a pushed-down output
@@ -373,10 +477,14 @@ impl DeltaScanExec {
         scan_plan: &KernelScanPlan,
         input: &Arc<dyn ExecutionPlan>,
         pushed: Option<&PushedSort>,
+        assumed_ordering: Option<&LexOrdering>,
     ) -> Arc<PlanProperties> {
         let mut orderings = Vec::new();
         if let Some(pushed) = pushed {
             orderings.push(pushed.ordering.clone());
+        }
+        if let Some(assumed) = assumed_ordering {
+            orderings.push(assumed.clone());
         }
         orderings.extend(derive_output_orderings(scan_plan, input));
         Arc::new(PlanProperties::new(
@@ -434,13 +542,14 @@ impl DeltaScanExec {
         Ok(self
             .input
             .try_pushdown_sort(&child_order)?
-            .map(|inner| self.with_input(inner, None)))
+            .map(|inner| self.with_input(inner, None, None)))
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        let same_input = Arc::ptr_eq(&self.input, &input);
         if let Some(pushed) = &self.pushed
-            && !Arc::ptr_eq(&self.input, &input)
+            && !same_input
             && !grouping_is_unchanged(&self.input, &input)
         {
             // The file grouping used for sort-pushdown is no longer valid, so the removal
@@ -454,21 +563,46 @@ impl DeltaScanExec {
                 pushed.ordering
             );
         }
-        Ok(self.with_input(input, self.pushed.clone()))
+        // The assumed arrangement rides on the order the rows come out in, not
+        // on where the partition boundaries fall, so it survives a replacement
+        // that re-cuts the same ordered stream.
+        //
+        // Withdrawing rather than failing, as the pushed sort does, because
+        // this claim is advertised to rules that have not committed to it yet:
+        // it is set at plan construction and DataFusion rebuilds the parquet
+        // scan underneath during `EnforceDistribution`, well before any sort
+        // is removed on its strength. Failing there would refuse plans that
+        // are merely losing an optimization.
+        //
+        // A pushed sort that got this far has already shown the grouping to
+        // be unchanged, which retains the row order too.
+        let assumed = self.assumed_ordering.clone().filter(|_| {
+            same_input || self.pushed.is_some() || grouping_retains_row_order(&self.input, &input)
+        });
+        Ok(self.with_input(input, self.pushed.clone(), assumed))
     }
 
     /// Rebuild this exec around `input`, claiming `pushed` as the sort its
-    /// file grouping serves, and recompute the plan properties from both.
+    /// file grouping serves and `assumed_ordering` as the arrangement its file
+    /// groups were given on trust, and recompute the plan properties from all
+    /// three.
     fn with_input(
         &self,
         input: Arc<dyn ExecutionPlan>,
         pushed: Option<Arc<PushedSort>>,
+        assumed_ordering: Option<LexOrdering>,
     ) -> Arc<dyn ExecutionPlan> {
-        let properties = Self::build_properties(&self.scan_plan, &input, pushed.as_deref());
+        let properties = Self::build_properties(
+            &self.scan_plan,
+            &input,
+            pushed.as_deref(),
+            assumed_ordering.as_ref(),
+        );
         Arc::new(Self {
             input,
             properties,
             pushed,
+            assumed_ordering,
             ..self.clone()
         })
     }
@@ -652,6 +786,18 @@ impl ExecutionPlan for DeltaScanExec {
             return Ok(None);
         }
 
+        if self.assumed_ordering.is_some() {
+            // Repartitioning would interleave files and invalidate an
+            // assumed order.
+            //
+            // Refusing here does not on its own keep the files whole: the
+            // same request reaches the parquet scan directly from
+            // `EnforceDistribution`, which this cannot intercept.
+            // If that partitions files, `with_new_input` verifies whether
+            // the assumed ordering is still valid.
+            return Ok(None);
+        }
+
         if let Some(input) = self.input.repartitioned(target_partitions, config)? {
             // Rebuild the cached properties: the new input's partitioning can
             // differ from the one this exec was built around.
@@ -822,6 +968,7 @@ impl ExecutionPlan for DeltaScanExec {
             &self.scan_plan.parquet_read_schema,
             &files,
             target_groups,
+            self.overlap,
         )?
         else {
             return unsupported();
@@ -868,7 +1015,9 @@ impl ExecutionPlan for DeltaScanExec {
             per_partition_stats: plan.per_partition_stats,
         });
         Ok(SortOrderPushdownResult::Exact {
-            inner: self.with_input(new_input, Some(pushed)),
+            // The regrouped input supersedes any no-overlap arrangement of the
+            // original file groups; the pushed ordering describes it instead.
+            inner: self.with_input(new_input, Some(pushed), None),
         })
     }
 
