@@ -154,6 +154,9 @@ fn matches_datatype(dtype_to_check: &DataType, dtype: &DataType) -> bool {
         DataType::Struct(inner) => inner
             .fields()
             .any(|f| matches_datatype(f.data_type(), dtype)),
+        DataType::Map(inner) => {
+            matches_datatype(inner.key_type(), dtype) || matches_datatype(inner.value_type(), dtype)
+        }
         _ => false,
     }
 }
@@ -195,6 +198,21 @@ pub(crate) fn contains_variant<'a>(mut fields: impl Iterator<Item = &'a StructFi
 /// checks if table contains float16 in any field including nested fields.
 pub fn contains_float16<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
     fields.any(|f| matches_datatype(f.data_type(), &DataType::FLOAT16))
+}
+
+#[cfg(feature = "unsigned-integers")]
+/// checks if table contains unsigned integers in any field including nested fields.
+pub fn contains_unsigned_integers<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
+    fields.any(|f| {
+        [
+            DataType::UINT8,
+            DataType::UINT16,
+            DataType::UINT32,
+            DataType::UINT64,
+        ]
+        .iter()
+        .any(|dt| matches_datatype(f.data_type(), dt))
+    })
 }
 
 /// Extension trait for delta-kernel Protocol action.
@@ -469,6 +487,11 @@ impl ProtocolInner {
             self = self.enable_float16();
         }
 
+        #[cfg(feature = "unsigned-integers")]
+        if self.contains_unsigned_integers(schema.fields()) {
+            self = self.enable_unsigned_integers();
+        }
+
         if !generated_cols.is_empty() {
             self = self.enable_generated_columns()
         }
@@ -662,6 +685,23 @@ impl ProtocolInner {
         self
     }
 
+    #[cfg(feature = "unsigned-integers")]
+    /// checks if table contains unsigned integers in any field including nested fields.
+    fn contains_unsigned_integers<'a>(
+        &self,
+        fields: impl Iterator<Item = &'a StructField>,
+    ) -> bool {
+        contains_unsigned_integers(fields)
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    /// Enable unsigned integer types in the protocol
+    fn enable_unsigned_integers(mut self) -> Self {
+        self = self.append_reader_features([TableFeature::UnsignedIntegerTypes]);
+        self = self.append_writer_features([TableFeature::UnsignedIntegerTypes]);
+        self
+    }
+
     /// Enabled generated columns
     fn enable_generated_columns(mut self) -> Self {
         if self.min_writer_version < 4 {
@@ -699,6 +739,10 @@ pub enum TableFeatures {
     TimestampNanos,
     #[cfg(feature = "float16")]
     Float16,
+    #[cfg(feature = "unsigned-integers")]
+    #[serde(rename = "unsignedIntegerTypes-dev")]
+    /// Unsigned integer types (in development)
+    UnsignedIntegerTypes,
     /// version 2 of checkpointing
     V2Checkpoint,
     /// Append Only Tables
@@ -740,6 +784,8 @@ impl FromStr for TableFeatures {
             "timestampNanos" => Ok(TableFeatures::TimestampNanos),
             #[cfg(feature = "float16")]
             "float16" => Ok(TableFeatures::Float16),
+            #[cfg(feature = "unsigned-integers")]
+            "unsignedIntegerTypes-dev" => Ok(TableFeatures::UnsignedIntegerTypes),
             "v2Checkpoint" => Ok(TableFeatures::V2Checkpoint),
             "appendOnly" => Ok(TableFeatures::AppendOnly),
             "invariants" => Ok(TableFeatures::Invariants),
@@ -769,6 +815,8 @@ impl AsRef<str> for TableFeatures {
             TableFeatures::TimestampNanos => "timestampNanos",
             #[cfg(feature = "float16")]
             TableFeatures::Float16 => "float16",
+            #[cfg(feature = "unsigned-integers")]
+            TableFeatures::UnsignedIntegerTypes => "unsignedIntegerTypes-dev",
             TableFeatures::V2Checkpoint => "v2Checkpoint",
             TableFeatures::AppendOnly => "appendOnly",
             TableFeatures::Invariants => "invariants",
@@ -845,6 +893,8 @@ impl TableFeatures {
                     TableFeature::TimestampNanos => (Some(feature.clone()), Some(feature)),
                     #[cfg(feature = "float16")]
                     TableFeature::Float16 => (Some(feature.clone()), Some(feature)),
+                    #[cfg(feature = "unsigned-integers")]
+                    TableFeature::UnsignedIntegerTypes => (Some(feature.clone()), Some(feature)),
 
                     // Unknown features
                     TableFeature::Unknown(_) => (None, None),
@@ -1316,6 +1366,87 @@ pub(crate) mod serde_path {
 mod tests {
     use super::*;
     use crate::kernel::PrimitiveType;
+
+    #[test]
+    fn test_contains_timestampntz_nested() {
+        use delta_kernel::schema::{ArrayType, MapType};
+
+        let fields = [
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable(
+                "map",
+                MapType::new(DataType::STRING, DataType::TIMESTAMP_NTZ, true),
+            ),
+        ];
+        assert!(contains_timestampntz(fields.iter()));
+
+        let fields = [StructField::nullable(
+            "list",
+            ArrayType::new(
+                MapType::new(DataType::TIMESTAMP_NTZ, DataType::STRING, true).into(),
+                true,
+            ),
+        )];
+        assert!(contains_timestampntz(fields.iter()));
+
+        let fields = [StructField::nullable(
+            "map",
+            MapType::new(DataType::STRING, DataType::TIMESTAMP, true),
+        )];
+        assert!(!contains_timestampntz(fields.iter()));
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_contains_unsigned_integers() {
+        use delta_kernel::schema::{ArrayType, MapType};
+
+        for dt in [
+            DataType::UINT8,
+            DataType::UINT16,
+            DataType::UINT32,
+            DataType::UINT64,
+        ] {
+            let fields = [StructField::nullable("x", dt.clone())];
+            assert!(contains_unsigned_integers(fields.iter()));
+            let fields = [StructField::nullable(
+                "xs",
+                ArrayType::new(dt.clone(), true),
+            )];
+            assert!(contains_unsigned_integers(fields.iter()));
+            let fields = [StructField::nullable(
+                "m",
+                MapType::new(dt.clone(), DataType::STRING, true),
+            )];
+            assert!(contains_unsigned_integers(fields.iter()));
+            let fields = [StructField::nullable(
+                "s",
+                StructType::try_new([StructField::nullable("inner", dt)]).unwrap(),
+            )];
+            assert!(contains_unsigned_integers(fields.iter()));
+        }
+
+        let fields = [
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", ArrayType::new(DataType::BYTE, true)),
+        ];
+        assert!(!contains_unsigned_integers(fields.iter()));
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_unsigned_integer_table_feature_name() {
+        let feature = TableFeatures::from_str("unsignedIntegerTypes-dev").unwrap();
+        assert_eq!(feature, TableFeatures::UnsignedIntegerTypes);
+        assert_eq!(feature.as_ref(), "unsignedIntegerTypes-dev");
+        assert_eq!(
+            feature.to_reader_writer_features(),
+            (
+                Some(TableFeature::UnsignedIntegerTypes),
+                Some(TableFeature::UnsignedIntegerTypes)
+            )
+        );
+    }
 
     #[test]
     fn test_primitive() {

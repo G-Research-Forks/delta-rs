@@ -8,6 +8,8 @@ use super::{TableReference, TransactionError};
 use crate::kernel::contains_float16;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::kernel::contains_timestamp_nanos;
+#[cfg(feature = "unsigned-integers")]
+use crate::kernel::contains_unsigned_integers;
 use crate::kernel::{
     Action, EagerSnapshot, Protocol, ProtocolExt as _, Schema, contains_timestampntz,
     contains_variant,
@@ -203,6 +205,21 @@ impl ProtocolChecker {
         )
     }
 
+    #[cfg(feature = "unsigned-integers")]
+    /// Check can write unsigned integers
+    pub fn check_can_write_unsigned_integers(
+        &self,
+        snapshot: &EagerSnapshot,
+        schema: &Schema,
+    ) -> Result<(), TransactionError> {
+        trace!("checking to see if {snapshot:?} can write unsigned integers");
+        self.check_can_write_feature(
+            snapshot,
+            contains_unsigned_integers(schema.fields()),
+            TableFeature::UnsignedIntegerTypes,
+        )
+    }
+
     /// Check if delta-rs can read form the given delta table.
     pub fn can_read_from(&self, snapshot: &dyn TableReference) -> Result<(), TransactionError> {
         self.can_read_from_protocol(snapshot.protocol())
@@ -327,6 +344,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     }
     #[cfg(feature = "float16")]
     reader_features.insert(TableFeature::Float16);
+    #[cfg(feature = "unsigned-integers")]
+    reader_features.insert(TableFeature::UnsignedIntegerTypes);
 
     let mut writer_features = HashSet::new();
     writer_features.insert(TableFeature::AppendOnly);
@@ -337,6 +356,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::VariantTypePreview);
     #[cfg(feature = "float16")]
     writer_features.insert(TableFeature::Float16);
+    #[cfg(feature = "unsigned-integers")]
+    writer_features.insert(TableFeature::UnsignedIntegerTypes);
     #[cfg(feature = "datafusion")]
     {
         writer_features.insert(TableFeature::ChangeDataFeed);

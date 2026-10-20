@@ -237,6 +237,26 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
             Some(value) => Ok(Scalar::Long(*value)),
             None => Ok(Scalar::Null(DataType::LONG)),
         },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt8(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint8(*value)),
+            None => Ok(Scalar::Null(DataType::UINT8)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt16(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint16(*value)),
+            None => Ok(Scalar::Null(DataType::UINT16)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt32(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint32(*value)),
+            None => Ok(Scalar::Null(DataType::UINT32)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt64(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint64(*value)),
+            None => Ok(Scalar::Null(DataType::UINT64)),
+        },
         #[cfg(feature = "float16")]
         ScalarValue::Float16(maybe_value) => match maybe_value {
             Some(value) => Ok(Scalar::Float16(*value)),
@@ -681,6 +701,35 @@ mod tests {
                 assert_eq!(data.scale(), 2);
             }
             _ => panic!("Expected Decimal literal, got {:?}", delta_expr),
+        }
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_unsigned_integer_literal_expressions() {
+        let test_cases = vec![
+            (lit(u8::MAX), Scalar::Uint8(u8::MAX)),
+            (lit(u16::MAX), Scalar::Uint16(u16::MAX)),
+            (lit(u32::MAX), Scalar::Uint32(u32::MAX)),
+            (lit(u64::MAX), Scalar::Uint64(u64::MAX)),
+            (lit(ScalarValue::UInt8(None)), Scalar::Null(DataType::UINT8)),
+            (
+                lit(ScalarValue::UInt16(None)),
+                Scalar::Null(DataType::UINT16),
+            ),
+            (
+                lit(ScalarValue::UInt32(None)),
+                Scalar::Null(DataType::UINT32),
+            ),
+            (
+                lit(ScalarValue::UInt64(None)),
+                Scalar::Null(DataType::UINT64),
+            ),
+        ];
+
+        for (expr, expected) in test_cases {
+            let delta_expr = to_delta_expression(&expr).unwrap();
+            assert_eq!(delta_expr, Expression::Literal(expected));
         }
     }
 

@@ -2405,6 +2405,14 @@ fn scalar_to_py<'py>(value: &Scalar, py_date: &Bound<'py, PyAny>) -> PyResult<Bo
         Long(val) => val.into_py_any(py)?,
         #[cfg(feature = "float16")]
         Float16(val) => val.to_f64().into_py_any(py)?,
+        #[cfg(feature = "unsigned-integers")]
+        Uint8(val) => val.into_py_any(py)?,
+        #[cfg(feature = "unsigned-integers")]
+        Uint16(val) => val.into_py_any(py)?,
+        #[cfg(feature = "unsigned-integers")]
+        Uint32(val) => val.into_py_any(py)?,
+        #[cfg(feature = "unsigned-integers")]
+        Uint64(val) => val.into_py_any(py)?,
         Float(val) => val.into_py_any(py)?,
         Double(val) => val.into_py_any(py)?,
         Timestamp(_) => {
@@ -3207,6 +3215,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
         cfg!(feature = "nanosecond-timestamps"),
     )?;
     m.add("_FLOAT16", cfg!(feature = "float16"))?;
+    m.add("_UNSIGNED_INTEGERS", cfg!(feature = "unsigned-integers"))?;
 
     Ok(())
 }

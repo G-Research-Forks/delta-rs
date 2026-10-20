@@ -500,6 +500,46 @@ fn primitive_partition_values_to_array(
                 _ => None,
             },
         )?)) as ArrayRef,
+        #[cfg(feature = "unsigned-integers")]
+        PrimitiveType::Uint8 => Arc::new(UInt8Array::from_iter(typed_partition_values(
+            field_name,
+            expected_data_type,
+            values,
+            |value| match value {
+                Scalar::Uint8(value) => Some(*value),
+                _ => None,
+            },
+        )?)) as ArrayRef,
+        #[cfg(feature = "unsigned-integers")]
+        PrimitiveType::Uint16 => Arc::new(UInt16Array::from_iter(typed_partition_values(
+            field_name,
+            expected_data_type,
+            values,
+            |value| match value {
+                Scalar::Uint16(value) => Some(*value),
+                _ => None,
+            },
+        )?)) as ArrayRef,
+        #[cfg(feature = "unsigned-integers")]
+        PrimitiveType::Uint32 => Arc::new(UInt32Array::from_iter(typed_partition_values(
+            field_name,
+            expected_data_type,
+            values,
+            |value| match value {
+                Scalar::Uint32(value) => Some(*value),
+                _ => None,
+            },
+        )?)) as ArrayRef,
+        #[cfg(feature = "unsigned-integers")]
+        PrimitiveType::Uint64 => Arc::new(UInt64Array::from_iter(typed_partition_values(
+            field_name,
+            expected_data_type,
+            values,
+            |value| match value {
+                Scalar::Uint64(value) => Some(*value),
+                _ => None,
+            },
+        )?)) as ArrayRef,
         PrimitiveType::Float => Arc::new(Float32Array::from_iter(typed_partition_values(
             field_name,
             expected_data_type,
@@ -648,6 +688,14 @@ fn scalar_type_name(value: &Scalar) -> &'static str {
         Scalar::Long(_) => "Long",
         #[cfg(feature = "float16")]
         Scalar::Float16(_) => "Float16",
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint8(_) => "Uint8",
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint16(_) => "Uint16",
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint32(_) => "Uint32",
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint64(_) => "Uint64",
         Scalar::Float(_) => "Float",
         Scalar::Double(_) => "Double",
         Scalar::String(_) => "String",

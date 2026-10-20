@@ -264,6 +264,10 @@ enum StatsScalar {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
+    #[cfg(feature = "unsigned-integers")]
+    UInt32(u32),
+    #[cfg(feature = "unsigned-integers")]
+    UInt64(u64),
     #[cfg(feature = "float16")]
     Float16(f16),
     Float32(f32),
@@ -273,7 +277,10 @@ enum StatsScalar {
     TimestampNtz(chrono::NaiveDateTime),
     // We are serializing to f64 later and the ordering should be the same
     // Scale is stored to handle scale=0 serialization correctly
-    Decimal { value: f64, scale: i32 },
+    Decimal {
+        value: f64,
+        scale: i32,
+    },
     String(String),
     Bytes(Vec<u8>),
     Uuid(uuid::Uuid),
@@ -311,6 +318,15 @@ impl StatsScalar {
                     scale: *scale,
                 })
             }
+            // Unsigned integers are stored with a signed physical type but are ordered as
+            // unsigned values, so reinterpret the bits. 8 and 16 bit values are zero-extended.
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Statistics::Int32(v),
+                Some(LogicalType::Integer {
+                    is_signed: false, ..
+                }),
+            ) => Ok(Self::UInt32(get_stat!(v) as u32)),
             (Statistics::Int32(v), _) => Ok(Self::Int32(get_stat!(v))),
             // Int64 can be timestamp, decimal, or integer
             (
@@ -348,6 +364,13 @@ impl StatsScalar {
                     scale: *scale,
                 })
             }
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Statistics::Int64(v),
+                Some(LogicalType::Integer {
+                    is_signed: false, ..
+                }),
+            ) => Ok(Self::UInt64(get_stat!(v) as u64)),
             (Statistics::Int64(v), _) => Ok(Self::Int64(get_stat!(v))),
             (Statistics::Float(v), _) => Ok(Self::Float32(get_stat!(v))),
             (Statistics::Double(v), _) => Ok(Self::Float64(get_stat!(v))),
@@ -476,6 +499,10 @@ impl From<StatsScalar> for serde_json::Value {
             StatsScalar::Boolean(v) => serde_json::Value::Bool(v),
             StatsScalar::Int32(v) => serde_json::Value::from(v),
             StatsScalar::Int64(v) => serde_json::Value::from(v),
+            #[cfg(feature = "unsigned-integers")]
+            StatsScalar::UInt32(v) => serde_json::Value::from(v),
+            #[cfg(feature = "unsigned-integers")]
+            StatsScalar::UInt64(v) => serde_json::Value::from(v),
             #[cfg(feature = "float16")]
             StatsScalar::Float16(v) => serde_json::Value::from(v.to_f32()),
             StatsScalar::Float32(v) => serde_json::Value::from(v),
@@ -911,6 +938,67 @@ mod tests {
             let actual = serde_json::Value::from(scalar);
             assert_eq!(&actual, expected);
         }
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_stats_scalar_serialization_unsigned() {
+        let unsigned = |bit_width| {
+            Some(LogicalType::Integer {
+                bit_width,
+                is_signed: false,
+            })
+        };
+        let cases = &[
+            (
+                simple_parquet_stat!(Statistics::Int32, 255),
+                unsigned(8),
+                Value::from(255),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int32, 65535),
+                unsigned(16),
+                Value::from(65535),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int32, u32::MAX as i32),
+                unsigned(32),
+                Value::from(u32::MAX),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int64, u64::MAX as i64),
+                unsigned(64),
+                Value::from(u64::MAX),
+            ),
+        ];
+
+        for (stats, logical_type, expected) in cases {
+            let scalar = StatsScalar::try_from_stats(stats, logical_type.as_ref(), true).unwrap();
+            let actual = serde_json::Value::from(scalar);
+            assert_eq!(&actual, expected);
+        }
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_aggregated_stats_unsigned_ordering() {
+        // Values above the signed maximum must sort after smaller values
+        let logical_type = Some(LogicalType::Integer {
+            bit_width: 64,
+            is_signed: false,
+        });
+        let small = Statistics::Int64(ValueStatistics::new(Some(1), Some(2), None, Some(0), false));
+        let large = Statistics::Int64(ValueStatistics::new(
+            Some((u64::MAX - 1) as i64),
+            Some(u64::MAX as i64),
+            None,
+            Some(0),
+            false,
+        ));
+        let mut stats = AggregatedStats::from((&small, logical_type.as_ref()));
+        stats += AggregatedStats::from((&large, logical_type.as_ref()));
+        assert_eq!(stats.min, Some(StatsScalar::UInt64(1)));
+        assert_eq!(stats.max, Some(StatsScalar::UInt64(u64::MAX)));
     }
 
     #[tokio::test]

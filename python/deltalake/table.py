@@ -26,6 +26,7 @@ from arro3.core.types import (
 from deltalake._internal import (
     _FLOAT16,
     _NANOSECOND_TIMESTAMPS,
+    _UNSIGNED_INTEGERS,
     DeltaError,
     PyMergeBuilder,
     RawDeltaTable,
@@ -78,6 +79,9 @@ if _NANOSECOND_TIMESTAMPS:
 if _FLOAT16:
     SUPPORTED_WRITER_FEATURES.add("float16")
     SUPPORTED_READER_FEATURES.add("float16")
+if _UNSIGNED_INTEGERS:
+    SUPPORTED_WRITER_FEATURES.add("unsignedIntegerTypes-dev")
+    SUPPORTED_READER_FEATURES.add("unsignedIntegerTypes-dev")
 
 FilterLiteralType = tuple[str, str, Any]
 FilterConjunctionType = list[FilterLiteralType]

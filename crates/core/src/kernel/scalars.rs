@@ -75,6 +75,14 @@ impl ScalarExt for Scalar {
             Self::Long(l) => l.to_string(),
             #[cfg(feature = "float16")]
             Self::Float16(f) => f.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint8(u) => u.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint16(u) => u.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint32(u) => u.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint64(u) => u.to_string(),
             Self::Float(f) => f.to_string(),
             Self::Double(d) => d.to_string(),
             Self::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
@@ -198,22 +206,46 @@ impl ScalarExt for Scalar {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .map(|v| checked(v, index, Self::Long(v.value(index)))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt8 => arr
                 .as_any()
                 .downcast_ref::<UInt8Array>()
                 .map(|v| checked(v, index, Self::Byte(v.value(index) as i8))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt16 => arr
                 .as_any()
                 .downcast_ref::<UInt16Array>()
                 .map(|v| checked(v, index, Self::Short(v.value(index) as i16))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt32 => arr
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .map(|v| checked(v, index, Self::Integer(v.value(index) as i32))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt64 => arr
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .map(|v| checked(v, index, Self::Long(v.value(index) as i64))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt8 => arr
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .map(|v| checked(v, index, Self::Uint8(v.value(index)))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt16 => arr
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .map(|v| checked(v, index, Self::Uint16(v.value(index)))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt32 => arr
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .map(|v| checked(v, index, Self::Uint32(v.value(index)))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt64 => arr
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .map(|v| checked(v, index, Self::Uint64(v.value(index)))),
             #[cfg(feature = "float16")]
             Float16 => arr
                 .as_any()
@@ -340,6 +372,14 @@ impl ScalarExt for Scalar {
             Self::Long(l) => Value::Number(serde_json::Number::from(*l)),
             #[cfg(feature = "float16")]
             Self::Float16(f) => Value::Number(serde_json::Number::from_f64(f.to_f64()).unwrap()),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint8(u) => Value::Number(serde_json::Number::from(*u)),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint16(u) => Value::Number(serde_json::Number::from(*u)),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint32(u) => Value::Number(serde_json::Number::from(*u)),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint64(u) => Value::Number(serde_json::Number::from(*u)),
             Self::Float(f) => Value::Number(serde_json::Number::from_f64(*f as f64).unwrap()),
             Self::Double(d) => Value::Number(serde_json::Number::from_f64(*d).unwrap()),
             Self::Boolean(b) => Value::Bool(*b),
@@ -478,6 +518,13 @@ mod tests {
         assert_eq!(Scalar::Long(123456789).serialize(), "123456789");
         #[cfg(feature = "float16")]
         assert_eq!(Scalar::Float16(f16::from_f32(1.5)).serialize(), "1.5");
+        #[cfg(feature = "unsigned-integers")]
+        {
+            assert_eq!(Scalar::Uint8(u8::MAX).serialize(), "255");
+            assert_eq!(Scalar::Uint16(u16::MAX).serialize(), "65535");
+            assert_eq!(Scalar::Uint32(u32::MAX).serialize(), "4294967295");
+            assert_eq!(Scalar::Uint64(u64::MAX).serialize(), "18446744073709551615");
+        }
         assert_eq!(Scalar::Float(3.14).serialize(), "3.14");
         assert_eq!(Scalar::Double(2.71828).serialize(), "2.71828");
     }
@@ -822,6 +869,7 @@ mod tests {
         assert!(result.is_null());
     }
 
+    #[cfg(not(feature = "unsigned-integers"))]
     #[test]
     fn test_scalar_from_array_unsigned_integers() {
         // Test UInt8
@@ -843,6 +891,42 @@ mod tests {
         let uint64_array = UInt64Array::from(vec![Some(42_u64), None]);
         let scalar = Scalar::from_array(&uint64_array, 0).unwrap();
         assert_eq!(scalar, Scalar::Long(42));
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_scalar_from_array_unsigned_integers() {
+        let uint8_array = UInt8Array::from(vec![Some(u8::MAX), None]);
+        let scalar = Scalar::from_array(&uint8_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint8(u8::MAX));
+
+        let uint16_array = UInt16Array::from(vec![Some(u16::MAX), None]);
+        let scalar = Scalar::from_array(&uint16_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint16(u16::MAX));
+
+        let uint32_array = UInt32Array::from(vec![Some(u32::MAX), None]);
+        let scalar = Scalar::from_array(&uint32_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint32(u32::MAX));
+
+        let uint64_array = UInt64Array::from(vec![Some(u64::MAX), None]);
+        let scalar = Scalar::from_array(&uint64_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint64(u64::MAX));
+        assert!(Scalar::from_array(&uint64_array, 1).unwrap().is_null());
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_scalar_to_json_unsigned_integers() {
+        assert_eq!(Scalar::Uint8(u8::MAX).to_json(), serde_json::json!(255));
+        assert_eq!(Scalar::Uint16(u16::MAX).to_json(), serde_json::json!(65535));
+        assert_eq!(
+            Scalar::Uint32(u32::MAX).to_json(),
+            serde_json::json!(u32::MAX)
+        );
+        assert_eq!(
+            Scalar::Uint64(u64::MAX).to_json(),
+            serde_json::json!(u64::MAX)
+        );
     }
 
     #[test]
