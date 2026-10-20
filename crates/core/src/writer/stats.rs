@@ -212,6 +212,7 @@ fn stats_from_metadata(
             continue;
         }
 
+        let logical_type = stats_logical_type(column_descr.as_ref());
         let maybe_stats: Option<AggregatedStats> = row_group_metadata
             .iter()
             .flat_map(|g| {
@@ -226,7 +227,7 @@ fn stats_from_metadata(
                         );
                         None
                     } else {
-                        Some(AggregatedStats::from((s, column_descr.logical_type_ref())))
+                        Some(AggregatedStats::from((s, logical_type.as_ref())))
                     }
                 })
             })
@@ -253,6 +254,31 @@ fn stats_from_metadata(
         num_records: num_rows,
         null_count,
     })
+}
+
+/// Get the logical type used to interpret a column's statistics.
+///
+/// Older writers annotate unsigned integer columns with only a legacy converted type,
+/// so derive the equivalent logical type to ensure their statistics are read as unsigned.
+fn stats_logical_type(column_descr: &ColumnDescriptor) -> Option<LogicalType> {
+    #[cfg(feature = "unsigned-integers")]
+    if column_descr.logical_type_ref().is_none() {
+        use parquet::basic::ConvertedType;
+        let bit_width = match column_descr.converted_type() {
+            ConvertedType::UINT_8 => Some(8),
+            ConvertedType::UINT_16 => Some(16),
+            ConvertedType::UINT_32 => Some(32),
+            ConvertedType::UINT_64 => Some(64),
+            _ => None,
+        };
+        if let Some(bit_width) = bit_width {
+            return Some(LogicalType::Integer {
+                bit_width,
+                is_signed: false,
+            });
+        }
+    }
+    column_descr.logical_type_ref().cloned()
 }
 
 /// Logical scalars extracted from statistics. These are used to aggregate
@@ -999,6 +1025,75 @@ mod tests {
         stats += AggregatedStats::from((&large, logical_type.as_ref()));
         assert_eq!(stats.min, Some(StatsScalar::UInt64(1)));
         assert_eq!(stats.max, Some(StatsScalar::UInt64(u64::MAX)));
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_stats_unsigned_legacy_converted_type() {
+        use parquet::basic::{ConvertedType, Repetition};
+        use parquet::data_type::{Int32Type, Int64Type};
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as SchemaType;
+
+        // Older writers annotate unsigned columns with only the legacy converted type
+        let column = |name: &str, physical_type, converted_type| {
+            Arc::new(
+                SchemaType::primitive_type_builder(name, physical_type)
+                    .with_repetition(Repetition::REQUIRED)
+                    .with_converted_type(converted_type)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let schema = Arc::new(
+            SchemaType::group_type_builder("schema")
+                .with_fields(vec![
+                    column("u32", Type::INT32, ConvertedType::UINT_32),
+                    column("u64", Type::INT64, ConvertedType::UINT_64),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut buffer = Vec::new();
+        let mut writer =
+            SerializedFileWriter::new(&mut buffer, schema, Arc::new(Default::default())).unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        let mut column_writer = row_group.next_column().unwrap().unwrap();
+        column_writer
+            .typed::<Int32Type>()
+            .write_batch(&[1, u32::MAX as i32], None, None)
+            .unwrap();
+        column_writer.close().unwrap();
+        let mut column_writer = row_group.next_column().unwrap().unwrap();
+        column_writer
+            .typed::<Int64Type>()
+            .write_batch(&[1, u64::MAX as i64], None, None)
+            .unwrap();
+        column_writer.close().unwrap();
+        row_group.close().unwrap();
+        writer.close().unwrap();
+
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        let column_descr = reader.metadata().file_metadata().schema_descr().column(1);
+        assert_eq!(column_descr.logical_type_ref(), None);
+
+        let stats = stats_from_file_metadata(
+            &IndexMap::new(),
+            reader.metadata(),
+            DataSkippingNumIndexedCols::AllColumns,
+            &None::<Vec<String>>,
+        )
+        .unwrap();
+
+        let value = |values: &HashMap<String, ColumnValueStat>, name: &str| {
+            values[name].as_value().cloned().unwrap()
+        };
+        assert_eq!(value(&stats.min_values, "u32"), json!(1));
+        assert_eq!(value(&stats.max_values, "u32"), json!(u32::MAX));
+        assert_eq!(value(&stats.min_values, "u64"), json!(1));
+        assert_eq!(value(&stats.max_values, "u64"), json!(u64::MAX));
     }
 
     #[tokio::test]
