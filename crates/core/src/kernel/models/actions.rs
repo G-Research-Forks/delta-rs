@@ -148,14 +148,19 @@ impl MetadataExt for Metadata {
 
 /// Checks if a datatype matches another type, or any of its inner fields match.
 fn matches_datatype(dtype_to_check: &DataType, dtype: &DataType) -> bool {
+    any_datatype(dtype_to_check, &|to_check| to_check == dtype)
+}
+
+/// checks if a data type or any type nested within it satisfies a predicate.
+fn any_datatype(dtype_to_check: &DataType, predicate: &impl Fn(&DataType) -> bool) -> bool {
     match dtype_to_check {
-        to_check if dtype == to_check => true,
-        DataType::Array(inner) => matches_datatype(inner.element_type(), dtype),
+        to_check if predicate(to_check) => true,
+        DataType::Array(inner) => any_datatype(inner.element_type(), predicate),
         DataType::Struct(inner) => inner
             .fields()
-            .any(|f| matches_datatype(f.data_type(), dtype)),
+            .any(|f| any_datatype(f.data_type(), predicate)),
         DataType::Map(inner) => {
-            matches_datatype(inner.key_type(), dtype) || matches_datatype(inner.value_type(), dtype)
+            any_datatype(inner.key_type(), predicate) || any_datatype(inner.value_type(), predicate)
         }
         _ => false,
     }
@@ -203,15 +208,19 @@ pub fn contains_float16<'a>(mut fields: impl Iterator<Item = &'a StructField>) -
 #[cfg(feature = "unsigned-integers")]
 /// checks if table contains unsigned integers in any field including nested fields.
 pub fn contains_unsigned_integers<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
+    use delta_kernel::schema::PrimitiveType;
     fields.any(|f| {
-        [
-            DataType::UINT8,
-            DataType::UINT16,
-            DataType::UINT32,
-            DataType::UINT64,
-        ]
-        .iter()
-        .any(|dt| matches_datatype(f.data_type(), dt))
+        any_datatype(f.data_type(), &|dt| {
+            matches!(
+                dt,
+                DataType::Primitive(
+                    PrimitiveType::Uint8
+                        | PrimitiveType::Uint16
+                        | PrimitiveType::Uint32
+                        | PrimitiveType::Uint64
+                )
+            )
+        })
     })
 }
 
