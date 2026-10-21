@@ -22,3 +22,5 @@ mod nanosecond_timestamps;
 mod read_delta_log_test;
 mod read_delta_partitions_test;
 mod sort_order;
+#[cfg(feature = "unsigned-integers")]
+mod unsigned_integers;

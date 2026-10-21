@@ -485,6 +485,17 @@ fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
     #[cfg(feature = "float16")]
     let matches_f16 = matches!(data_type, &PrimitiveType::Float16);
 
+    #[cfg(not(feature = "unsigned-integers"))]
+    let matches_unsigned = false;
+    #[cfg(feature = "unsigned-integers")]
+    let matches_unsigned = matches!(
+        data_type,
+        &PrimitiveType::Uint8
+            | &PrimitiveType::Uint16
+            | &PrimitiveType::Uint32
+            | &PrimitiveType::Uint64
+    );
+
     matches!(
         data_type,
         &PrimitiveType::Byte
@@ -502,6 +513,7 @@ fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
             | PrimitiveType::Decimal(_)
     ) || matches_nanos
         || matches_f16
+        || matches_unsigned
 }
 
 pub(crate) fn rb_from_scan_meta(metadata: ScanMetadata) -> DeltaResult<RecordBatch> {

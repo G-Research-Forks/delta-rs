@@ -130,6 +130,9 @@ delta-cache = ["foyer", "tempfile", "url/serde"]
 # Experimental support for nanosecond timestamps primitive type
 nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]
 
+# Experimental support for unsigned integer primitive types
+unsigned-integers = ["delta_kernel/unsigned-integers"]
+
 integration_test = []
 
 # All integration tests are consolidated into two test binaries to keep

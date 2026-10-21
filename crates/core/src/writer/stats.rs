@@ -212,6 +212,7 @@ fn stats_from_metadata(
             continue;
         }
 
+        let logical_type = stats_logical_type(column_descr.as_ref());
         let maybe_stats: Option<AggregatedStats> = row_group_metadata
             .iter()
             .flat_map(|g| {
@@ -226,7 +227,7 @@ fn stats_from_metadata(
                         );
                         None
                     } else {
-                        Some(AggregatedStats::from((s, column_descr.logical_type_ref())))
+                        Some(AggregatedStats::from((s, logical_type.as_ref())))
                     }
                 })
             })
@@ -255,6 +256,31 @@ fn stats_from_metadata(
     })
 }
 
+/// Get the logical type used to interpret a column's statistics.
+///
+/// Older writers annotate unsigned integer columns with only a legacy converted type,
+/// so derive the equivalent logical type to ensure their statistics are read as unsigned.
+fn stats_logical_type(column_descr: &ColumnDescriptor) -> Option<LogicalType> {
+    #[cfg(feature = "unsigned-integers")]
+    if column_descr.logical_type_ref().is_none() {
+        use parquet::basic::ConvertedType;
+        let bit_width = match column_descr.converted_type() {
+            ConvertedType::UINT_8 => Some(8),
+            ConvertedType::UINT_16 => Some(16),
+            ConvertedType::UINT_32 => Some(32),
+            ConvertedType::UINT_64 => Some(64),
+            _ => None,
+        };
+        if let Some(bit_width) = bit_width {
+            return Some(LogicalType::Integer {
+                bit_width,
+                is_signed: false,
+            });
+        }
+    }
+    column_descr.logical_type_ref().cloned()
+}
+
 /// Logical scalars extracted from statistics. These are used to aggregate
 /// minimums and maximums. We can't use the physical scalars because they
 /// are not ordered correctly for some types. For example, decimals are stored
@@ -264,6 +290,10 @@ enum StatsScalar {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
+    #[cfg(feature = "unsigned-integers")]
+    UInt32(u32),
+    #[cfg(feature = "unsigned-integers")]
+    UInt64(u64),
     #[cfg(feature = "float16")]
     Float16(f16),
     Float32(f32),
@@ -273,7 +303,10 @@ enum StatsScalar {
     TimestampNtz(chrono::NaiveDateTime),
     // We are serializing to f64 later and the ordering should be the same
     // Scale is stored to handle scale=0 serialization correctly
-    Decimal { value: f64, scale: i32 },
+    Decimal {
+        value: f64,
+        scale: i32,
+    },
     String(String),
     Bytes(Vec<u8>),
     Uuid(uuid::Uuid),
@@ -311,6 +344,15 @@ impl StatsScalar {
                     scale: *scale,
                 })
             }
+            // Unsigned integers are stored with a signed physical type but are ordered as
+            // unsigned values, so reinterpret the bits. 8 and 16 bit values are zero-extended.
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Statistics::Int32(v),
+                Some(LogicalType::Integer {
+                    is_signed: false, ..
+                }),
+            ) => Ok(Self::UInt32(get_stat!(v) as u32)),
             (Statistics::Int32(v), _) => Ok(Self::Int32(get_stat!(v))),
             // Int64 can be timestamp, decimal, or integer
             (
@@ -348,6 +390,13 @@ impl StatsScalar {
                     scale: *scale,
                 })
             }
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Statistics::Int64(v),
+                Some(LogicalType::Integer {
+                    is_signed: false, ..
+                }),
+            ) => Ok(Self::UInt64(get_stat!(v) as u64)),
             (Statistics::Int64(v), _) => Ok(Self::Int64(get_stat!(v))),
             (Statistics::Float(v), _) => Ok(Self::Float32(get_stat!(v))),
             (Statistics::Double(v), _) => Ok(Self::Float64(get_stat!(v))),
@@ -476,6 +525,10 @@ impl From<StatsScalar> for serde_json::Value {
             StatsScalar::Boolean(v) => serde_json::Value::Bool(v),
             StatsScalar::Int32(v) => serde_json::Value::from(v),
             StatsScalar::Int64(v) => serde_json::Value::from(v),
+            #[cfg(feature = "unsigned-integers")]
+            StatsScalar::UInt32(v) => serde_json::Value::from(v),
+            #[cfg(feature = "unsigned-integers")]
+            StatsScalar::UInt64(v) => serde_json::Value::from(v),
             #[cfg(feature = "float16")]
             StatsScalar::Float16(v) => serde_json::Value::from(v.to_f32()),
             StatsScalar::Float32(v) => serde_json::Value::from(v),
@@ -911,6 +964,136 @@ mod tests {
             let actual = serde_json::Value::from(scalar);
             assert_eq!(&actual, expected);
         }
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_stats_scalar_serialization_unsigned() {
+        let unsigned = |bit_width| {
+            Some(LogicalType::Integer {
+                bit_width,
+                is_signed: false,
+            })
+        };
+        let cases = &[
+            (
+                simple_parquet_stat!(Statistics::Int32, 255),
+                unsigned(8),
+                Value::from(255),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int32, 65535),
+                unsigned(16),
+                Value::from(65535),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int32, u32::MAX as i32),
+                unsigned(32),
+                Value::from(u32::MAX),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int64, u64::MAX as i64),
+                unsigned(64),
+                Value::from(u64::MAX),
+            ),
+        ];
+
+        for (stats, logical_type, expected) in cases {
+            let scalar = StatsScalar::try_from_stats(stats, logical_type.as_ref(), true).unwrap();
+            let actual = serde_json::Value::from(scalar);
+            assert_eq!(&actual, expected);
+        }
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_aggregated_stats_unsigned_ordering() {
+        // Values above the signed maximum must sort after smaller values
+        let logical_type = Some(LogicalType::Integer {
+            bit_width: 64,
+            is_signed: false,
+        });
+        let small = Statistics::Int64(ValueStatistics::new(Some(1), Some(2), None, Some(0), false));
+        let large = Statistics::Int64(ValueStatistics::new(
+            Some((u64::MAX - 1) as i64),
+            Some(u64::MAX as i64),
+            None,
+            Some(0),
+            false,
+        ));
+        let mut stats = AggregatedStats::from((&small, logical_type.as_ref()));
+        stats += AggregatedStats::from((&large, logical_type.as_ref()));
+        assert_eq!(stats.min, Some(StatsScalar::UInt64(1)));
+        assert_eq!(stats.max, Some(StatsScalar::UInt64(u64::MAX)));
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_stats_unsigned_legacy_converted_type() {
+        use parquet::basic::{ConvertedType, Repetition};
+        use parquet::data_type::{Int32Type, Int64Type};
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as SchemaType;
+
+        // Older writers annotate unsigned columns with only the legacy converted type
+        let column = |name: &str, physical_type, converted_type| {
+            Arc::new(
+                SchemaType::primitive_type_builder(name, physical_type)
+                    .with_repetition(Repetition::REQUIRED)
+                    .with_converted_type(converted_type)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let schema = Arc::new(
+            SchemaType::group_type_builder("schema")
+                .with_fields(vec![
+                    column("u32", Type::INT32, ConvertedType::UINT_32),
+                    column("u64", Type::INT64, ConvertedType::UINT_64),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut buffer = Vec::new();
+        let mut writer =
+            SerializedFileWriter::new(&mut buffer, schema, Arc::new(Default::default())).unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        let mut column_writer = row_group.next_column().unwrap().unwrap();
+        column_writer
+            .typed::<Int32Type>()
+            .write_batch(&[1, u32::MAX as i32], None, None)
+            .unwrap();
+        column_writer.close().unwrap();
+        let mut column_writer = row_group.next_column().unwrap().unwrap();
+        column_writer
+            .typed::<Int64Type>()
+            .write_batch(&[1, u64::MAX as i64], None, None)
+            .unwrap();
+        column_writer.close().unwrap();
+        row_group.close().unwrap();
+        writer.close().unwrap();
+
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        let column_descr = reader.metadata().file_metadata().schema_descr().column(1);
+        assert_eq!(column_descr.logical_type_ref(), None);
+
+        let stats = stats_from_file_metadata(
+            &IndexMap::new(),
+            reader.metadata(),
+            DataSkippingNumIndexedCols::AllColumns,
+            &None::<Vec<String>>,
+        )
+        .unwrap();
+
+        let value = |values: &HashMap<String, ColumnValueStat>, name: &str| {
+            values[name].as_value().cloned().unwrap()
+        };
+        assert_eq!(value(&stats.min_values, "u32"), json!(1));
+        assert_eq!(value(&stats.max_values, "u32"), json!(u32::MAX));
+        assert_eq!(value(&stats.min_values, "u64"), json!(1));
+        assert_eq!(value(&stats.max_values, "u64"), json!(u64::MAX));
     }
 
     #[tokio::test]

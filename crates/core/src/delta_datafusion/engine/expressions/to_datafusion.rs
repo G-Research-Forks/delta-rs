@@ -78,6 +78,14 @@ pub(crate) fn to_datafusion_scalar(scalar: &Scalar) -> DFResult<ScalarValue> {
         Scalar::Long(value) => ScalarValue::Int64(Some(*value)),
         #[cfg(feature = "float16")]
         Scalar::Float16(value) => ScalarValue::Float16(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint8(value) => ScalarValue::UInt8(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint16(value) => ScalarValue::UInt16(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint32(value) => ScalarValue::UInt32(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint64(value) => ScalarValue::UInt64(Some(*value)),
         Scalar::Float(value) => ScalarValue::Float32(Some(*value)),
         Scalar::Double(value) => ScalarValue::Float64(Some(*value)),
         Scalar::Timestamp(value) => {
@@ -267,6 +275,23 @@ mod tests {
             (Scalar::Double(42.0), ScalarValue::Float64(Some(42.0))),
             (Scalar::Byte(42), ScalarValue::Int8(Some(42))),
             (Scalar::Short(42), ScalarValue::Int16(Some(42))),
+            #[cfg(feature = "unsigned-integers")]
+            (Scalar::Uint8(u8::MAX), ScalarValue::UInt8(Some(u8::MAX))),
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Scalar::Uint16(u16::MAX),
+                ScalarValue::UInt16(Some(u16::MAX)),
+            ),
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Scalar::Uint32(u32::MAX),
+                ScalarValue::UInt32(Some(u32::MAX)),
+            ),
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Scalar::Uint64(u64::MAX),
+                ScalarValue::UInt64(Some(u64::MAX)),
+            ),
         ];
 
         for (input, expected) in test_cases {

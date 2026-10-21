@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 __version__: str
 _NANOSECOND_TIMESTAMPS: bool
 _FLOAT16: bool
+_UNSIGNED_INTEGERS: bool
 
 class TableFeatures(Enum):
     # Mapping of one column to another

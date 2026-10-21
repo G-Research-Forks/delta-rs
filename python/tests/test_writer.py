@@ -16,6 +16,7 @@ from deltalake import CommitProperties, DeltaTable, Transaction, write_deltalake
 from deltalake._internal import (
     _FLOAT16,
     _NANOSECOND_TIMESTAMPS,
+    _UNSIGNED_INTEGERS,
     CommitFailedError,
     Field,
     PrimitiveType,
@@ -632,7 +633,8 @@ def test_roundtrip_metadata(tmp_path: pathlib.Path, sample_table: Table):
         "date32",
         "timestamp",
     ]
-    + (["float16"] if _FLOAT16 else []),
+    + (["float16"] if _FLOAT16 else [])
+    + (["uint64", "uint32", "uint16", "uint8"] if _UNSIGNED_INTEGERS else []),
 )
 def test_roundtrip_partitioned(
     tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Table", column: str
@@ -1036,6 +1038,10 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
     if _FLOAT16:
         expected_mins["float16"] = -0.0
 
+    if _UNSIGNED_INTEGERS:
+        for column in ["uint64", "uint32", "uint16", "uint8"]:
+            expected_mins[column] = 0
+
     assert stats["minValues"] == expected_mins
 
     expected_maxs = {
@@ -1060,6 +1066,10 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
 
     if _FLOAT16:
         expected_maxs["float16"] = 4.0
+
+    if _UNSIGNED_INTEGERS:
+        for column in ["uint64", "uint32", "uint16", "uint8"]:
+            expected_maxs[column] = 4
 
     assert stats["maxValues"] == expected_maxs
 
@@ -1809,6 +1819,18 @@ def test_uint_arrow_types(tmp_path: pathlib.Path):
     )
 
     write_deltalake(tmp_path, table)
+
+    dt = DeltaTable(tmp_path)
+    if _UNSIGNED_INTEGERS:
+        expected_types = ["uint8", "uint16", "uint32", "uint64"]
+        protocol = dt.protocol()
+        assert protocol.reader_features is not None
+        assert "unsignedIntegerTypes-dev" in protocol.reader_features
+        assert protocol.writer_features is not None
+        assert "unsignedIntegerTypes-dev" in protocol.writer_features
+    else:
+        expected_types = ["byte", "short", "integer", "long"]
+    assert [f.type.type for f in dt.schema().fields] == expected_types
 
 
 @pytest.mark.pyarrow

@@ -120,6 +120,82 @@ pub fn generate_random_array(
             );
             Ok(Arc::new(arr))
         }
+        #[cfg(feature = "unsigned-integers")]
+        Primitive(Uint8) => {
+            let min_val = min_val
+                .and_then(|min| Uint8.parse_scalar(&min).ok())
+                .unwrap_or(Scalar::Uint8(0));
+            let max_val = max_val
+                .and_then(|max| Uint8.parse_scalar(&max).ok())
+                .unwrap_or(Scalar::Uint8(10));
+            let between = match (min_val, max_val) {
+                (Scalar::Uint8(min), Scalar::Uint8(max)) => Uniform::try_from(min..=max)?,
+                _ => unreachable!(),
+            };
+            let arr = UInt8Array::from(
+                (0..length)
+                    .map(|_| between.sample(&mut rng))
+                    .collect::<Vec<_>>(),
+            );
+            Ok(Arc::new(arr))
+        }
+        #[cfg(feature = "unsigned-integers")]
+        Primitive(Uint16) => {
+            let min_val = min_val
+                .and_then(|min| Uint16.parse_scalar(&min).ok())
+                .unwrap_or(Scalar::Uint16(0));
+            let max_val = max_val
+                .and_then(|max| Uint16.parse_scalar(&max).ok())
+                .unwrap_or(Scalar::Uint16(10));
+            let between = match (min_val, max_val) {
+                (Scalar::Uint16(min), Scalar::Uint16(max)) => Uniform::try_from(min..=max)?,
+                _ => unreachable!(),
+            };
+            let arr = UInt16Array::from(
+                (0..length)
+                    .map(|_| between.sample(&mut rng))
+                    .collect::<Vec<_>>(),
+            );
+            Ok(Arc::new(arr))
+        }
+        #[cfg(feature = "unsigned-integers")]
+        Primitive(Uint32) => {
+            let min_val = min_val
+                .and_then(|min| Uint32.parse_scalar(&min).ok())
+                .unwrap_or(Scalar::Uint32(0));
+            let max_val = max_val
+                .and_then(|max| Uint32.parse_scalar(&max).ok())
+                .unwrap_or(Scalar::Uint32(10));
+            let between = match (min_val, max_val) {
+                (Scalar::Uint32(min), Scalar::Uint32(max)) => Uniform::try_from(min..=max)?,
+                _ => unreachable!(),
+            };
+            let arr = UInt32Array::from(
+                (0..length)
+                    .map(|_| between.sample(&mut rng))
+                    .collect::<Vec<_>>(),
+            );
+            Ok(Arc::new(arr))
+        }
+        #[cfg(feature = "unsigned-integers")]
+        Primitive(Uint64) => {
+            let min_val = min_val
+                .and_then(|min| Uint64.parse_scalar(&min).ok())
+                .unwrap_or(Scalar::Uint64(0));
+            let max_val = max_val
+                .and_then(|max| Uint64.parse_scalar(&max).ok())
+                .unwrap_or(Scalar::Uint64(10));
+            let between = match (min_val, max_val) {
+                (Scalar::Uint64(min), Scalar::Uint64(max)) => Uniform::try_from(min..=max)?,
+                _ => unreachable!(),
+            };
+            let arr = UInt64Array::from(
+                (0..length)
+                    .map(|_| between.sample(&mut rng))
+                    .collect::<Vec<_>>(),
+            );
+            Ok(Arc::new(arr))
+        }
         #[cfg(feature = "float16")]
         Primitive(Float16) => {
             let min_val = min_val
@@ -221,6 +297,38 @@ fn get_stats(batch: &RecordBatch) -> TestResult<FileStats> {
                 let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
                 let min = Scalar::Long(arrow_min(array).unwrap());
                 let max = Scalar::Long(arrow_max(array).unwrap());
+                let null_count = Scalar::Long(array.null_count() as i64);
+                Some((null_count, min, max))
+            }
+            #[cfg(feature = "unsigned-integers")]
+            UInt8 => {
+                let array = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+                let min = Scalar::Uint8(arrow_min(array).unwrap());
+                let max = Scalar::Uint8(arrow_max(array).unwrap());
+                let null_count = Scalar::Long(array.null_count() as i64);
+                Some((null_count, min, max))
+            }
+            #[cfg(feature = "unsigned-integers")]
+            UInt16 => {
+                let array = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+                let min = Scalar::Uint16(arrow_min(array).unwrap());
+                let max = Scalar::Uint16(arrow_max(array).unwrap());
+                let null_count = Scalar::Long(array.null_count() as i64);
+                Some((null_count, min, max))
+            }
+            #[cfg(feature = "unsigned-integers")]
+            UInt32 => {
+                let array = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+                let min = Scalar::Uint32(arrow_min(array).unwrap());
+                let max = Scalar::Uint32(arrow_max(array).unwrap());
+                let null_count = Scalar::Long(array.null_count() as i64);
+                Some((null_count, min, max))
+            }
+            #[cfg(feature = "unsigned-integers")]
+            UInt64 => {
+                let array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                let min = Scalar::Uint64(arrow_min(array).unwrap());
+                let max = Scalar::Uint64(arrow_max(array).unwrap());
                 let null_count = Scalar::Long(array.null_count() as i64);
                 Some((null_count, min, max))
             }

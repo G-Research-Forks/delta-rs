@@ -434,6 +434,8 @@ impl WriteBuilder {
                     PROTOCOL.check_can_write_variant(snapshot, &schema)?;
                     #[cfg(feature = "float16")]
                     PROTOCOL.check_can_write_float16(snapshot, &schema)?;
+                    #[cfg(feature = "unsigned-integers")]
+                    PROTOCOL.check_can_write_unsigned_integers(snapshot, &schema)?;
                 }
                 match self.mode {
                     SaveMode::ErrorIfExists => {
@@ -3900,6 +3902,106 @@ mod tests {
         let result_field = schema.field_with_name("xs").unwrap();
         assert!(
             matches!(result_field.data_type(), DataType::List(inner) if inner.data_type() == &DataType::Float16)
+        );
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[tokio::test]
+    async fn test_write_unsigned_integers() {
+        use arrow::datatypes::UInt32Type;
+        use arrow_array::{ListArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
+        use delta_kernel::expressions::Scalar;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("u32s", DataType::new_list(DataType::UInt32, true), true),
+        ]));
+        // Include values above the signed maximum to check they are not reinterpreted as negative
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(UInt8Array::from(vec![Some(0), Some(u8::MAX), None])),
+                Arc::new(UInt16Array::from(vec![Some(0), Some(u16::MAX), None])),
+                Arc::new(UInt32Array::from(vec![Some(1), Some(u32::MAX), None])),
+                Arc::new(UInt64Array::from(vec![Some(1), Some(u64::MAX), None])),
+                Arc::new(ListArray::from_iter_primitive::<UInt32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(u32::MAX)]),
+                    None,
+                    Some(vec![]),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::UnsignedIntegerTypes)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::UnsignedIntegerTypes)
+        );
+
+        let files: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .snapshot()
+            .file_views(&table.log_store(), None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let stat = |values: Option<Scalar>, name: &str| -> Scalar {
+            let Some(Scalar::Struct(data)) = values else {
+                panic!("expected struct stats, got {values:?}");
+            };
+            let index = data.fields().iter().position(|f| f.name() == name).unwrap();
+            data.values()[index].clone()
+        };
+        let min_values = files[0].min_values();
+        let max_values = files[0].max_values();
+        assert_eq!(stat(min_values.clone(), "u8"), Scalar::Uint8(0));
+        assert_eq!(stat(max_values.clone(), "u8"), Scalar::Uint8(u8::MAX));
+        assert_eq!(stat(min_values.clone(), "u16"), Scalar::Uint16(0));
+        assert_eq!(stat(max_values.clone(), "u16"), Scalar::Uint16(u16::MAX));
+        assert_eq!(stat(min_values.clone(), "u32"), Scalar::Uint32(1));
+        assert_eq!(stat(max_values.clone(), "u32"), Scalar::Uint32(u32::MAX));
+        assert_eq!(stat(min_values, "u64"), Scalar::Uint64(1));
+        assert_eq!(stat(max_values, "u64"), Scalar::Uint64(u64::MAX));
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let schema = batches[0].schema();
+        for (name, data_type) in [
+            ("u8", DataType::UInt8),
+            ("u16", DataType::UInt16),
+            ("u32", DataType::UInt32),
+            ("u64", DataType::UInt64),
+        ] {
+            assert_eq!(
+                schema.field_with_name(name).unwrap().data_type(),
+                &data_type
+            );
+        }
+        let list_field = schema.field_with_name("u32s").unwrap();
+        assert!(
+            matches!(list_field.data_type(), DataType::List(inner) if inner.data_type() == &DataType::UInt32)
         );
     }
 
