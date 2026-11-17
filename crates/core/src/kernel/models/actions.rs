@@ -206,7 +206,7 @@ pub fn contains_float16<'a>(mut fields: impl Iterator<Item = &'a StructField>) -
 }
 
 #[cfg(feature = "nanosecond-time")]
-/// checks if table contains time_nanos in any field including nested fields.
+/// checks if table contains `time(9)` in any field including nested fields.
 pub fn contains_time_nanos<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
     fields.any(|f| any_datatype(f.data_type(), &|dt| dt == &DataType::TIME_NANOS))
 }

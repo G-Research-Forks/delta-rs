@@ -223,13 +223,13 @@ impl ProtocolChecker {
     }
 
     #[cfg(feature = "nanosecond-time")]
-    /// Check can write time_nanos
+    /// Check can write `time(9)` columns
     pub fn check_can_write_time_nanos(
         &self,
         snapshot: &EagerSnapshot,
         schema: &Schema,
     ) -> Result<(), TransactionError> {
-        trace!("checking to see if {snapshot:?} can write time_nanos");
+        trace!("checking to see if {snapshot:?} can write time(9) columns");
         self.check_can_write_feature(
             snapshot,
             contains_time_nanos(schema.fields()),
