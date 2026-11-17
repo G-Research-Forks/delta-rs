@@ -6,6 +6,8 @@ use delta_kernel::table_features::TableFeature;
 use super::{TableReference, TransactionError};
 #[cfg(feature = "float16")]
 use crate::kernel::contains_float16;
+#[cfg(feature = "nanosecond-time")]
+use crate::kernel::contains_time_nanos;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::kernel::contains_timestamp_nanos;
 #[cfg(feature = "unsigned-integers")]
@@ -220,6 +222,21 @@ impl ProtocolChecker {
         )
     }
 
+    #[cfg(feature = "nanosecond-time")]
+    /// Check can write time_nanos
+    pub fn check_can_write_time_nanos(
+        &self,
+        snapshot: &EagerSnapshot,
+        schema: &Schema,
+    ) -> Result<(), TransactionError> {
+        trace!("checking to see if {snapshot:?} can write time_nanos");
+        self.check_can_write_feature(
+            snapshot,
+            contains_time_nanos(schema.fields()),
+            TableFeature::TimeNanos,
+        )
+    }
+
     /// Check if delta-rs can read form the given delta table.
     pub fn can_read_from(&self, snapshot: &dyn TableReference) -> Result<(), TransactionError> {
         self.can_read_from_protocol(snapshot.protocol())
@@ -346,6 +363,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::Float16);
     #[cfg(feature = "unsigned-integers")]
     reader_features.insert(TableFeature::UnsignedIntegerTypes);
+    #[cfg(feature = "nanosecond-time")]
+    reader_features.insert(TableFeature::TimeNanos);
 
     let mut writer_features = HashSet::new();
     writer_features.insert(TableFeature::AppendOnly);
@@ -358,6 +377,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::Float16);
     #[cfg(feature = "unsigned-integers")]
     writer_features.insert(TableFeature::UnsignedIntegerTypes);
+    #[cfg(feature = "nanosecond-time")]
+    writer_features.insert(TableFeature::TimeNanos);
     #[cfg(feature = "datafusion")]
     {
         writer_features.insert(TableFeature::ChangeDataFeed);

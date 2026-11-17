@@ -292,6 +292,11 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
             Some(value) => Ok(Scalar::Date(*value)),
             None => Ok(Scalar::Null(DataType::DATE)),
         },
+        #[cfg(feature = "nanosecond-time")]
+        ScalarValue::Time64Nanosecond(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::TimeNanos(*value)),
+            None => Ok(Scalar::Null(DataType::TIME_NANOS)),
+        },
         ScalarValue::Binary(maybe_value)
         | ScalarValue::LargeBinary(maybe_value)
         | ScalarValue::BinaryView(maybe_value)
@@ -701,6 +706,26 @@ mod tests {
                 assert_eq!(data.scale(), 2);
             }
             _ => panic!("Expected Decimal literal, got {:?}", delta_expr),
+        }
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_time_nanos_literal_expressions() {
+        let test_cases = vec![
+            (
+                lit(ScalarValue::Time64Nanosecond(Some(47_167_123_456_789))),
+                Scalar::TimeNanos(47_167_123_456_789),
+            ),
+            (
+                lit(ScalarValue::Time64Nanosecond(None)),
+                Scalar::Null(DataType::TIME_NANOS),
+            ),
+        ];
+
+        for (expr, expected) in test_cases {
+            let delta_expr = to_delta_expression(&expr).unwrap();
+            assert_eq!(delta_expr, Expression::Literal(expected));
         }
     }
 

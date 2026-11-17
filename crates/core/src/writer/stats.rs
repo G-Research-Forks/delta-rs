@@ -23,6 +23,8 @@ use parquet::{
 use tracing::warn;
 
 use super::*;
+#[cfg(feature = "nanosecond-time")]
+use crate::kernel::scalars::format_time_nanos;
 use crate::kernel::{Add, scalars::ScalarExt};
 use crate::protocol::{ColumnValueStat, Stats};
 
@@ -299,6 +301,8 @@ enum StatsScalar {
     Float32(f32),
     Float64(f64),
     Date(chrono::NaiveDate),
+    #[cfg(feature = "nanosecond-time")]
+    TimeNanos(i64),
     Timestamp(chrono::NaiveDateTime),
     TimestampNtz(chrono::NaiveDateTime),
     // We are serializing to f64 later and the ordering should be the same
@@ -382,6 +386,14 @@ impl StatsScalar {
                     Ok(Self::TimestampNtz(timestamp.naive_utc()))
                 }
             }
+            #[cfg(feature = "nanosecond-time")]
+            (
+                Statistics::Int64(v),
+                Some(LogicalType::Time {
+                    unit: TimeUnit::NANOS,
+                    ..
+                }),
+            ) => Ok(Self::TimeNanos(get_stat!(v))),
             (Statistics::Int64(v), Some(LogicalType::Decimal { scale, .. })) => {
                 let val = get_stat!(v) as f64 / 10.0_f64.powi(*scale);
                 // Spark serializes these as numbers
@@ -534,6 +546,8 @@ impl From<StatsScalar> for serde_json::Value {
             StatsScalar::Float32(v) => serde_json::Value::from(v),
             StatsScalar::Float64(v) => serde_json::Value::from(v),
             StatsScalar::Date(v) => serde_json::Value::from(v.format("%Y-%m-%d").to_string()),
+            #[cfg(feature = "nanosecond-time")]
+            StatsScalar::TimeNanos(v) => serde_json::Value::from(format_time_nanos(v)),
             StatsScalar::Timestamp(v) => {
                 serde_json::Value::from(v.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
             }

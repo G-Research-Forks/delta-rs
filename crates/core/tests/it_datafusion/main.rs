@@ -17,6 +17,8 @@ mod float16;
 mod integration;
 mod integration_checkpoint;
 mod integration_datafusion;
+#[cfg(feature = "nanosecond-time")]
+mod nanosecond_time;
 #[cfg(feature = "nanosecond-timestamps")]
 mod nanosecond_timestamps;
 mod read_delta_log_test;

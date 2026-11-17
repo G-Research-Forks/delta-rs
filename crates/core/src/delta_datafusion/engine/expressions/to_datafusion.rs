@@ -98,6 +98,8 @@ pub(crate) fn to_datafusion_scalar(scalar: &Scalar) -> DFResult<ScalarValue> {
         #[cfg(feature = "nanosecond-timestamps")]
         Scalar::TimestampNanosNtz(value) => ScalarValue::TimestampNanosecond(Some(*value), None),
         Scalar::TimestampNtz(value) => ScalarValue::TimestampMicrosecond(Some(*value), None),
+        #[cfg(feature = "nanosecond-time")]
+        Scalar::TimeNanos(value) => ScalarValue::Time64Nanosecond(Some(*value)),
         Scalar::Date(value) => ScalarValue::Date32(Some(*value)),
         Scalar::Binary(value) => ScalarValue::Binary(Some(value.clone())),
         Scalar::Decimal(data) => {
@@ -313,6 +315,11 @@ mod tests {
                 ScalarValue::TimestampMicrosecond(Some(1234567890), None),
             ),
             (Scalar::Date(18262), ScalarValue::Date32(Some(18262))),
+            #[cfg(feature = "nanosecond-time")]
+            (
+                Scalar::TimeNanos(47_167_123_456_789),
+                ScalarValue::Time64Nanosecond(Some(47_167_123_456_789)),
+            ),
         ];
 
         for (input, expected) in test_cases {

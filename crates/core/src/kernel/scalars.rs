@@ -52,6 +52,19 @@ fn encode_partition_value(value: &str) -> String {
 
 use crate::NULL_PARTITION_VALUE_DATA_PATH;
 
+#[cfg(feature = "nanosecond-time")]
+/// Formats nanoseconds since midnight as "HH:MM:SS.fffffffff"
+pub(crate) fn format_time_nanos(nanos: i64) -> String {
+    const NANOS_PER_SECOND: i64 = 1_000_000_000;
+    let seconds = nanos.div_euclid(NANOS_PER_SECOND) as u32;
+    let subsecond_nanos = nanos.rem_euclid(NANOS_PER_SECOND) as u32;
+    // Arrow guarantees a Time64 value lies within one day
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(seconds, subsecond_nanos)
+        .unwrap()
+        .format("%H:%M:%S%.9f")
+        .to_string()
+}
+
 /// Auxiliary methods for dealing with kernel scalars
 pub trait ScalarExt: Sized {
     /// Serialize to string
@@ -101,6 +114,8 @@ impl ScalarExt for Scalar {
                 let ts = Utc.timestamp_micros(*ts).single().unwrap();
                 ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
             }
+            #[cfg(feature = "nanosecond-time")]
+            Self::TimeNanos(nanos) => format_time_nanos(*nanos),
             Self::Date(days) => {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 date.format("%Y-%m-%d").to_string()
@@ -293,6 +308,11 @@ impl ScalarExt for Scalar {
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .map(|v| checked(v, index, Self::TimestampNanosNtz(v.value(index)))),
+            #[cfg(feature = "nanosecond-time")]
+            Time64(TimeUnit::Nanosecond) => arr
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .map(|v| checked(v, index, Self::TimeNanos(v.value(index)))),
             Struct(fields) => {
                 let struct_fields = fields
                     .iter()
@@ -398,6 +418,8 @@ impl ScalarExt for Scalar {
                 let ts = Utc.timestamp_micros(*ts).single().unwrap();
                 Value::String(ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
             }
+            #[cfg(feature = "nanosecond-time")]
+            Self::TimeNanos(nanos) => Value::String(format_time_nanos(*nanos)),
             Self::Date(days) => {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 Value::String(date.format("%Y-%m-%d").to_string())
@@ -545,6 +567,19 @@ mod tests {
 
         let scalar_ntz = Scalar::TimestampNtz(timestamp_micros);
         assert_eq!(scalar.serialize(), scalar_ntz.serialize());
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_scalar_time_nanos_serializes_and_reads_from_array() {
+        let nanos = 47_167_123_456_789;
+        let scalar = Scalar::TimeNanos(nanos);
+        assert_eq!(scalar.serialize(), "13:06:07.123456789");
+        assert_eq!(scalar.to_json(), serde_json::json!("13:06:07.123456789"));
+
+        let array = Time64NanosecondArray::from(vec![Some(nanos), None]);
+        assert_eq!(Scalar::from_array(&array, 0).unwrap(), scalar);
+        assert!(Scalar::from_array(&array, 1).unwrap().is_null());
     }
 
     #[cfg(feature = "nanosecond-timestamps")]

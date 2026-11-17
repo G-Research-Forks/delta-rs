@@ -205,6 +205,12 @@ pub fn contains_float16<'a>(mut fields: impl Iterator<Item = &'a StructField>) -
     fields.any(|f| matches_datatype(f.data_type(), &DataType::FLOAT16))
 }
 
+#[cfg(feature = "nanosecond-time")]
+/// checks if table contains time_nanos in any field including nested fields.
+pub fn contains_time_nanos<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
+    fields.any(|f| any_datatype(f.data_type(), &|dt| dt == &DataType::TIME_NANOS))
+}
+
 #[cfg(feature = "unsigned-integers")]
 /// checks if table contains unsigned integers in any field including nested fields.
 pub fn contains_unsigned_integers<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
@@ -501,6 +507,11 @@ impl ProtocolInner {
             self = self.enable_unsigned_integers();
         }
 
+        #[cfg(feature = "nanosecond-time")]
+        if contains_time_nanos(schema.fields()) {
+            self = self.enable_time_nanos();
+        }
+
         if !generated_cols.is_empty() {
             self = self.enable_generated_columns()
         }
@@ -711,6 +722,14 @@ impl ProtocolInner {
         self
     }
 
+    #[cfg(feature = "nanosecond-time")]
+    /// Enable the time of day in nanoseconds type in the protocol
+    fn enable_time_nanos(mut self) -> Self {
+        self = self.append_reader_features([TableFeature::TimeNanos]);
+        self = self.append_writer_features([TableFeature::TimeNanos]);
+        self
+    }
+
     /// Enabled generated columns
     fn enable_generated_columns(mut self) -> Self {
         if self.min_writer_version < 4 {
@@ -752,6 +771,10 @@ pub enum TableFeatures {
     #[serde(rename = "unsignedIntegerTypes-dev")]
     /// Unsigned integer types (in development)
     UnsignedIntegerTypes,
+    #[cfg(feature = "nanosecond-time")]
+    #[serde(rename = "timeNanos-dev")]
+    /// Time of day in nanoseconds type (in development)
+    TimeNanos,
     /// version 2 of checkpointing
     V2Checkpoint,
     /// Append Only Tables
@@ -795,6 +818,8 @@ impl FromStr for TableFeatures {
             "float16" => Ok(TableFeatures::Float16),
             #[cfg(feature = "unsigned-integers")]
             "unsignedIntegerTypes-dev" => Ok(TableFeatures::UnsignedIntegerTypes),
+            #[cfg(feature = "nanosecond-time")]
+            "timeNanos-dev" => Ok(TableFeatures::TimeNanos),
             "v2Checkpoint" => Ok(TableFeatures::V2Checkpoint),
             "appendOnly" => Ok(TableFeatures::AppendOnly),
             "invariants" => Ok(TableFeatures::Invariants),
@@ -826,6 +851,8 @@ impl AsRef<str> for TableFeatures {
             TableFeatures::Float16 => "float16",
             #[cfg(feature = "unsigned-integers")]
             TableFeatures::UnsignedIntegerTypes => "unsignedIntegerTypes-dev",
+            #[cfg(feature = "nanosecond-time")]
+            TableFeatures::TimeNanos => "timeNanos-dev",
             TableFeatures::V2Checkpoint => "v2Checkpoint",
             TableFeatures::AppendOnly => "appendOnly",
             TableFeatures::Invariants => "invariants",
@@ -904,6 +931,8 @@ impl TableFeatures {
                     TableFeature::Float16 => (Some(feature.clone()), Some(feature)),
                     #[cfg(feature = "unsigned-integers")]
                     TableFeature::UnsignedIntegerTypes => (Some(feature.clone()), Some(feature)),
+                    #[cfg(feature = "nanosecond-time")]
+                    TableFeature::TimeNanos => (Some(feature.clone()), Some(feature)),
 
                     // Unknown features
                     TableFeature::Unknown(_) => (None, None),
@@ -1440,6 +1469,49 @@ mod tests {
             StructField::nullable("b", ArrayType::new(DataType::BYTE, true)),
         ];
         assert!(!contains_unsigned_integers(fields.iter()));
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_contains_time_nanos() {
+        use delta_kernel::schema::{ArrayType, MapType};
+
+        let dt = DataType::TIME_NANOS;
+        let fields = [StructField::nullable("x", dt.clone())];
+        assert!(contains_time_nanos(fields.iter()));
+        let fields = [StructField::nullable(
+            "xs",
+            ArrayType::new(dt.clone(), true),
+        )];
+        assert!(contains_time_nanos(fields.iter()));
+        let fields = [StructField::nullable(
+            "m",
+            MapType::new(DataType::STRING, dt.clone(), true),
+        )];
+        assert!(contains_time_nanos(fields.iter()));
+        let fields = [StructField::nullable(
+            "s",
+            StructType::try_new([StructField::nullable("inner", dt)]).unwrap(),
+        )];
+        assert!(contains_time_nanos(fields.iter()));
+
+        let fields = [
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", ArrayType::new(DataType::TIMESTAMP_NTZ, true)),
+        ];
+        assert!(!contains_time_nanos(fields.iter()));
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_time_nanos_table_feature_name() {
+        let feature = TableFeatures::from_str("timeNanos-dev").unwrap();
+        assert_eq!(feature, TableFeatures::TimeNanos);
+        assert_eq!(feature.as_ref(), "timeNanos-dev");
+        assert_eq!(
+            feature.to_reader_writer_features(),
+            (Some(TableFeature::TimeNanos), Some(TableFeature::TimeNanos))
+        );
     }
 
     #[cfg(feature = "unsigned-integers")]
