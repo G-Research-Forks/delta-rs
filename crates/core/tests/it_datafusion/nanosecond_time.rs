@@ -220,3 +220,34 @@ async fn partition_by_time_nanos() -> DeltaResult<()> {
     assert_eq!(ids, vec![1, 2]);
     Ok(())
 }
+
+#[tokio::test]
+async fn concurrent_deletes_with_time_nanos_predicates() -> DeltaResult<()> {
+    let morning = make_batch(vec![0, 1], vec![Some(MIDNIGHT), Some(1)])?;
+    let afternoon = make_batch(vec![2, 3], vec![Some(AFTERNOON), Some(AFTERNOON + 1)])?;
+    let table = DeltaTable::new_in_memory().write(vec![morning]).await?;
+    let table = table.write(vec![afternoon]).await?;
+
+    // Both deletes start from the same snapshot, so the second one to commit has to check
+    // the files added by the first against its read predicate using their time statistics.
+    let stale_table = table.clone();
+    let (_, metrics) = table
+        .delete()
+        .with_predicate(col("t").eq(lit(ScalarValue::Time64Nanosecond(Some(1)))))
+        .await?;
+    assert_eq!(metrics.num_deleted_rows, Some(1));
+
+    let (table, metrics) = stale_table
+        .delete()
+        .with_predicate(col("t").gt(lit(ScalarValue::Time64Nanosecond(Some(AFTERNOON)))))
+        .await?;
+    assert_eq!(table.version(), Some(3));
+    assert_eq!(metrics.num_deleted_rows, Some(1));
+
+    let batches = query(table, "select * from test").await;
+    assert_eq!(
+        sorted_times(&batches),
+        vec![Some(MIDNIGHT), Some(AFTERNOON)]
+    );
+    Ok(())
+}
