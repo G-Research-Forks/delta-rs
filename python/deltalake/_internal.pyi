@@ -31,6 +31,7 @@ __version__: str
 _NANOSECOND_TIMESTAMPS: bool
 _FLOAT16: bool
 _UNSIGNED_INTEGERS: bool
+_NANOSECOND_TIME: bool
 
 class TableFeatures(Enum):
     # Mapping of one column to another

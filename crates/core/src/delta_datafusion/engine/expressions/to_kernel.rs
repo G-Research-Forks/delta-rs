@@ -11,6 +11,8 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::{DataType, DecimalType, PrimitiveType};
 
 use crate::kernel::scalars::ScalarExt;
+#[cfg(feature = "nanosecond-time")]
+use crate::kernel::scalars::is_valid_time_nanos;
 
 /// Converts a DataFusion expression to a Delta predicate.
 ///
@@ -291,6 +293,14 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
         ScalarValue::Date32(maybe_value) => match maybe_value {
             Some(value) => Ok(Scalar::Date(*value)),
             None => Ok(Scalar::Null(DataType::DATE)),
+        },
+        #[cfg(feature = "nanosecond-time")]
+        ScalarValue::Time64Nanosecond(maybe_value) => match maybe_value {
+            Some(value) if is_valid_time_nanos(*value) => Ok(Scalar::TimeNanos(*value)),
+            Some(value) => {
+                plan_err!("Time64(Nanosecond) value {value} does not lie within a single day")
+            }
+            None => Ok(Scalar::Null(DataType::TIME_NANOS)),
         },
         ScalarValue::Binary(maybe_value)
         | ScalarValue::LargeBinary(maybe_value)
@@ -701,6 +711,31 @@ mod tests {
                 assert_eq!(data.scale(), 2);
             }
             _ => panic!("Expected Decimal literal, got {:?}", delta_expr),
+        }
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_time_nanos_literal_expressions() {
+        let test_cases = vec![
+            (
+                lit(ScalarValue::Time64Nanosecond(Some(47_167_123_456_789))),
+                Scalar::TimeNanos(47_167_123_456_789),
+            ),
+            (
+                lit(ScalarValue::Time64Nanosecond(None)),
+                Scalar::Null(DataType::TIME_NANOS),
+            ),
+        ];
+
+        for (expr, expected) in test_cases {
+            let delta_expr = to_delta_expression(&expr).unwrap();
+            assert_eq!(delta_expr, Expression::Literal(expected));
+        }
+
+        for nanos in [-1, 86_400_000_000_000] {
+            let expr = lit(ScalarValue::Time64Nanosecond(Some(nanos)));
+            assert!(to_delta_expression(&expr).is_err(), "{nanos}");
         }
     }
 
