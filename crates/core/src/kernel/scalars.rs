@@ -53,16 +53,36 @@ fn encode_partition_value(value: &str) -> String {
 use crate::NULL_PARTITION_VALUE_DATA_PATH;
 
 #[cfg(feature = "nanosecond-time")]
-/// Formats nanoseconds since midnight as "HH:MM:SS.fffffffff"
-pub(crate) fn format_time_nanos(nanos: i64) -> String {
+/// Returns whether nanoseconds since midnight lie within a single day.
+///
+/// Arrow doesn't validate the range of `Time64` values, so this must be checked
+/// before a value is accepted as a time of day.
+pub(crate) fn is_valid_time_nanos(nanos: i64) -> bool {
+    const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+    (0..NANOS_PER_DAY).contains(&nanos)
+}
+
+#[cfg(feature = "nanosecond-time")]
+/// Formats nanoseconds since midnight as "HH:MM:SS.fffffffff",
+/// or returns `None` if the value doesn't lie within a single day.
+pub(crate) fn format_time_nanos(nanos: i64) -> Option<String> {
     const NANOS_PER_SECOND: i64 = 1_000_000_000;
-    let seconds = nanos.div_euclid(NANOS_PER_SECOND) as u32;
-    let subsecond_nanos = nanos.rem_euclid(NANOS_PER_SECOND) as u32;
-    // Arrow guarantees a Time64 value lies within one day
-    chrono::NaiveTime::from_num_seconds_from_midnight_opt(seconds, subsecond_nanos)
-        .unwrap()
-        .format("%H:%M:%S%.9f")
-        .to_string()
+    if !is_valid_time_nanos(nanos) {
+        return None;
+    }
+    // Both parts fit in a u32 now that the value is known to lie within one day
+    let seconds = (nanos / NANOS_PER_SECOND) as u32;
+    let subsecond_nanos = (nanos % NANOS_PER_SECOND) as u32;
+    let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(seconds, subsecond_nanos)?;
+    Some(time.format("%H:%M:%S%.9f").to_string())
+}
+
+#[cfg(feature = "nanosecond-time")]
+/// Formats a [`Scalar::TimeNanos`] value, which conversions into a [`Scalar`] in this
+/// crate only create for values within a single day.
+fn format_time_nanos_scalar(nanos: i64) -> String {
+    format_time_nanos(nanos)
+        .unwrap_or_else(|| panic!("TimeNanos value {nanos} does not lie within a single day"))
 }
 
 /// Auxiliary methods for dealing with kernel scalars
@@ -115,7 +135,7 @@ impl ScalarExt for Scalar {
                 ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
             }
             #[cfg(feature = "nanosecond-time")]
-            Self::TimeNanos(nanos) => format_time_nanos(*nanos),
+            Self::TimeNanos(nanos) => format_time_nanos_scalar(*nanos),
             Self::Date(days) => {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 date.format("%Y-%m-%d").to_string()
@@ -312,6 +332,7 @@ impl ScalarExt for Scalar {
             Time64(TimeUnit::Nanosecond) => arr
                 .as_any()
                 .downcast_ref::<Time64NanosecondArray>()
+                .filter(|v| is_valid_time_nanos(v.value(index)))
                 .map(|v| checked(v, index, Self::TimeNanos(v.value(index)))),
             Struct(fields) => {
                 let struct_fields = fields
@@ -419,7 +440,7 @@ impl ScalarExt for Scalar {
                 Value::String(ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
             }
             #[cfg(feature = "nanosecond-time")]
-            Self::TimeNanos(nanos) => Value::String(format_time_nanos(*nanos)),
+            Self::TimeNanos(nanos) => Value::String(format_time_nanos_scalar(*nanos)),
             Self::Date(days) => {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 Value::String(date.format("%Y-%m-%d").to_string())
@@ -580,6 +601,31 @@ mod tests {
         let array = Time64NanosecondArray::from(vec![Some(nanos), None]);
         assert_eq!(Scalar::from_array(&array, 0).unwrap(), scalar);
         assert!(Scalar::from_array(&array, 1).unwrap().is_null());
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_time_nanos_outside_of_one_day() {
+        use super::format_time_nanos;
+
+        assert_eq!(format_time_nanos(0).unwrap(), "00:00:00.000000000");
+        assert_eq!(
+            format_time_nanos(86_399_999_999_999).unwrap(),
+            "23:59:59.999999999"
+        );
+        // Includes values that would wrap to a valid time if narrowed to u32 seconds
+        let invalid = [
+            -1,
+            86_400_000_000_000,
+            (1 << 32) * 1_000_000_000,
+            i64::MIN,
+            i64::MAX,
+        ];
+        for nanos in invalid {
+            assert_eq!(format_time_nanos(nanos), None, "{nanos}");
+            let array = Time64NanosecondArray::from(vec![nanos]);
+            assert_eq!(Scalar::from_array(&array, 0), None, "{nanos}");
+        }
     }
 
     #[cfg(feature = "nanosecond-timestamps")]

@@ -772,7 +772,7 @@ impl fmt::Display for ScalarValueFormat<'_> {
                 Some(e) => write!(
                     f,
                     "arrow_cast('{}', 'Time64(Nanosecond)')",
-                    format_time_nanos(*e)
+                    format_time_nanos(*e).ok_or(Error)?
                 )?,
                 None => write!(f, "NULL")?,
             },

@@ -251,3 +251,30 @@ async fn concurrent_deletes_with_time_nanos_predicates() -> DeltaResult<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn write_time_nanos_outside_of_one_day() -> DeltaResult<()> {
+    // Arrow doesn't validate that Time64 values lie within a day. The value 2^32 seconds
+    // past midnight would wrap to a valid time if narrowed to u32 seconds.
+    let wrapping = (1 << 32) * 1_000_000_000 + AFTERNOON;
+    let invalid = [-1, 86_400_000_000_000, wrapping];
+    let batch = make_batch(vec![0, 1, 2], invalid.map(Some).to_vec())?;
+
+    // Statistics can't represent these values, so they are left out
+    let table = DeltaTable::new_in_memory()
+        .write(vec![batch.clone()])
+        .await?;
+    let files: Vec<_> = table.snapshot()?.log_data().iter().collect();
+    assert_eq!(files.len(), 1);
+    let stats: serde_json::Value = serde_json::from_str(&files[0].stats().unwrap()).unwrap();
+    assert!(stats["minValues"].get("t").is_none(), "{stats}");
+    assert!(stats["maxValues"].get("t").is_none(), "{stats}");
+
+    // Partition values have to be represented, so the write fails
+    let result = DeltaTable::new_in_memory()
+        .write(vec![batch])
+        .with_partition_columns(["t"])
+        .await;
+    assert!(result.is_err());
+    Ok(())
+}
