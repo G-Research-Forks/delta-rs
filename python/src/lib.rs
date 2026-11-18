@@ -2436,7 +2436,7 @@ fn scalar_to_py<'py>(value: &Scalar, py_date: &Bound<'py, PyAny>) -> PyResult<Bo
             value.into_py_any(py)?
         }
         #[cfg(feature = "nanosecond-time")]
-        TimeNanos(_) => value.serialize().into_py_any(py)?,
+        TimeNanos(val) => val.into_py_any(py)?,
         // NOTE: PyArrow 13.0.0 lost the ability to cast from string to date32, so
         // we have to implement that manually.
         Date(_) => {
