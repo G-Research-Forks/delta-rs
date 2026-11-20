@@ -4,6 +4,8 @@ use std::sync::LazyLock;
 use delta_kernel::table_features::TableFeature;
 
 use super::{TableReference, TransactionError};
+#[cfg(feature = "float16")]
+use crate::kernel::contains_float16;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::kernel::contains_timestamp_nanos;
 use crate::kernel::{
@@ -155,6 +157,24 @@ impl ProtocolChecker {
             snapshot,
             contains_nanos,
             TableFeature::TimestampWithoutTimezone,
+        )
+    }
+
+    #[cfg(feature = "float16")]
+    /// Check can write float16
+    pub fn check_can_write_float16(
+        &self,
+        snapshot: &EagerSnapshot,
+        schema: &Schema,
+    ) -> Result<(), TransactionError> {
+        trace!(
+            "checking if snapshot v{} can write float16",
+            snapshot.version()
+        );
+        self.check_can_write_feature(
+            snapshot,
+            contains_float16(schema.fields()),
+            TableFeature::Float16,
         )
     }
 
@@ -316,6 +336,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::VacuumProtocolCheck);
     #[cfg(feature = "nanosecond-timestamps")]
     reader_features.insert(TableFeature::TimestampNanos);
+    #[cfg(feature = "float16")]
+    reader_features.insert(TableFeature::Float16);
     #[cfg(feature = "datafusion")]
     {
         reader_features.insert(TableFeature::ColumnMapping);
@@ -326,6 +348,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::TimestampWithoutTimezone);
     #[cfg(feature = "nanosecond-timestamps")]
     writer_features.insert(TableFeature::TimestampNanos);
+    #[cfg(feature = "float16")]
+    writer_features.insert(TableFeature::Float16);
     writer_features.insert(TableFeature::VariantType);
     writer_features.insert(TableFeature::VariantTypePreview);
     writer_features.insert(TableFeature::V2Checkpoint);

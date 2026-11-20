@@ -31,6 +31,8 @@ pub fn to_datafusion_scalar(scalar: &Scalar) -> DeltaResult<ScalarValue> {
         Scalar::Short(value) => ScalarValue::Int16(Some(*value)),
         Scalar::Integer(value) => ScalarValue::Int32(Some(*value)),
         Scalar::Long(value) => ScalarValue::Int64(Some(*value)),
+        #[cfg(feature = "float16")]
+        Scalar::Float16(value) => ScalarValue::Float16(Some(*value)),
         Scalar::Float(value) => ScalarValue::Float32(Some(*value)),
         Scalar::Double(value) => ScalarValue::Float64(Some(*value)),
         Scalar::Timestamp(value) => {
@@ -246,6 +248,16 @@ mod scalar_tests {
         #[case] expected: DFScalarValue,
     ) {
         assert_eq!(to_datafusion_scalar(&scalar).unwrap(), expected);
+    }
+
+    #[cfg(feature = "float16")]
+    #[test]
+    fn float16_converts_to_matching_value() {
+        use half::f16;
+        assert_eq!(
+            to_datafusion_scalar(&KernelScalar::Float16(f16::from_f32(1.25))).unwrap(),
+            DFScalarValue::Float16(Some(f16::from_f32(1.25)))
+        );
     }
 
     #[test]

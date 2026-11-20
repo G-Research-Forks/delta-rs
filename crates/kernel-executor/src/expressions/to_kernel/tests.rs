@@ -535,6 +535,25 @@ fn test_null_literals() {
     }
 }
 
+#[cfg(feature = "float16")]
+#[test]
+fn test_float16_literals() {
+    use half::f16;
+
+    let delta_expr =
+        to_delta_expression(&lit(ScalarValue::Float16(Some(f16::from_f32(1.5))))).unwrap();
+    assert_eq!(
+        delta_expr,
+        Expression::Literal(Scalar::Float16(f16::from_f32(1.5)))
+    );
+
+    let delta_expr = to_delta_expression(&lit(ScalarValue::Float16(None))).unwrap();
+    assert_eq!(
+        delta_expr,
+        Expression::Literal(Scalar::Null(DataType::FLOAT16))
+    );
+}
+
 #[test]
 fn test_between_expressions() {
     // Test BETWEEN (not negated) - should be equivalent to: NOT (x < low OR x > high)

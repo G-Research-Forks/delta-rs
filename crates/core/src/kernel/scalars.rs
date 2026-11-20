@@ -86,6 +86,8 @@ impl ScalarExt for Scalar {
             Self::Short(s) => s.to_string(),
             Self::Integer(i) => i.to_string(),
             Self::Long(l) => l.to_string(),
+            #[cfg(feature = "float16")]
+            Self::Float16(f) => f.to_string(),
             Self::Float(f) => f.to_string(),
             Self::Double(d) => d.to_string(),
             Self::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
@@ -221,6 +223,13 @@ impl ScalarExt for Scalar {
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .map(|v| checked(v, index, Self::Long(v.value(index) as i64))),
+            #[cfg(feature = "float16")]
+            Float16 => arr
+                .as_any()
+                .downcast_ref::<Float16Array>()
+                .map(|v| checked(v, index, Self::Float16(v.value(index)))),
+            #[cfg(not(feature = "float16"))]
+            Float16 => None,
             Float32 => arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -308,8 +317,7 @@ impl ScalarExt for Scalar {
                     _ => None,
                 }
             }
-            Float16
-            | Decimal32(_, _)
+            Decimal32(_, _)
             | Decimal64(_, _)
             | Decimal256(_, _)
             | List(_)
@@ -339,6 +347,8 @@ impl ScalarExt for Scalar {
             Self::Short(s) => Value::Number(serde_json::Number::from(*s)),
             Self::Integer(i) => Value::Number(serde_json::Number::from(*i)),
             Self::Long(l) => Value::Number(serde_json::Number::from(*l)),
+            #[cfg(feature = "float16")]
+            Self::Float16(f) => Value::Number(serde_json::Number::from_f64(f.to_f64()).unwrap()),
             Self::Float(f) => Value::Number(serde_json::Number::from_f64(*f as f64).unwrap()),
             Self::Double(d) => Value::Number(serde_json::Number::from_f64(*d).unwrap()),
             Self::Boolean(b) => Value::Bool(*b),
@@ -432,6 +442,8 @@ mod tests {
     use super::*;
     use arrow_array::*;
     use delta_kernel::expressions::Scalar;
+    #[cfg(feature = "float16")]
+    use half::f16;
 
     #[test]
     fn test_encode_partition_value() {
@@ -467,6 +479,8 @@ mod tests {
         assert_eq!(Scalar::Long(123456789).serialize(), "123456789");
         assert_eq!(Scalar::Float(3.14).serialize(), "3.14");
         assert_eq!(Scalar::Double(2.71828).serialize(), "2.71828");
+        #[cfg(feature = "float16")]
+        assert_eq!(Scalar::Float16(f16::from_f32(1.5)).serialize(), "1.5");
     }
 
     #[test]
@@ -866,6 +880,15 @@ mod tests {
         assert_eq!(scalar, Scalar::Double(2.71828));
     }
 
+    #[cfg(feature = "float16")]
+    #[test]
+    fn test_scalar_from_array_float16() {
+        let float_array = Float16Array::from(vec![Some(f16::from_f32(3.25)), None]);
+        let scalar = Scalar::from_array(&float_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Float16(f16::from_f32(3.25)));
+        assert!(Scalar::from_array(&float_array, 1).is_none_or(|s| s.is_null()));
+    }
+
     #[test]
     fn test_scalar_from_array_all_integer_types() {
         // Test Int8
@@ -1023,5 +1046,11 @@ mod tests {
         // Test negative numbers
         assert_eq!(Scalar::Integer(-42).serialize(), "-42");
         assert_eq!(Scalar::Float(-3.14).serialize(), "-3.14");
+
+        #[cfg(feature = "float16")]
+        {
+            assert_eq!(Scalar::Float16(f16::from_f32(0.0)).serialize(), "0");
+            assert_eq!(Scalar::Float16(f16::from_f32(-2.5)).serialize(), "-2.5");
+        }
     }
 }

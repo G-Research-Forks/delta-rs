@@ -13,6 +13,8 @@ mod datafusion_dat;
 mod datafusion_table_provider;
 mod dst_commits;
 mod file_selection_bench_bridge;
+#[cfg(feature = "float16")]
+mod float16;
 mod integration;
 mod integration_checkpoint;
 mod integration_datafusion;

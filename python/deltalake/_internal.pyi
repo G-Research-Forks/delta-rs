@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     )
 __version__: str
 _NANOSECOND_TIMESTAMPS: bool
+_FLOAT16: bool
 
 def _set_cast_nanos_timestamps_to_micros(cast: bool) -> None: ...
 

@@ -25,6 +25,7 @@ from arro3.core.types import (
 )
 
 from deltalake._internal import (
+    _FLOAT16,
     PyMergeBuilder,
     RawDeltaTable,
     TableFeatures,
@@ -75,6 +76,10 @@ SUPPORTED_READER_FEATURES = {
     "variantType",
     "variantType-preview",
 }
+
+if _FLOAT16:
+    SUPPORTED_WRITER_FEATURES.add("float16")
+    SUPPORTED_READER_FEATURES.add("float16")
 
 FSCK_METRICS_FILES_REMOVED_LABEL = "files_removed"
 
