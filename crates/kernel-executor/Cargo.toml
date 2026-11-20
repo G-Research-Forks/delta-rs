@@ -65,6 +65,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]
 # Experimental support for the float16 primitive type
 float16 = ["delta_kernel/float16", "dep:half"]
+# Experimental support for unsigned integer primitive types
+unsigned-integers = ["delta_kernel/unsigned-integers"]
 
 [lints]
 workspace = true

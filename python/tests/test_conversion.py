@@ -4,7 +4,19 @@ import pytest
 from arro3.core import DataType, Field, Schema
 
 from deltalake import DeltaTable, write_deltalake
+from deltalake._internal import _UNSIGNED_INTEGERS
 from deltalake.writer._conversion import _convert_arro3_schema_to_delta
+
+if _UNSIGNED_INTEGERS:
+    _converted_uint8 = DataType.uint8
+    _converted_uint16 = DataType.uint16
+    _converted_uint32 = DataType.uint32
+    _converted_uint64 = DataType.uint64
+else:
+    _converted_uint8 = DataType.int8
+    _converted_uint16 = DataType.int16
+    _converted_uint32 = DataType.int32
+    _converted_uint64 = DataType.int64
 
 
 @pytest.mark.parametrize(
@@ -23,22 +35,22 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
             Schema(fields=[Field("foo", DataType.int16())]),
             Schema(fields=[Field("foo", DataType.int16())]),
         ),
-        # Unsigned integers to signed
+        # Unsigned integers to signed, unless unsigned integer support is enabled
         (
             Schema(fields=[Field("foo", DataType.uint8())]),
-            Schema(fields=[Field("foo", DataType.int8())]),
+            Schema(fields=[Field("foo", _converted_uint8())]),
         ),
         (
             Schema(fields=[Field("foo", DataType.uint16())]),
-            Schema(fields=[Field("foo", DataType.int16())]),
+            Schema(fields=[Field("foo", _converted_uint16())]),
         ),
         (
             Schema(fields=[Field("foo", DataType.uint32())]),
-            Schema(fields=[Field("foo", DataType.int32())]),
+            Schema(fields=[Field("foo", _converted_uint32())]),
         ),
         (
             Schema(fields=[Field("foo", DataType.uint64())]),
-            Schema(fields=[Field("foo", DataType.int64())]),
+            Schema(fields=[Field("foo", _converted_uint64())]),
         ),
         # Timestamps
         (
@@ -64,7 +76,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
         # Nullability variations
         (
             Schema(fields=[Field("foo", DataType.uint16(), nullable=False)]),
-            Schema(fields=[Field("foo", DataType.int16(), nullable=False)]),
+            Schema(fields=[Field("foo", _converted_uint16(), nullable=False)]),
         ),
         (
             Schema(fields=[Field("foo", DataType.timestamp("ns"), nullable=True)]),
@@ -73,11 +85,11 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
         # List of unsigned ints
         (
             Schema(fields=[Field("foo", DataType.list(DataType.uint32()))]),
-            Schema(fields=[Field("foo", DataType.list(DataType.int32()))]),
+            Schema(fields=[Field("foo", DataType.list(_converted_uint32()))]),
         ),
         (
             Schema(fields=[Field("foo", DataType.large_list(DataType.uint8()))]),
-            Schema(fields=[Field("foo", DataType.large_list(DataType.int8()))]),
+            Schema(fields=[Field("foo", DataType.large_list(_converted_uint8()))]),
         ),
         # List with nullable inner fields
         (
@@ -93,7 +105,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                 fields=[
                     Field(
                         "my_list",
-                        DataType.list(Field("foo", DataType.int8(), nullable=True)),
+                        DataType.list(Field("foo", _converted_uint8(), nullable=True)),
                     )
                 ]
             ),
@@ -112,7 +124,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                 fields=[
                     Field(
                         "my_list",
-                        DataType.list(Field("foo", DataType.int8(), nullable=False)),
+                        DataType.list(Field("foo", _converted_uint8(), nullable=False)),
                     )
                 ]
             ),
@@ -157,7 +169,9 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                                         "level_2",
                                         DataType.list(
                                             Field(
-                                                "value", DataType.int16(), nullable=True
+                                                "value",
+                                                _converted_uint16(),
+                                                nullable=True,
                                             )
                                         ),
                                         nullable=True,
@@ -173,7 +187,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
         # Fixed-size list
         (
             Schema(fields=[Field("foo", DataType.list(DataType.uint16(), 5))]),
-            Schema(fields=[Field("foo", DataType.list(DataType.int16(), 5))]),
+            Schema(fields=[Field("foo", DataType.list(_converted_uint16(), 5))]),
         ),
         # Struct with mixed fields
         (
@@ -197,9 +211,9 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                         "foo",
                         DataType.struct(
                             [
-                                Field("a", DataType.int64()),
+                                Field("a", _converted_uint64()),
                                 Field("b", DataType.timestamp("us")),
-                                Field("c", DataType.int32()),
+                                Field("c", _converted_uint32()),
                             ]
                         ),
                     )
@@ -230,7 +244,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                         DataType.list(
                             DataType.struct(
                                 [
-                                    Field("a", DataType.int8(), nullable=False),
+                                    Field("a", _converted_uint8(), nullable=False),
                                     Field("b", DataType.timestamp("us")),
                                 ]
                             )
@@ -258,12 +272,15 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
             ),
             Schema(
                 fields=[
-                    Field("a", DataType.int16()),
+                    Field("a", _converted_uint16()),
                     Field("b", DataType.timestamp("us", tz="UTC")),
                     Field(
                         "d",
                         DataType.struct(
-                            [Field("x", DataType.int32()), Field("y", DataType.int64())]
+                            [
+                                Field("x", _converted_uint32()),
+                                Field("y", DataType.int64()),
+                            ]
                         ),
                     ),
                 ]
@@ -284,7 +301,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                 fields=[
                     Field(
                         "foo",
-                        DataType.int16(),
+                        _converted_uint16(),
                         metadata={"description": "an unsigned int"},
                     )
                 ]
@@ -344,7 +361,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                             [
                                 Field(
                                     "id",
-                                    DataType.int32(),
+                                    _converted_uint32(),
                                     metadata={"index": "primary"},
                                 ),
                                 Field(
@@ -384,7 +401,7 @@ from deltalake.writer._conversion import _convert_arro3_schema_to_delta
                         DataType.list(
                             Field(
                                 "reading",
-                                DataType.int8(),
+                                _converted_uint8(),
                                 nullable=False,
                                 metadata={"unit": "celsius"},
                             )
@@ -441,9 +458,9 @@ def test_schema_conversion(input_schema: Schema, expected_schema: Schema):
                         "foo",
                         DataType.struct(
                             [
-                                Field("a", DataType.int64()),
+                                Field("a", _converted_uint64()),
                                 Field("b", DataType.timestamp("ns", tz="UTC")),
-                                Field("c", DataType.int32()),
+                                Field("c", _converted_uint32()),
                             ]
                         ),
                     )

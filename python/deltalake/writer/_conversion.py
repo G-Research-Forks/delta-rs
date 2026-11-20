@@ -3,12 +3,15 @@ from __future__ import annotations
 from arro3.core import DataType
 from arro3.core import Schema as Arro3Schema
 
+from deltalake._internal import _UNSIGNED_INTEGERS
+
 
 def _convert_arro3_schema_to_delta(
     schema: Arro3Schema,
     existing_schema: Arro3Schema | None = None,
 ) -> Arro3Schema:
-    """Convert a arro3 schema to a schema compatible with Delta Lake. Converts unsigned to signed equivalent, and
+    """Convert a arro3 schema to a schema compatible with Delta Lake. Converts unsigned to signed equivalent
+    (unless built with unsigned integer support), and
     converts all timestamps to `us` timestamps, except nanosecond timestamps when the experimental nanosecond
     timestamp feature is enabled.
     Also handles null column types by converting them to match
@@ -51,7 +54,7 @@ def _convert_arro3_schema_to_delta(
             return DataType.timestamp(time_unit, tz=tz)
         elif DataType.is_fixed_size_binary(dtype):
             return DataType.binary()
-        elif DataType.is_unsigned_integer(dtype):
+        elif DataType.is_unsigned_integer(dtype) and not _UNSIGNED_INTEGERS:
             if DataType.is_uint16(dtype):
                 return DataType.int16()
             elif DataType.is_uint32(dtype):

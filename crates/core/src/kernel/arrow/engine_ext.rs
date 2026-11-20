@@ -491,6 +491,16 @@ pub(crate) fn is_public_min_max_stats_eligible_primitive(data_type: &PrimitiveTy
     let matches_f16 = false;
     #[cfg(feature = "float16")]
     let matches_f16 = matches!(data_type, &PrimitiveType::Float16);
+    #[cfg(not(feature = "unsigned-integers"))]
+    let matches_unsigned = false;
+    #[cfg(feature = "unsigned-integers")]
+    let matches_unsigned = matches!(
+        data_type,
+        &PrimitiveType::Uint8
+            | &PrimitiveType::Uint16
+            | &PrimitiveType::Uint32
+            | &PrimitiveType::Uint64
+    );
     matches!(
         data_type,
         &PrimitiveType::Byte
@@ -507,6 +517,7 @@ pub(crate) fn is_public_min_max_stats_eligible_primitive(data_type: &PrimitiveTy
             | PrimitiveType::Decimal(_)
     ) || matches_nanos
         || matches_f16
+        || matches_unsigned
 }
 
 pub(crate) fn rb_from_scan_meta(metadata: ScanMetadata) -> DeltaResult<RecordBatch> {

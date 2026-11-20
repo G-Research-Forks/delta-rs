@@ -269,6 +269,26 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
             Some(value) => Ok(Scalar::Long(*value)),
             None => Ok(Scalar::Null(DataType::LONG)),
         },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt8(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint8(*value)),
+            None => Ok(Scalar::Null(DataType::UINT8)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt16(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint16(*value)),
+            None => Ok(Scalar::Null(DataType::UINT16)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt32(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint32(*value)),
+            None => Ok(Scalar::Null(DataType::UINT32)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt64(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint64(*value)),
+            None => Ok(Scalar::Null(DataType::UINT64)),
+        },
         #[cfg(feature = "float16")]
         ScalarValue::Float16(maybe_value) => match maybe_value {
             Some(value) => Ok(Scalar::Float16(*value)),

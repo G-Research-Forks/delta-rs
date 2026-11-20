@@ -140,6 +140,7 @@ native-tls = ["deltalake/s3-native-tls", "deltalake/glue"]
 rustls = ["deltalake/s3", "deltalake/glue"]
 nanosecond-timestamps = ["deltalake/nanosecond-timestamps"]
 float16 = ["deltalake/float16"]
+unsigned-integers = ["deltalake/unsigned-integers"]
 
 [lints]
 workspace = true

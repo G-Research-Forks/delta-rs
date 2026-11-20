@@ -17,6 +17,9 @@ pub enum TableFeatures {
     #[cfg(feature = "float16")]
     /// Float16 data type
     Float16,
+    #[cfg(feature = "unsigned-integers")]
+    /// Unsigned integer data types
+    UnsignedIntegerTypes,
     /// version 2 of checkpointing
     V2Checkpoint,
     /// Append Only Tables
@@ -55,6 +58,8 @@ impl From<TableFeatures> for KernelTableFeatures {
             }
             #[cfg(feature = "float16")]
             TableFeatures::Float16 => KernelTableFeatures::Float16,
+            #[cfg(feature = "unsigned-integers")]
+            TableFeatures::UnsignedIntegerTypes => KernelTableFeatures::UnsignedIntegerTypes,
             TableFeatures::V2Checkpoint => KernelTableFeatures::V2Checkpoint,
             TableFeatures::AppendOnly => KernelTableFeatures::AppendOnly,
             TableFeatures::Invariants => KernelTableFeatures::Invariants,

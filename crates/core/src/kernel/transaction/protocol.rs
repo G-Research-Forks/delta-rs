@@ -8,6 +8,8 @@ use super::{TableReference, TransactionError};
 use crate::kernel::contains_float16;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::kernel::contains_timestamp_nanos;
+#[cfg(feature = "unsigned-integers")]
+use crate::kernel::contains_unsigned_integers;
 use crate::kernel::{
     Action, EagerSnapshot, Protocol, ProtocolExt as _, Schema, contains_timestampntz,
     contains_variant,
@@ -178,6 +180,24 @@ impl ProtocolChecker {
         )
     }
 
+    #[cfg(feature = "unsigned-integers")]
+    /// Check can write unsigned integers
+    pub fn check_can_write_unsigned_integers(
+        &self,
+        snapshot: &EagerSnapshot,
+        schema: &Schema,
+    ) -> Result<(), TransactionError> {
+        trace!(
+            "checking if snapshot v{} can write unsigned integers",
+            snapshot.version()
+        );
+        self.check_can_write_feature(
+            snapshot,
+            contains_unsigned_integers(schema.fields()),
+            TableFeature::UnsignedIntegerTypes,
+        )
+    }
+
     /// Check can write variant
     pub fn check_can_write_variant(
         &self,
@@ -338,6 +358,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::TimestampNanos);
     #[cfg(feature = "float16")]
     reader_features.insert(TableFeature::Float16);
+    #[cfg(feature = "unsigned-integers")]
+    reader_features.insert(TableFeature::UnsignedIntegerTypes);
     #[cfg(feature = "datafusion")]
     {
         reader_features.insert(TableFeature::ColumnMapping);
@@ -350,6 +372,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::TimestampNanos);
     #[cfg(feature = "float16")]
     writer_features.insert(TableFeature::Float16);
+    #[cfg(feature = "unsigned-integers")]
+    writer_features.insert(TableFeature::UnsignedIntegerTypes);
     writer_features.insert(TableFeature::VariantType);
     writer_features.insert(TableFeature::VariantTypePreview);
     writer_features.insert(TableFeature::V2Checkpoint);

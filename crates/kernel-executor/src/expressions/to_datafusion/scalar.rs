@@ -33,6 +33,14 @@ pub fn to_datafusion_scalar(scalar: &Scalar) -> DeltaResult<ScalarValue> {
         Scalar::Long(value) => ScalarValue::Int64(Some(*value)),
         #[cfg(feature = "float16")]
         Scalar::Float16(value) => ScalarValue::Float16(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint8(value) => ScalarValue::UInt8(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint16(value) => ScalarValue::UInt16(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint32(value) => ScalarValue::UInt32(Some(*value)),
+        #[cfg(feature = "unsigned-integers")]
+        Scalar::Uint64(value) => ScalarValue::UInt64(Some(*value)),
         Scalar::Float(value) => ScalarValue::Float32(Some(*value)),
         Scalar::Double(value) => ScalarValue::Float64(Some(*value)),
         Scalar::Timestamp(value) => {
@@ -258,6 +266,19 @@ mod scalar_tests {
             to_datafusion_scalar(&KernelScalar::Float16(f16::from_f32(1.25))).unwrap(),
             DFScalarValue::Float16(Some(f16::from_f32(1.25)))
         );
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[rstest]
+    #[case::uint8(KernelScalar::Uint8(u8::MAX), DFScalarValue::UInt8(Some(u8::MAX)))]
+    #[case::uint16(KernelScalar::Uint16(u16::MAX), DFScalarValue::UInt16(Some(u16::MAX)))]
+    #[case::uint32(KernelScalar::Uint32(u32::MAX), DFScalarValue::UInt32(Some(u32::MAX)))]
+    #[case::uint64(KernelScalar::Uint64(u64::MAX), DFScalarValue::UInt64(Some(u64::MAX)))]
+    fn unsigned_integer_converts_to_matching_value(
+        #[case] scalar: KernelScalar,
+        #[case] expected: DFScalarValue,
+    ) {
+        assert_eq!(to_datafusion_scalar(&scalar).unwrap(), expected);
     }
 
     #[test]
