@@ -54,6 +54,8 @@ pub fn to_datafusion_scalar(scalar: &Scalar) -> DeltaResult<ScalarValue> {
         Scalar::TimestampNanosNtz(value) => ScalarValue::TimestampNanosecond(Some(*value), None),
         Scalar::TimestampNtz(value) => ScalarValue::TimestampMicrosecond(Some(*value), None),
         Scalar::Date(value) => ScalarValue::Date32(Some(*value)),
+        #[cfg(feature = "nanosecond-time")]
+        Scalar::TimeNanos(value) => ScalarValue::Time64Nanosecond(Some(*value)),
         Scalar::Binary(value) => ScalarValue::Binary(Some(value.clone())),
         // scale() is 0..=38, so the i8 cast never truncates.
         Scalar::Decimal(data) => {
@@ -279,6 +281,15 @@ mod scalar_tests {
         #[case] expected: DFScalarValue,
     ) {
         assert_eq!(to_datafusion_scalar(&scalar).unwrap(), expected);
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn time_nanos_converts_to_matching_value() {
+        assert_eq!(
+            to_datafusion_scalar(&KernelScalar::TimeNanos(47_167_123_456_789)).unwrap(),
+            DFScalarValue::Time64Nanosecond(Some(47_167_123_456_789))
+        );
     }
 
     #[test]

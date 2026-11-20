@@ -457,6 +457,8 @@ impl WriteBuilder {
                     PROTOCOL.check_can_write_float16(snapshot, &schema)?;
                     #[cfg(feature = "unsigned-integers")]
                     PROTOCOL.check_can_write_unsigned_integers(snapshot, &schema)?;
+                    #[cfg(feature = "nanosecond-time")]
+                    PROTOCOL.check_can_write_time_nanos(snapshot, &schema)?;
                     PROTOCOL.check_can_write_variant(snapshot, &schema)?;
                 }
                 match self.mode {
@@ -3976,6 +3978,49 @@ mod tests {
         let result_field = schema.field_with_name("xs").unwrap();
         assert!(
             matches!(result_field.data_type(), DataType::List(inner) if inner.data_type() == &DataType::Float16)
+        );
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[tokio::test]
+    async fn test_write_time_nanos_records_min_and_max_stats() {
+        use arrow_array::Time64NanosecondArray;
+        use delta_kernel::expressions::Scalar;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "t",
+            DataType::Time64(TimeUnit::Nanosecond),
+            true,
+        )]));
+        let times = vec![Some(47_167_123_456_789), Some(1), None];
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Time64NanosecondArray::from(times))])
+                .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let files: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .snapshot()
+            .file_views(&table.log_store(), None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let stat = |values: Option<Scalar>| -> Scalar {
+            let Some(Scalar::Struct(data)) = values else {
+                panic!("expected struct stats, got {values:?}");
+            };
+            data.values()[0].clone()
+        };
+        assert_eq!(stat(files[0].min_values()), Scalar::TimeNanos(1));
+        assert_eq!(
+            stat(files[0].max_values()),
+            Scalar::TimeNanos(47_167_123_456_789)
         );
     }
 

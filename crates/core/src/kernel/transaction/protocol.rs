@@ -6,6 +6,8 @@ use delta_kernel::table_features::TableFeature;
 use super::{TableReference, TransactionError};
 #[cfg(feature = "float16")]
 use crate::kernel::contains_float16;
+#[cfg(feature = "nanosecond-time")]
+use crate::kernel::contains_time_nanos;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::kernel::contains_timestamp_nanos;
 #[cfg(feature = "unsigned-integers")]
@@ -198,6 +200,24 @@ impl ProtocolChecker {
         )
     }
 
+    #[cfg(feature = "nanosecond-time")]
+    /// Check can write `time(9)` columns
+    pub fn check_can_write_time_nanos(
+        &self,
+        snapshot: &EagerSnapshot,
+        schema: &Schema,
+    ) -> Result<(), TransactionError> {
+        trace!(
+            "checking if snapshot v{} can write time(9) columns",
+            snapshot.version()
+        );
+        self.check_can_write_feature(
+            snapshot,
+            contains_time_nanos(schema.fields()),
+            TableFeature::TimeNanos,
+        )
+    }
+
     /// Check can write variant
     pub fn check_can_write_variant(
         &self,
@@ -360,6 +380,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::Float16);
     #[cfg(feature = "unsigned-integers")]
     reader_features.insert(TableFeature::UnsignedIntegerTypes);
+    #[cfg(feature = "nanosecond-time")]
+    reader_features.insert(TableFeature::TimeNanos);
     #[cfg(feature = "datafusion")]
     {
         reader_features.insert(TableFeature::ColumnMapping);
@@ -374,6 +396,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::Float16);
     #[cfg(feature = "unsigned-integers")]
     writer_features.insert(TableFeature::UnsignedIntegerTypes);
+    #[cfg(feature = "nanosecond-time")]
+    writer_features.insert(TableFeature::TimeNanos);
     writer_features.insert(TableFeature::VariantType);
     writer_features.insert(TableFeature::VariantTypePreview);
     writer_features.insert(TableFeature::V2Checkpoint);

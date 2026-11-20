@@ -2495,6 +2495,8 @@ fn scalar_to_py<'py>(value: &Scalar, py_date: &Bound<'py, PyAny>) -> PyResult<Bo
         Uint32(val) => val.into_py_any(py)?,
         #[cfg(feature = "unsigned-integers")]
         Uint64(val) => val.into_py_any(py)?,
+        #[cfg(feature = "nanosecond-time")]
+        TimeNanos(val) => val.into_py_any(py)?,
         Float(val) => val.into_py_any(py)?,
         Double(val) => val.into_py_any(py)?,
         Timestamp(_) => {
@@ -3400,6 +3402,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("_FLOAT16", cfg!(feature = "float16"))?;
     m.add("_UNSIGNED_INTEGERS", cfg!(feature = "unsigned-integers"))?;
+    m.add("_NANOSECOND_TIME", cfg!(feature = "nanosecond-time"))?;
     #[cfg(feature = "nanosecond-timestamps")]
     {
         // Default is casting happens, since nanosecond timestamps will be

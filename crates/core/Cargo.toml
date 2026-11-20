@@ -158,6 +158,13 @@ unsigned-integers = [
     "deltalake-kernel-executor?/unsigned-integers",
 ]
 
+# Experimental support for the time of day in nanoseconds primitive type
+nanosecond-time = [
+    "delta_kernel/nanosecond-time",
+    "delta_kernel_default_engine/nanosecond-time",
+    "deltalake-kernel-executor?/nanosecond-time",
+]
+
 integration_test = []
 
 # All integration tests are consolidated into two test binaries to keep

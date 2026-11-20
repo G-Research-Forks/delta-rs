@@ -491,6 +491,10 @@ pub(crate) fn is_public_min_max_stats_eligible_primitive(data_type: &PrimitiveTy
     let matches_f16 = false;
     #[cfg(feature = "float16")]
     let matches_f16 = matches!(data_type, &PrimitiveType::Float16);
+    #[cfg(not(feature = "nanosecond-time"))]
+    let matches_time_nanos = false;
+    #[cfg(feature = "nanosecond-time")]
+    let matches_time_nanos = matches!(data_type, &PrimitiveType::TimeNanos);
     #[cfg(not(feature = "unsigned-integers"))]
     let matches_unsigned = false;
     #[cfg(feature = "unsigned-integers")]
@@ -518,6 +522,7 @@ pub(crate) fn is_public_min_max_stats_eligible_primitive(data_type: &PrimitiveTy
     ) || matches_nanos
         || matches_f16
         || matches_unsigned
+        || matches_time_nanos
 }
 
 pub(crate) fn rb_from_scan_meta(metadata: ScanMetadata) -> DeltaResult<RecordBatch> {

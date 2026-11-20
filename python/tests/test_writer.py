@@ -23,6 +23,7 @@ from deltalake import (
 )
 from deltalake._internal import (
     _FLOAT16,
+    _NANOSECOND_TIME,
     _NANOSECOND_TIMESTAMPS,
     _UNSIGNED_INTEGERS,
     CommitFailedError,
@@ -1968,6 +1969,36 @@ def test_uint_arrow_types(tmp_path: pathlib.Path):
     else:
         expected_types = ["byte", "short", "integer", "long"]
     assert [f.type.type for f in dt.schema().fields] == expected_types
+
+
+@pytest.mark.pyarrow
+@pytest.mark.skipif(not _NANOSECOND_TIME, reason="nanosecond time not enabled")
+def test_time_nanos_partitions_and_stats(tmp_path: pathlib.Path):
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    # 13:06:07.123456789, with sub-microsecond digits to check nothing truncates them
+    afternoon = 47_167_123_456_789
+    times = pa.array([0, afternoon, afternoon + 1, None], pa.time64("ns"))
+    data = pa.table({"id": pa.array([0, 1, 2, 3], pa.int32()), "t": times})
+
+    partitioned_path = tmp_path / "partitioned"
+    write_deltalake(partitioned_path, data, partition_by=["t"])
+    result = DeltaTable(partitioned_path).to_pyarrow_table().sort_by("id")
+    assert result.schema.field("t").type == pa.time64("ns")
+    assert result["t"] == data["t"]
+
+    # Two files that differ only below the microsecond, so stats skipping has to keep
+    # full precision for the filter to return the right file.
+    stats_path = tmp_path / "stats"
+    write_deltalake(stats_path, data.slice(0, 2))
+    write_deltalake(stats_path, data.slice(2, 2), mode="append")
+    dataset = DeltaTable(stats_path).to_pyarrow_dataset()
+    threshold = pa.scalar(afternoon, pa.time64("ns"))
+    fragments = list(dataset.get_fragments(filter=ds.field("t") > threshold))
+    assert len(fragments) == 1
+    result = dataset.to_table(filter=ds.field("t") > threshold)
+    assert result["id"].to_pylist() == [2]
 
 
 @pytest.mark.pyarrow

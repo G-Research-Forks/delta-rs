@@ -583,6 +583,31 @@ fn test_unsigned_integer_literals() {
     }
 }
 
+#[cfg(feature = "nanosecond-time")]
+#[test]
+fn test_time_nanos_literals() {
+    let test_cases = vec![
+        (
+            lit(ScalarValue::Time64Nanosecond(Some(47_167_123_456_789))),
+            Scalar::TimeNanos(47_167_123_456_789),
+        ),
+        (
+            lit(ScalarValue::Time64Nanosecond(None)),
+            Scalar::Null(DataType::TIME_NANOS),
+        ),
+    ];
+
+    for (expr, expected) in test_cases {
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        assert_eq!(delta_expr, Expression::Literal(expected));
+    }
+
+    for nanos in [-1, 86_400_000_000_000] {
+        let expr = lit(ScalarValue::Time64Nanosecond(Some(nanos)));
+        assert!(to_delta_expression(&expr).is_err(), "{nanos}");
+    }
+}
+
 #[test]
 fn test_between_expressions() {
     // Test BETWEEN (not negated) - should be equivalent to: NOT (x < low OR x > high)

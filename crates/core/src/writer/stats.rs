@@ -16,6 +16,8 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 #[cfg(feature = "unsigned-integers")]
 use parquet::basic::IntType;
+#[cfg(feature = "nanosecond-time")]
+use parquet::basic::TimeType;
 use parquet::basic::Type;
 use parquet::basic::{ConvertedType, DecimalType, LogicalType};
 use parquet::file::metadata::ParquetMetaData;
@@ -27,6 +29,8 @@ use parquet::{
 use tracing::warn;
 
 use super::*;
+#[cfg(feature = "nanosecond-time")]
+use crate::kernel::scalars::{format_time_nanos, is_valid_time_nanos};
 use crate::kernel::{Add, scalars::ScalarExt};
 use crate::protocol::{ColumnValueStat, Stats};
 
@@ -281,6 +285,8 @@ enum StatsScalar {
     Float32(f32),
     Float64(f64),
     Date(chrono::NaiveDate),
+    #[cfg(feature = "nanosecond-time")]
+    TimeNanos(i64),
     Timestamp(chrono::NaiveDateTime),
     TimestampNtz(chrono::NaiveDateTime),
     // All values of a column share one precision and scale, so this orders by the unscaled value
@@ -356,6 +362,24 @@ impl StatsScalar {
                     Ok(Self::Timestamp(timestamp.naive_utc()))
                 } else {
                     Ok(Self::TimestampNtz(timestamp.naive_utc()))
+                }
+            }
+            #[cfg(feature = "nanosecond-time")]
+            (
+                Statistics::Int64(v),
+                Some(LogicalType::Time(TimeType {
+                    unit: TimeUnit::NANOS,
+                    ..
+                })),
+            ) => {
+                let nanos = get_stat!(v);
+                if is_valid_time_nanos(nanos) {
+                    Ok(Self::TimeNanos(nanos))
+                } else {
+                    Err(DeltaWriterError::StatsParsingFailed {
+                        debug_value: nanos.to_string(),
+                        logical_type: logical_type.cloned(),
+                    })
                 }
             }
             (Statistics::Int64(v), Some(LogicalType::Decimal(decimal_type))) => Ok(Self::Decimal {
@@ -497,6 +521,10 @@ impl StatsScalar {
             StatsScalar::Float32(v) => serde_json::Value::from(v),
             StatsScalar::Float64(v) => serde_json::Value::from(v),
             StatsScalar::Date(v) => serde_json::Value::from(v.format("%Y-%m-%d").to_string()),
+            #[cfg(feature = "nanosecond-time")]
+            StatsScalar::TimeNanos(v) => serde_json::Value::from(
+                format_time_nanos(v).expect("validated when parsing the statistics"),
+            ),
             StatsScalar::Timestamp(v) => {
                 // Timestamps must be truncated to millisecond precision when writing
                 // to JSON for compatibility with the Delta Protocol.

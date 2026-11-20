@@ -615,6 +615,18 @@ fn primitive_partition_values_to_array(
                 _ => None,
             },
         )?)) as ArrayRef,
+        #[cfg(feature = "nanosecond-time")]
+        PrimitiveType::TimeNanos => {
+            Arc::new(Time64NanosecondArray::from_iter(typed_partition_values(
+                field_name,
+                expected_data_type,
+                values,
+                |value| match value {
+                    Scalar::TimeNanos(value) => Some(*value),
+                    _ => None,
+                },
+            )?)) as ArrayRef
+        }
         PrimitiveType::Timestamp => Arc::new(
             TimestampMicrosecondArray::from_iter(typed_partition_values(
                 field_name,
@@ -760,6 +772,8 @@ fn scalar_type_name(value: &Scalar) -> &'static str {
         Scalar::TimestampNanos(_) => "TimestampNanos",
         #[cfg(feature = "nanosecond-timestamps")]
         Scalar::TimestampNanosNtz(_) => "TimestampNanosNtz",
+        #[cfg(feature = "nanosecond-time")]
+        Scalar::TimeNanos(_) => "TimeNanos",
         Scalar::TimestampNtz(_) => "TimestampNtz",
         Scalar::Decimal(_) => "Decimal",
         Scalar::Struct(_) => "Struct",

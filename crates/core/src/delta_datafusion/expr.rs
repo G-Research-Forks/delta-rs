@@ -64,6 +64,8 @@ use delta_kernel::schema::StructType;
 use tracing::log::*;
 
 use crate::delta_datafusion::session::DeltaParserOptions;
+#[cfg(feature = "nanosecond-time")]
+use crate::kernel::scalars::format_time_nanos;
 use crate::table::GeneratedColumn;
 use crate::{DeltaResult, DeltaTableError};
 
@@ -801,6 +803,15 @@ impl fmt::Display for ScalarValueFormat<'_> {
                 )?,
                 None => write!(f, "NULL")?,
             },
+            #[cfg(feature = "nanosecond-time")]
+            ScalarValue::Time64Nanosecond(e) => match e {
+                Some(e) => write!(
+                    f,
+                    "arrow_cast('{}', 'Time64(Nanosecond)')",
+                    format_time_nanos(*e).ok_or(Error)?
+                )?,
+                None => write!(f, "NULL")?,
+            },
             ScalarValue::Null => write!(f, "NULL")?,
             _ => return Err(Error),
         };
@@ -893,6 +904,12 @@ mod test {
             StructField::new(
                 "_date".to_string(),
                 DataType::Primitive(PrimitiveType::Date),
+                true,
+            ),
+            #[cfg(feature = "nanosecond-time")]
+            StructField::new(
+                "_time_nanos".to_string(),
+                DataType::Primitive(PrimitiveType::TimeNanos),
                 true,
             ),
             #[cfg(feature = "nanosecond-timestamps")]
@@ -1315,6 +1332,22 @@ mod test {
                             args: vec![
                                 lit(ScalarValue::Utf8(Some("2010-01-01T00:00:00.000000".into()))),
                                 lit(ScalarValue::Utf8(Some("Timestamp(Microsecond, Some(\"UTC\"))".into())))
+                            ]
+                        }
+                    )
+                )),
+            },
+            #[cfg(feature = "nanosecond-time")]
+            ParseTest {
+                expr: col("_time_nanos").gt(lit(ScalarValue::Time64Nanosecond(Some(47_167_123_456_789)))),
+                expected: "_time_nanos > arrow_cast('13:06:07.123456789', 'Time64(Nanosecond)')".to_string(),
+                override_expected_expr: Some(col("_time_nanos").gt(
+                    datafusion::logical_expr::Expr::ScalarFunction(
+                        ScalarFunction {
+                            func: arrow_cast(),
+                            args: vec![
+                                lit(ScalarValue::Utf8(Some("13:06:07.123456789".into()))),
+                                lit(ScalarValue::Utf8(Some("Time64(Nanosecond)".into())))
                             ]
                         }
                     )

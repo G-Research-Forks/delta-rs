@@ -67,6 +67,8 @@ nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]
 float16 = ["delta_kernel/float16", "dep:half"]
 # Experimental support for unsigned integer primitive types
 unsigned-integers = ["delta_kernel/unsigned-integers"]
+# Experimental support for the time of day in nanoseconds primitive type
+nanosecond-time = ["delta_kernel/nanosecond-time"]
 
 [lints]
 workspace = true

@@ -346,6 +346,8 @@ pub(crate) fn get_null_of_arrow_type(t: &ArrowDataType) -> DeltaResult<ScalarVal
                 TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(None, tz),
             })
         }
+        #[cfg(feature = "nanosecond-time")]
+        ArrowDataType::Time64(TimeUnit::Nanosecond) => Ok(ScalarValue::Time64Nanosecond(None)),
         ArrowDataType::Dictionary(k, v) => Ok(ScalarValue::Dictionary(
             k.clone(),
             Box::new(get_null_of_arrow_type(v)?),

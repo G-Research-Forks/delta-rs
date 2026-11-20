@@ -324,6 +324,16 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
             Some(value) => Ok(Scalar::Date(*value)),
             None => Ok(Scalar::Null(DataType::DATE)),
         },
+        // Arrow doesn't validate the range of `Time64` values, so check that the value is a
+        // time of day before accepting it.
+        #[cfg(feature = "nanosecond-time")]
+        ScalarValue::Time64Nanosecond(maybe_value) => match maybe_value {
+            Some(value) if (0..86_400_000_000_000).contains(value) => Ok(Scalar::TimeNanos(*value)),
+            Some(value) => {
+                plan_err!("Time64(Nanosecond) value {value} does not lie within a single day")
+            }
+            None => Ok(Scalar::Null(DataType::TIME_NANOS)),
+        },
         ScalarValue::Binary(maybe_value)
         | ScalarValue::LargeBinary(maybe_value)
         | ScalarValue::BinaryView(maybe_value)
