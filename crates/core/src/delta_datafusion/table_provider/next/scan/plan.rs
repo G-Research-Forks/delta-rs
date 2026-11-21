@@ -294,9 +294,21 @@ impl KernelScanPlan {
             kernel_predicate
         };
 
-        let scan_builder = snapshot
+        let mut scan_builder = snapshot
             .scan_builder()
             .with_predicate(scan_predicate.clone());
+
+        if !config.file_sort_order.is_empty() {
+            // Materialize file statistics for the declared sort order columns so
+            // scan file groups can be formed (and orderings validated) from
+            // per-file min/max values.
+            scan_builder = scan_builder.with_extra_stats_columns(
+                config
+                    .file_sort_order
+                    .iter()
+                    .map(|sort_column| ColumnName::new([sort_column.column.as_str()])),
+            );
+        }
 
         let scan = if contract.kernel_projection.is_some() {
             let kernel_projection_names = contract

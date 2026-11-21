@@ -26,6 +26,7 @@ mod operation_scope;
 mod read_delta_log_test;
 mod read_delta_partitions_test;
 mod scan_file_statistics;
+mod sort_order;
 mod timestamp_statistics;
 #[cfg(feature = "unsigned-integers")]
 mod unsigned_integers;

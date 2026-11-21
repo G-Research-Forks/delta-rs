@@ -25,7 +25,7 @@ use arrow_array::{
     ArrayRef, DictionaryArray, RecordBatch, StringArray, StringViewArray, UInt16Array,
 };
 use arrow_cast::{CastOptions, cast_with_options};
-use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaBuilder, SchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaBuilder, SchemaRef, SortOptions};
 use dashmap::DashMap;
 use datafusion::{
     catalog::Session,
@@ -42,7 +42,9 @@ use datafusion::{
         cache::{cache_manager::FileMetadataCache, default_cache::DefaultCache},
         object_store::ObjectStoreUrl,
     },
-    physical_expr::{Partitioning, conjunction, expressions::Column},
+    physical_expr::{
+        LexOrdering, Partitioning, PhysicalSortExpr, conjunction, expressions::Column,
+    },
     physical_plan::{
         ExecutionPlan, PhysicalExpr,
         coalesce_partitions::CoalescePartitionsExec,
@@ -53,8 +55,11 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_datasource::{
-    PartitionedFile, TableSchema, compute_all_files_statistics, file::FileSource,
-    file_groups::FileGroup, file_scan_config::FileScanConfigBuilder, source::DataSourceExec,
+    PartitionedFile, TableSchema, compute_all_files_statistics,
+    file::FileSource,
+    file_groups::FileGroup,
+    file_scan_config::{FileScanConfig, FileScanConfigBuilder},
+    source::DataSourceExec,
 };
 use datafusion_physical_expr_adapter::{
     BatchAdapter, BatchAdapterFactory, PhysicalExprAdapterFactory,
@@ -210,7 +215,159 @@ pub(super) async fn execution_plan(
         ))
     });
 
-    get_data_scan_plan(session, scan_plan, replayed, limit, file_pruner).await
+    let file_sort_order = resolve_file_sort_order(config, &scan_plan);
+    get_data_scan_plan(
+        session,
+        scan_plan,
+        replayed,
+        limit,
+        file_pruner,
+        file_sort_order,
+    )
+    .await
+}
+
+/// Resolve the configured per-file sort order into a physical ordering over
+/// the parquet read schema.
+///
+/// Column-mapped tables translate logical column names to physical parquet
+/// names. A sort column that is not part of the parquet scan (e.g. dropped by
+/// the query's projection) truncates the ordering there: the remaining prefix
+/// is still a valid ordering. Returns `None` when no order is configured or
+/// no prefix could be resolved.
+fn resolve_file_sort_order(
+    config: &DeltaScanConfig,
+    scan_plan: &KernelScanPlan,
+) -> Option<LexOrdering> {
+    if config.file_sort_order.is_empty() {
+        return None;
+    }
+    let table_config = scan_plan.table_configuration();
+    let column_mapping = table_config.is_feature_enabled(&TableFeature::ColumnMapping);
+    let read_schema = &scan_plan.parquet_read_schema;
+
+    let mut sort_exprs = Vec::with_capacity(config.file_sort_order.len());
+    for sort_column in &config.file_sort_order {
+        let physical_name = if column_mapping {
+            let Some(physical) = scan_plan
+                .scan
+                .logical_schema()
+                .field(&sort_column.column)
+                .and_then(|field| field.make_physical(table_config.column_mapping_mode()).ok())
+            else {
+                break;
+            };
+            physical.name().to_string()
+        } else {
+            sort_column.column.clone()
+        };
+        let Ok(index) = read_schema.index_of(&physical_name) else {
+            break;
+        };
+        sort_exprs.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(&physical_name, index)),
+            SortOptions {
+                descending: sort_column.descending,
+                nulls_first: sort_column.nulls_first,
+            },
+        ));
+    }
+    LexOrdering::new(sort_exprs)
+}
+
+/// The longest prefix of `ordering` whose columns provably contain no nulls
+/// in any of the files: either the column is non-nullable in the read schema,
+/// or every file's statistics report an exact null count of zero.
+///
+/// Nulls sort at one end of *each file*, so concatenating multiple files into
+/// one ordered group interleaves each file's nulls into the middle of the
+/// group's stream. Min/max statistics cannot detect this, so an ordering on a
+/// column that may contain nulls must not be declared for multi-file groups.
+fn null_free_ordering_prefix(
+    ordering: &LexOrdering,
+    read_schema: &SchemaRef,
+    files: &[PartitionedFile],
+) -> Option<LexOrdering> {
+    let sort_exprs = ordering
+        .iter()
+        .take_while(|sort_expr| {
+            let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
+                return false;
+            };
+            if !read_schema.field(column.index()).is_nullable() {
+                return true;
+            }
+            files.iter().all(|file| {
+                file.statistics
+                    .as_ref()
+                    .and_then(|stats| stats.column_statistics.get(column.index()))
+                    .is_some_and(|column_stats| column_stats.null_count == Precision::Exact(0))
+            })
+        })
+        .cloned()
+        .collect_vec();
+    LexOrdering::new(sort_exprs)
+}
+
+/// Build scan file groups such that the files within each group are mutually
+/// non-overlapping and ordered on the declared file sort order, so reading a
+/// group sequentially preserves that order.
+///
+/// The statistics-based grouping creates additional groups beyond the target
+/// partition count when file ranges overlap; with heavily overlapping files
+/// this degrades to one group per file. To bound the number of scan
+/// partitions, the result is only used when it stays within
+/// `max(64, 2 * target_partitions)` groups.
+///
+/// Falls back to the default grouping when that cap is exceeded, when
+/// statistics are unavailable, or when a group would exceed the file-id
+/// dictionary key space; the declared output ordering is then dropped by
+/// DataFusion's statistics-based validation of scan orderings rather than
+/// producing wrong results.
+fn split_file_groups_for_ordering(
+    files: Vec<PartitionedFile>,
+    ordering: &LexOrdering,
+    table_schema: &SchemaRef,
+    target_partitions: usize,
+) -> Vec<FileGroup> {
+    let max_groups = usize::max(64, target_partitions.saturating_mul(2));
+    let flat = vec![FileGroup::new(files.clone())];
+    match FileScanConfig::split_groups_by_statistics_with_target_partitions(
+        table_schema,
+        &flat,
+        ordering,
+        target_partitions.max(1),
+    ) {
+        Ok(groups)
+            if groups.len() <= max_groups
+                && groups
+                    .iter()
+                    .all(|group| group.len() <= MAX_PARTITION_DICT_CARDINALITY) =>
+        {
+            groups
+        }
+        Ok(groups) => {
+            if groups.len() > max_groups {
+                debug!(
+                    groups = groups.len(),
+                    max_groups,
+                    "file sort order grouping of heavily overlapping files produced too many groups; falling back to default grouping"
+                );
+            } else {
+                debug!(
+                    "file sort order grouping exceeded the file-id dictionary key space; falling back to default grouping"
+                );
+            }
+            partitioned_files_to_file_groups(files, target_partitions)
+        }
+        Err(err) => {
+            debug!(
+                error = %err,
+                "failed to group files by statistics for the declared file sort order; falling back to default grouping"
+            );
+            partitioned_files_to_file_groups(files, target_partitions)
+        }
+    }
 }
 
 /// Load deletion-vector keep masks for the selected files.
@@ -546,6 +703,8 @@ async fn get_data_scan_plan(
     replayed: ReplayedScanFiles,
     limit: Option<usize>,
     file_pruner: Option<Arc<RuntimeScanFilePruner>>,
+    // Sort order (over `parquet_read_schema`) that every data file adheres to.
+    file_sort_order: Option<LexOrdering>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ReplayedScanFiles {
         files,
@@ -722,6 +881,7 @@ async fn get_data_scan_plan(
         &file_id_field,
         predicate,
         file_pruner.as_ref().map(|pruner| pruner.predicate()),
+        file_sort_order.as_ref(),
     )
     .await?;
     let pq_plan = if has_deletion_vectors && pq_plan.properties().partitioning.partition_count() > 1
@@ -955,6 +1115,8 @@ async fn get_read_plan(
     // rows, and the deletion vector of a file must see all rows of that file. This predicate is
     // always set, because it keeps or removes a file with all its rows.
     file_predicate: Option<Arc<dyn PhysicalExpr>>,
+    // Sort order (over `parquet_read_schema`) that every data file adheres to.
+    file_sort_order: Option<&LexOrdering>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut plans = Vec::new();
 
@@ -1054,8 +1216,38 @@ async fn get_read_plan(
             file_source = file_source.with_predicate(predicate);
         }
 
-        let file_groups =
-            partitioned_files_to_file_groups(files, state.config().target_partitions());
+        let target_partitions = state.config().target_partitions();
+        let (file_groups, store_sort_order) = match file_sort_order {
+            Some(ordering) => {
+                let null_free_prefix =
+                    null_free_ordering_prefix(ordering, parquet_read_schema, &files);
+                let file_groups = split_file_groups_for_ordering(
+                    files,
+                    ordering,
+                    &full_table_schema,
+                    target_partitions,
+                );
+                // A single sorted file per group upholds the full ordering even
+                // when sort columns contain nulls; multi-file groups only
+                // uphold the prefix of the ordering that is provably null-free
+                // (see `null_free_ordering_prefix`).
+                let store_sort_order = if file_groups.iter().all(|group| group.len() <= 1) {
+                    Some(ordering.clone())
+                } else {
+                    if null_free_prefix.as_ref().map_or(0, |prefix| prefix.len()) < ordering.len() {
+                        debug!(
+                            "file sort order columns may contain nulls; declaring only the null-free prefix of the ordering"
+                        );
+                    }
+                    null_free_prefix
+                };
+                (file_groups, store_sort_order)
+            }
+            None => (
+                partitioned_files_to_file_groups(files, target_partitions),
+                None,
+            ),
+        };
         let full_table_width = full_table_schema.fields().len();
         let (file_groups, mut statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
@@ -1073,6 +1265,10 @@ async fn get_read_plan(
             .with_statistics(statistics)
             .with_limit(if has_deletion_vectors { None } else { limit })
             .with_expr_adapter(Some(adapter_factory.clone() as _));
+        let builder = match store_sort_order {
+            Some(ordering) => builder.with_output_ordering(vec![ordering]),
+            None => builder,
+        };
         let builder = if has_deletion_vectors {
             builder
                 .with_output_partitioning(Some(Partitioning::UnknownPartitioning(file_group_count)))
@@ -1896,6 +2092,7 @@ mod tests {
             &file_id_field,
             None,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1918,6 +2115,7 @@ mod tests {
             &parquet_predicate_schema,
             Some(1),
             &file_id_field,
+            None,
             None,
             None,
         )
@@ -1947,6 +2145,7 @@ mod tests {
             &parquet_predicate_schema_extended,
             Some(1),
             &file_id_field,
+            None,
             None,
             None,
         )
@@ -2024,6 +2223,7 @@ mod tests {
             &file_id_field,
             None,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2061,6 +2261,7 @@ mod tests {
             &parquet_predicate_schema_extended,
             None,
             &file_id_field,
+            None,
             None,
             None,
         )
@@ -2251,6 +2452,7 @@ mod tests {
             &file_id_field,
             None,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2316,6 +2518,7 @@ mod tests {
             &file_id_field,
             Some(&predicate),
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2379,6 +2582,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
@@ -2457,6 +2661,7 @@ mod tests {
             &file_id_field,
             Some(&predicate),
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2530,6 +2735,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
@@ -2605,6 +2811,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
@@ -2692,6 +2899,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
