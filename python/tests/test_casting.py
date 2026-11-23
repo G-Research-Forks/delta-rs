@@ -65,6 +65,30 @@ def test_append_unsigned_to_signed_column(tmp_path):
     assert sorted(result["foo"].to_pylist()) == [1, 2, 3, 4]
 
 
+@pytest.mark.skipif(
+    not _UNSIGNED_INTEGERS, reason="unsigned integer support not enabled"
+)
+def test_overwrite_schema_signed_column_with_unsigned(tmp_path):
+    write_deltalake(
+        tmp_path, Table.from_pydict({"foo": Array([1, 2], DataType.int8())})
+    )
+    # 200 doesn't fit in int8, so this only works if the column becomes uint8
+    write_deltalake(
+        tmp_path,
+        Table.from_pydict({"foo": Array([3, 200], DataType.uint8())}),
+        mode="overwrite",
+        schema_mode="overwrite",
+    )
+
+    dt = DeltaTable(tmp_path)
+    assert "unsignedIntegerTypes-dev" in (dt.protocol().writer_features or [])
+    result = (
+        QueryBuilder().register("tbl", dt).execute("select foo from tbl").read_all()
+    )
+    assert result.schema.field("foo").type == DataType.uint8()
+    assert sorted(result["foo"].to_pylist()) == [3, 200]
+
+
 @pytest.mark.parametrize("schema_mode", [None, "merge"])
 def test_append_fractional_float64_to_int64_rejected(tmp_path, schema_mode):
     """Appending fractional float64 values into an int64 column must raise
