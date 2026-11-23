@@ -421,7 +421,7 @@ impl ScalarExt for Scalar {
             Self::Integer(i) => Value::Number(serde_json::Number::from(*i)),
             Self::Long(l) => Value::Number(serde_json::Number::from(*l)),
             #[cfg(feature = "float16")]
-            Self::Float16(f) => Value::Number(serde_json::Number::from_f64(f.to_f64()).unwrap()),
+            Self::Float16(f) => Value::from(f.to_f64()),
             #[cfg(feature = "unsigned-integers")]
             Self::Uint8(u) => Value::Number(serde_json::Number::from(*u)),
             #[cfg(feature = "unsigned-integers")]
@@ -430,8 +430,9 @@ impl ScalarExt for Scalar {
             Self::Uint32(u) => Value::Number(serde_json::Number::from(*u)),
             #[cfg(feature = "unsigned-integers")]
             Self::Uint64(u) => Value::Number(serde_json::Number::from(*u)),
-            Self::Float(f) => Value::Number(serde_json::Number::from_f64(*f as f64).unwrap()),
-            Self::Double(d) => Value::Number(serde_json::Number::from_f64(*d).unwrap()),
+            // JSON has no representation of NaN or infinity, which become null
+            Self::Float(f) => Value::from(*f),
+            Self::Double(d) => Value::from(*d),
             Self::Boolean(b) => Value::Bool(*b),
             #[cfg(feature = "nanosecond-timestamps")]
             Self::TimestampNanos(ts) => {
@@ -867,6 +868,31 @@ mod tests {
             Scalar::Null(delta_kernel::schema::DataType::STRING).to_json(),
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn test_scalar_to_json_floats() {
+        assert_eq!(Scalar::Float(1.5).to_json(), serde_json::json!(1.5));
+        assert_eq!(Scalar::Double(-2.25).to_json(), serde_json::json!(-2.25));
+        #[cfg(feature = "float16")]
+        assert_eq!(
+            Scalar::Float16(f16::from_f32(1.5)).to_json(),
+            serde_json::json!(1.5)
+        );
+
+        // JSON can't represent non-finite values
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                Scalar::Float(value as f32).to_json(),
+                serde_json::Value::Null
+            );
+            assert_eq!(Scalar::Double(value).to_json(), serde_json::Value::Null);
+            #[cfg(feature = "float16")]
+            assert_eq!(
+                Scalar::Float16(f16::from_f64(value)).to_json(),
+                serde_json::Value::Null
+            );
+        }
     }
 
     #[test]
