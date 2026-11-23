@@ -7,6 +7,10 @@
 //! If the partitions are non-overlapping with respect to the sort order, then
 //! this merge is unnecessary, and we can stream the partitions one after another
 //! using a [`ProgressiveEvalExec`].
+//!
+//! Streaming partitions one after another is only sound when no operator below
+//! the merge needs all of its partitions to be running at once; see
+//! [`contains_hash_join`] for the one that does.
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Statistics;
@@ -15,9 +19,12 @@ use datafusion::common::{Result, ScalarValue};
 use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::source::DataSourceExec;
 
 use super::progressive_eval::ProgressiveEvalExec;
 use std::cmp::Ordering;
@@ -50,11 +57,14 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
                 return Ok(Transformed::no(plan));
             };
             let input = merge.input();
+            if contains_hash_join(input)? {
+                return Ok(Transformed::no(plan));
+            }
             let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
                 return Ok(Transformed::no(plan));
             };
-            let replacement =
-                ProgressiveEvalExec::new(Arc::clone(input), Some(ranges), merge.fetch());
+            let input = preserve_input_order(Arc::clone(input))?;
+            let replacement = ProgressiveEvalExec::new(input, Some(ranges), merge.fetch());
             Ok(Transformed::yes(Arc::new(replacement) as _))
         })
         .data()
@@ -67,6 +77,66 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Whether any node of `plan` is a [`HashJoinExec`].
+///
+/// A [`ProgressiveEvalExec`] executes its input partitions a few at a time,
+/// starting the next one only once an earlier one is exhausted. A hash join
+/// whose dynamic filter was pushed into the probe-side scan cannot be read
+/// that way: every probe partition reports its build-side bounds to a shared
+/// accumulator and then waits until *all* probe partitions have reported, so
+/// the partitions that are running wait for ones that will only be started
+/// after they finish, and the query hangs. The filter is attached by
+/// `FilterPushdown::new_post_optimization`, which runs before this rule, so
+/// it could be detected precisely; but joins over a scan that was regrouped
+/// for a sort are uncommon enough that the merge is simply kept for every
+/// hash join, which also does not depend on how the rules are ordered.
+fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    plan.exists(|node| {
+        Ok((node.as_ref() as &dyn ExecutionPlan)
+            .downcast_ref::<HashJoinExec>()
+            .is_some())
+    })
+}
+
+/// Mark the data sources under `plan` order-sensitive, so that they keep the
+/// partition-to-data mapping their per-partition statistics describe.
+///
+/// A file scan that declares no output ordering is free to let its sibling
+/// streams steal unopened files from one another at execution time, which is
+/// what `datafusion.execution.enable_file_stream_work_stealing` does by
+/// default. The partition boundaries proven above are then meaningless: a
+/// partition can emit rows planned for another. This is the case for a scan
+/// under a per-partition `SortExec` whose file groups were arranged by
+/// statistics without an ordering being declared for them.
+///
+/// Only leaves are asked: the nodes above forward `with_preserve_order` to
+/// their children and rebuild themselves, which the walk already does for the
+/// ancestors of a changed leaf. A file scan that keeps its files local is
+/// left as it is - `FileScanConfig::with_preserve_order` copies every file
+/// even when the flag already matches, and a scan regrouped for a pushed-down
+/// sort is already order-sensitive.
+fn preserve_input_order(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_down(|plan| {
+        if !plan.children().is_empty() || scan_keeps_files_local(&plan) {
+            return Ok(Transformed::no(plan));
+        }
+        match plan.with_preserve_order(true) {
+            Some(pinned) => Ok(Transformed::yes(pinned)),
+            None => Ok(Transformed::no(plan)),
+        }
+    })
+    .data()
+}
+
+/// Whether `plan` is a file scan whose streams cannot take each other's files:
+/// order-sensitive, or declaring an output partitioning, which disables the
+/// sharing as well.
+fn scan_keeps_files_local(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.downcast_ref::<DataSourceExec>()
+        .and_then(|scan| scan.data_source().as_ref().downcast_ref::<FileScanConfig>())
+        .is_some_and(|config| config.preserve_order || config.output_partitioning.is_some())
 }
 
 /// To be able to convert to a ProgressiveEval, we need the partitions to
@@ -189,27 +259,42 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
     use datafusion::common::stats::{ColumnStatistics, Precision};
     use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::common::{JoinType, NullEquality};
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::joins::PartitionMode;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PhysicalExpr, PlanProperties};
 
-    /// Leaf plan reporting fixed per-partition statistics; never executed.
+    /// Plan reporting fixed per-partition statistics; never executed. It is a
+    /// leaf unless given an `input`, which it reports regardless of.
     #[derive(Debug)]
     struct StatsExec {
         stats: Vec<Statistics>,
+        input: Option<Arc<dyn ExecutionPlan>>,
         cache: Arc<PlanProperties>,
     }
 
     impl StatsExec {
         fn plan(stats: Vec<Statistics>) -> Arc<dyn ExecutionPlan> {
+            Self::over(stats, None)
+        }
+
+        fn over(
+            stats: Vec<Statistics>,
+            input: Option<Arc<dyn ExecutionPlan>>,
+        ) -> Arc<dyn ExecutionPlan> {
             let cache = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(test_schema()),
                 Partitioning::UnknownPartitioning(stats.len()),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ));
-            Arc::new(Self { stats, cache })
+            Arc::new(Self {
+                stats,
+                input,
+                cache,
+            })
         }
     }
 
@@ -233,7 +318,7 @@ mod tests {
         }
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
+            self.input.iter().collect()
         }
 
         fn with_new_children(
@@ -265,6 +350,8 @@ mod tests {
         ) -> Result<Arc<Statistics>> {
             match args.partition() {
                 Some(idx) => Ok(Arc::new(self.stats[idx].clone())),
+                // A single partition's statistics are also the whole plan's.
+                None if self.stats.len() == 1 => Ok(Arc::new(self.stats[0].clone())),
                 None => Ok(Arc::new(Statistics::new_unknown(&self.schema()))),
             }
         }
@@ -576,5 +663,128 @@ mod tests {
         let ordering = LexOrdering::new(vec![asc(1, "id")]).unwrap();
 
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    /// Two partitions with disjoint `t` ranges: a merge on `t` over them is
+    /// replaceable by a progressive eval.
+    fn ordered_partitions() -> Arc<dyn ExecutionPlan> {
+        StatsExec::plan(vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(101, 200, 0), exact_i64(11, 20, 0)]),
+        ])
+    }
+
+    fn merge_on_t(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        Arc::new(SortPreservingMergeExec::new(ordering, input))
+    }
+
+    fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        ProgressiveEvalRule::new()
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn merge_over_ordered_partitions_is_replaced() {
+        let optimized = optimize(merge_on_t(ordered_partitions()));
+
+        assert!(
+            optimized.downcast_ref::<ProgressiveEvalExec>().is_some(),
+            "expected ProgressiveEvalExec, got {}",
+            optimized.name()
+        );
+    }
+
+    #[test]
+    fn merge_over_hash_join_is_kept() {
+        // DataFusion reports inexact statistics for a join, which already keeps
+        // the merge. Wrap the join in a node reporting exact, ordered statistics,
+        // so that only the hash join itself can keep the merge.
+        let build = StatsExec::plan(vec![partition(vec![
+            exact_i64(0, 0, 0),
+            exact_i64(5, 5, 0),
+        ])]);
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                build,
+                ordered_partitions(),
+                vec![(
+                    Arc::new(Column::new("id", 1)),
+                    Arc::new(Column::new("id", 1)),
+                )],
+                None,
+                &JoinType::RightSemi,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+        let ordered_stats = vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(101, 200, 0), exact_i64(11, 20, 0)]),
+        ];
+        let plan = StatsExec::over(ordered_stats, Some(join));
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        assert!(
+            ordered_partition_ranges(&plan, &ordering).is_some(),
+            "the partitions should look replaceable on statistics alone"
+        );
+
+        let optimized = optimize(merge_on_t(plan));
+
+        assert!(
+            optimized
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected SortPreservingMergeExec, got {}",
+            optimized.name()
+        );
+    }
+
+    /// A parquet scan over one file, order-sensitive or not.
+    fn parquet_scan(preserve_order: bool) -> Arc<dyn ExecutionPlan> {
+        use datafusion::datasource::physical_plan::ParquetSource;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion_datasource::file_groups::FileGroup;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::{PartitionedFile, TableSchema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let source = Arc::new(ParquetSource::new(TableSchema::from(schema)));
+        let group: FileGroup = [PartitionedFile::new("a", 10)].into_iter().collect();
+        let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file_groups(vec![group])
+            .with_preserve_order(preserve_order)
+            .build();
+        DataSourceExec::from_data_source(config)
+    }
+
+    /// A scan that already keeps its files local is handed back as it is:
+    /// asking it would copy every file for nothing.
+    #[test]
+    fn preserve_input_order_leaves_a_pinned_scan_untouched() {
+        let scan = parquet_scan(true);
+        let pinned = preserve_input_order(Arc::clone(&scan)).unwrap();
+        assert!(Arc::ptr_eq(&scan, &pinned));
+    }
+
+    /// An order-insensitive scan is pinned, and the nodes above it rebuilt
+    /// around the pinned leaf, whether or not they forward the request
+    /// themselves.
+    #[test]
+    fn preserve_input_order_pins_a_scan_through_its_parents() {
+        use datafusion::physical_plan::coop::CooperativeExec;
+
+        let scan = parquet_scan(false);
+        assert!(!scan_keeps_files_local(&scan));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CooperativeExec::new(scan));
+
+        let pinned = preserve_input_order(plan).unwrap();
+
+        assert!(pinned.downcast_ref::<CooperativeExec>().is_some());
+        assert!(scan_keeps_files_local(pinned.children()[0]));
     }
 }
