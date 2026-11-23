@@ -225,6 +225,7 @@ pub(super) async fn execution_plan(
         limit,
         file_pruner,
         file_sort_order,
+        config.assume_no_overlap_on_sort,
     )
     .await
 }
@@ -341,6 +342,39 @@ impl KeyTypes {
     }
 }
 
+/// Where the knowledge that files do not overlap comes from.
+///
+/// Delta statistics are per column, not lexicographic, so a multi-column sort
+/// order can leave files that do not really overlap looking as though they
+/// might. Two files sorted by `(date, time)` covering `(0, 17)..(1, 9)` and
+/// `(1, 17)..(2, 9)` report `date` in `[0, 1]` and `[1, 2]` and `time` in
+/// `[0, 23]` for both: the tie on `date` falls through to `time`, where the
+/// second file's minimum sits below the first's maximum. Nothing rules out an
+/// overlap, so [`Prove`](Self::Prove) refuses them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OverlapPolicy {
+    /// Order files only when their statistics show the ranges to be disjoint.
+    Prove,
+    /// Take the ranges to be disjoint on the table's say-so
+    /// ([`DeltaScanConfig::assume_no_overlap_on_sort`]), ordering the files on
+    /// their range endpoints alone.
+    Assume,
+}
+
+/// Reorder `items` by a permutation of their indices.
+fn apply_order<T>(items: Vec<T>, order: Vec<usize>) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|index| slots[index].take().expect("a permutation of the items"))
+        .collect()
+}
+
+/// The sort options of `ordering`, column by column.
+fn sort_options(ordering: &LexOrdering) -> Vec<SortOptions> {
+    ordering.iter().map(|sort_expr| sort_expr.options).collect()
+}
+
 /// Arrange `items` in the order in which their files (`file` reads the
 /// `PartitionedFile` off an item) are mutually non-overlapping on `ordering`.
 /// When they overlap or cannot be ordered, `Err` hands the items back as they
@@ -355,30 +389,58 @@ impl KeyTypes {
 /// Values that cannot be compared, and null bounds, refuse the files rather
 /// than being ordered arbitrarily. Nulls among the sort columns are the
 /// caller's concern: the bounds say nothing about them.
-pub(super) fn non_overlapping_file_order<T>(
+///
+/// The files are proven non-overlapping first, falling back on the table's
+/// assertion only when `overlap` allows it and the statistics could not.
+/// Under [`OverlapPolicy::Assume`] the overlap check is then replaced by the
+/// assertion and the files are placed on their endpoints alone; see
+/// [`non_overlapping_order`] for what that changes.
+///
+/// `Ok` carries the arrangement and whether the assertion is what produced it;
+/// tables the proving path already handled keep their behaviour either way.
+pub(super) fn arrange_non_overlapping_files<T>(
     items: Vec<T>,
     file: impl Fn(&T) -> &PartitionedFile,
     ordering: &LexOrdering,
-) -> Result<Vec<T>, Vec<T>> {
-    match non_overlapping_order(items.iter().map(file), ordering) {
-        Some(order) => {
-            let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
-            Ok(order
-                .into_iter()
-                .map(|index| slots[index].take().expect("a permutation of the items"))
-                .collect())
-        }
+    overlap: OverlapPolicy,
+) -> Result<(Vec<T>, bool), Vec<T>> {
+    // Reading the ranges walks every file's statistics and clones two bounds
+    // per sort column, so both policies run over the one reading. A table that
+    // asserts non-overlap is one the proving pass is expected to fail, so that
+    // walk would otherwise be paid for twice on every query against it.
+    let Some(ranges) = file_ranges(items.iter().map(file), ordering) else {
+        return Err(items);
+    };
+    let options = sort_options(ordering);
+    if let Some(order) = non_overlapping_order(&ranges, &options, OverlapPolicy::Prove) {
+        return Ok((apply_order(items, order), false));
+    }
+    if overlap == OverlapPolicy::Prove {
+        return Err(items);
+    }
+    match non_overlapping_order(&ranges, &options, OverlapPolicy::Assume) {
+        Some(order) => Ok((apply_order(items, order), true)),
         None => Err(items),
     }
 }
 
-/// [`non_overlapping_file_order`] as a permutation of `files`.
-fn non_overlapping_order<'a>(
+/// Each file's range endpoints under `ordering`, in the order the files came
+/// in; see [`FileRange`]. `None` when a file carries no usable bounds for the
+/// sort columns, which refuses the whole set.
+///
+/// Values that cannot be compared, and null bounds, refuse the files rather
+/// than being ordered arbitrarily.
+///
+/// The bounds are taken to be exact. Wider ones only make
+/// [`OverlapPolicy::Prove`] refuse more often and are safe there, but can make
+/// [`OverlapPolicy::Assume`] order files incorrectly. Asserting the
+/// non-overlapping property also asserts that the min/max statistics can be
+/// used to compute the sorted file order.
+fn file_ranges<'a>(
     files: impl IntoIterator<Item = &'a PartitionedFile>,
     ordering: &LexOrdering,
-) -> Option<Vec<usize>> {
-    // Each file's first and last key in sort order.
-    let mut ranges: Vec<(Vec<ScalarValue>, Vec<ScalarValue>, usize)> = Vec::new();
+) -> Option<Vec<FileRange>> {
+    let mut ranges: Vec<FileRange> = Vec::new();
     let mut key_types = KeyTypes::default();
     for (index, file) in files.into_iter().enumerate() {
         let stats = file.statistics.as_ref()?;
@@ -390,8 +452,8 @@ fn non_overlapping_order<'a>(
             // Read the bounds whatever their precision, as `MinMaxStatistics`
             // does. A null bound is an absent one: stats parsed against a
             // schema wider than the columns a writer indexed carry typed
-            // nulls for the rest, and `compare_rows` would place such a
-            // bound after every value rather than nowhere.
+            // nulls for the rest, and `compare_rows` would place such a bound
+            // after every value rather than nowhere.
             let min = column_stats.min_value.get_value()?;
             let max = column_stats.max_value.get_value()?;
             if min.is_null() || max.is_null() {
@@ -412,18 +474,128 @@ fn non_overlapping_order<'a>(
         }
         ranges.push((starts, ends, index));
     }
+    Some(ranges)
+}
 
-    let options: Vec<SortOptions> = ordering.iter().map(|sort_expr| sort_expr.options).collect();
+/// [`arrange_non_overlapping_files`] under one policy, as a permutation of
+/// the files behind `ranges`, which [`file_ranges`] read off them.
+///
+/// [`OverlapPolicy::Prove`] sorts the files on the start of their range and
+/// refuses the whole set as soon as one range reaches into the next.
+///
+/// [`OverlapPolicy::Assume`] takes the ranges to be disjoint and so orders the
+/// files on their endpoints alone; see [`assumed_range_cmp`] for how, and
+/// [`assumed_ranges_separate`] for the pairs it still refuses.
+///
+/// The ranges are read rather than consumed, so one reading of the statistics
+/// serves both policies; see [`arrange_non_overlapping_files`].
+fn non_overlapping_order(
+    ranges: &[FileRange],
+    options: &[SortOptions],
+    overlap: OverlapPolicy,
+) -> Option<Vec<usize>> {
     let cmp = |a: &[ScalarValue], b: &[ScalarValue]| {
-        compare_rows(a, b, &options).expect("endpoints share a non-nested type per column")
+        compare_rows(a, b, options).expect("endpoints share a non-nested type per column")
     };
-    ranges.sort_by(|a, b| cmp(&a.0, &b.0));
-    for pair in ranges.windows(2) {
-        if cmp(&pair[0].1, &pair[1].0) == Ordering::Greater {
-            return None;
+    let mut ordered: Vec<&FileRange> = ranges.iter().collect();
+    match overlap {
+        OverlapPolicy::Prove => {
+            ordered.sort_by(|a, b| cmp(&a.0, &b.0));
+            for pair in ordered.windows(2) {
+                if cmp(&pair[0].1, &pair[1].0) == Ordering::Greater {
+                    return None;
+                }
+            }
+        }
+        OverlapPolicy::Assume => {
+            ordered.sort_by(|a, b| assumed_range_cmp(a, b, options));
+            for pair in ordered.windows(2) {
+                if !assumed_ranges_separate(pair[0], pair[1], options) {
+                    return None;
+                }
+            }
         }
     }
-    Some(ranges.into_iter().map(|(_, _, index)| index).collect())
+    Some(ordered.into_iter().map(|(_, _, index)| *index).collect())
+}
+
+/// One file's range under the sort ordering: where it begins and where it ends
+/// on each sort column, plus the file's index among the files handed in.
+///
+/// Only the *leading* column's pair is the file's true first and last key. A
+/// file is sorted on that column first, so its minimum and maximum there are
+/// the values its first and last rows carry (potentially flipped for a
+/// descending order). On any later column the minimum
+/// and maximum are taken across the whole file and need not sit at its ends:
+/// a file running from `(5, 20)` to `(6, 1)` reports the second column as
+/// `[1, 20]`, neither end of which is where the file starts or stops.
+type FileRange = (Vec<ScalarValue>, Vec<ScalarValue>, usize);
+
+/// Compare two endpoints on sort column `column` alone, under that column's
+/// sort options.
+fn compare_endpoints(
+    a: &ScalarValue,
+    b: &ScalarValue,
+    column: usize,
+    options: &[SortOptions],
+) -> Ordering {
+    compare_rows(
+        std::slice::from_ref(a),
+        std::slice::from_ref(b),
+        &options[column..=column],
+    )
+    .expect("endpoints share a non-nested type per column")
+}
+
+/// Order two files taken to be disjoint, on their range endpoints alone.
+fn assumed_range_cmp(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> Ordering {
+    (0..options.len())
+        .find_map(|column| {
+            // Compare start values
+            match compare_endpoints(&a.0[column], &b.0[column], column, options) {
+                Ordering::Equal => {}
+                order => return Some(order),
+            }
+            // Compare end values in the case of equal starts. A file with a range
+            // inside another's span is ordered first.
+            match compare_endpoints(&a.1[column], &b.1[column], column, options) {
+                Ordering::Equal => None,
+                order => Some(order),
+            }
+        })
+        // All sort columns are equal so the files are considered equal:
+        .unwrap_or(Ordering::Equal)
+}
+
+/// Whether the statistics place `a` and `b` apart at all, so that
+/// [`assumed_range_cmp`] ordering them means something.
+///
+/// Walks the sort columns until one of them settles the pair:
+///
+/// * When ranges begin at different values, the file beginning earlier is
+///   ordered first.
+/// * Both ranges beginning with the same value can be ordered if one file
+///   has a constant value. The constant values file is ordered first.
+/// * If both are constant, move on to the next column.
+/// * If neither file holds a constant value, the files can't be ordered and
+///   we return false.
+///
+/// Running out of columns leaves both files pinned to the same key on every
+/// one of them, so either ordering is valid, and we return true.
+fn assumed_ranges_separate(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> bool {
+    let pinned = |range: &FileRange, column: usize| {
+        compare_endpoints(&range.0[column], &range.1[column], column, options) == Ordering::Equal
+    };
+    for column in 0..options.len() {
+        if compare_endpoints(&a.0[column], &b.0[column], column, options) != Ordering::Equal {
+            return true;
+        }
+        match (pinned(a, column), pinned(b, column)) {
+            (true, true) => continue,
+            (a_pinned, b_pinned) => return a_pinned || b_pinned,
+        }
+    }
+    true
 }
 
 /// Cut a globally ordered, mutually non-overlapping file list into contiguous
@@ -473,19 +645,43 @@ fn chunk_ordered_files(files: Vec<PartitionedFile>, target_partitions: usize) ->
 /// dictionary key space; the declared output ordering is then dropped by
 /// DataFusion's statistics-based validation of scan orderings rather than
 /// producing wrong results.
+///
+/// [`OverlapPolicy::Assume`] only comes into play once the statistics have
+/// failed to rule out an overlap. The files are then placed on those
+/// statistics alone, so there is always exactly one ordered run and the
+/// grouping below - along with its group cap - is reached only when a file
+/// cannot be placed at all. The caller is then responsible for re-declaring
+/// the ordering that DataFusion's validation drops; see
+/// [`DeltaScanExec::with_no_overlap_assumption`].
+///
+/// The returned flag reports whether the assertion was actually used; it is
+/// false whenever the ordinary statistics-proving path settled the order.
 fn split_file_groups_for_ordering(
     files: Vec<PartitionedFile>,
     ordering: &LexOrdering,
     table_schema: &SchemaRef,
     target_partitions: usize,
-) -> Vec<FileGroup> {
+    overlap: OverlapPolicy,
+) -> (Vec<FileGroup>, bool) {
     let max_groups = max_num_groups(target_partitions);
 
     // Missing/unusable statistics fall through: the grouping below fails the
     // same way and takes its default-grouping fallback.
-    let files = match non_overlapping_file_order(files, |file| file, ordering) {
-        Ok(ordered_files) => return chunk_ordered_files(ordered_files, target_partitions),
-        Err(files) => files,
+    let files = match arrange_non_overlapping_files(files, |file| file, ordering, overlap) {
+        Ok((ordered_files, assumed)) => {
+            return (
+                chunk_ordered_files(ordered_files, target_partitions),
+                assumed,
+            );
+        }
+        Err(files) => {
+            if overlap == OverlapPolicy::Assume {
+                debug!(
+                    "file statistics cannot place every file in the declared sort order; ignoring the no-overlap assertion"
+                );
+            }
+            files
+        }
     };
 
     let flat = vec![FileGroup::new(files)];
@@ -495,7 +691,7 @@ fn split_file_groups_for_ordering(
             target_partitions,
         )
     };
-    match FileScanConfig::split_groups_by_statistics_with_target_partitions(
+    let groups = match FileScanConfig::split_groups_by_statistics_with_target_partitions(
         table_schema,
         &flat,
         ordering,
@@ -530,7 +726,8 @@ fn split_file_groups_for_ordering(
             );
             default_grouping(flat)
         }
-    }
+    };
+    (groups, false)
 }
 
 /// Load deletion-vector keep masks for the selected files.
@@ -868,6 +1065,8 @@ async fn get_data_scan_plan(
     file_pruner: Option<Arc<RuntimeScanFilePruner>>,
     // Sort order (over `parquet_read_schema`) that every data file adheres to.
     file_sort_order: Option<LexOrdering>,
+    // Whether the table asserts its files never overlap on `file_sort_order`.
+    config_assumes_no_overlap: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ReplayedScanFiles {
         files,
@@ -1073,7 +1272,17 @@ async fn get_data_scan_plan(
         scan_plan.parquet_predicate.as_ref()
     };
     let file_id_field = scan_plan.contract.file_id_field.clone();
-    let pq_plan = get_read_plan(
+    // The assertion says files do not overlap on the declared sort order, so
+    // it means nothing without one. Scans with deletion vectors read through
+    // a single stream: their file groups are coalesced below, which
+    // interleaves them, so no arrangement of the groups can be declared.
+    let overlap = if config_assumes_no_overlap && file_sort_order.is_some() && !has_deletion_vectors
+    {
+        OverlapPolicy::Assume
+    } else {
+        OverlapPolicy::Prove
+    };
+    let (pq_plan, assumed_ordering) = get_read_plan(
         session,
         files_by_store,
         &scan_plan.parquet_read_schema,
@@ -1083,6 +1292,7 @@ async fn get_data_scan_plan(
         predicate,
         file_pruner.as_ref().map(|pruner| pruner.predicate()),
         file_sort_order.as_ref(),
+        overlap,
     )
     .await?;
     let pq_plan = if has_deletion_vectors && pq_plan.properties().partitioning.partition_count() > 1
@@ -1104,7 +1314,8 @@ async fn get_data_scan_plan(
         metrics,
     )
     .with_file_pruner(file_pruner)
-    .with_file_sort_order(file_sort_order);
+    .with_file_sort_order(file_sort_order)
+    .with_no_overlap_assumption(overlap, assumed_ordering);
 
     Ok(Arc::new(exec))
 }
@@ -1364,8 +1575,32 @@ async fn get_read_plan(
     file_predicate: Option<Arc<dyn PhysicalExpr>>,
     // Sort order (over `parquet_read_schema`) that every data file adheres to.
     file_sort_order: Option<&LexOrdering>,
-) -> Result<Arc<dyn ExecutionPlan>> {
+    // Whether the files may be taken to be non-overlapping on `file_sort_order`
+    // without proving it from their statistics. Narrowed to
+    // [`OverlapPolicy::Prove`] below when the files span several stores.
+    overlap: OverlapPolicy,
+    // Returns the read plan, plus the ordering (over `parquet_read_schema`) its
+    // partitions follow only by virtue of that assumption, if any.
+) -> Result<(Arc<dyn ExecutionPlan>, Option<LexOrdering>)> {
     let mut plans = Vec::new();
+    // Set when the grouping used relies on a non-overlapping assertion
+    // being set on the table.
+    let mut assumed_ordering = None;
+
+    // The per-store plans are unioned, which interleaves their files, so an
+    // arrangement resting on the non-overlapping assertion could not be
+    // declared for the result whatever each store's grouping looks like.
+    // Arranging on the assertion here would only displace the grouping DataFusion
+    // can certify by itself and leave the scan advertising no ordering at all,
+    // so this grouping keeps to what the statistics prove. The table's
+    // declaration is a separate matter, held by the exec: see
+    // [`DeltaScanExec::with_no_overlap_assumption`].
+    let files_by_store = files_by_store.into_iter().collect_vec();
+    let overlap = if files_by_store.len() > 1 {
+        OverlapPolicy::Prove
+    } else {
+        overlap
+    };
 
     // Relax nested-field nullability on the schema handed to the parquet source:
     // Delta's `nullable = false` is a write-time invariant, and Spark-written files
@@ -1469,11 +1704,12 @@ async fn get_read_plan(
                 let null_free_prefix =
                     null_free_ordering_prefix(ordering, parquet_read_schema, files.iter());
                 let null_free_len = null_free_prefix.as_ref().map_or(0, |prefix| prefix.len());
-                let file_groups = split_file_groups_for_ordering(
+                let (file_groups, assumed) = split_file_groups_for_ordering(
                     files,
                     ordering,
                     &full_table_schema,
                     target_partitions,
+                    overlap,
                 );
                 // A single sorted file per group upholds the full ordering even
                 // when sort columns contain nulls; multi-file groups only
@@ -1487,8 +1723,13 @@ async fn get_read_plan(
                             "file sort order columns may contain nulls; declaring only the null-free prefix of the ordering"
                         );
                     }
-                    null_free_prefix
+                    null_free_prefix.clone()
                 };
+                // Nulls within files prevent ordering even when the table asserts
+                // an ordering, so we can only declare the null-free prefix as an assumed order.
+                if assumed {
+                    assumed_ordering = null_free_prefix;
+                }
                 (file_groups, store_sort_order)
             }
             None => (
@@ -1539,11 +1780,14 @@ async fn get_read_plan(
         plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
     }
 
-    Ok(match plans.len() {
-        0 => Arc::new(EmptyExec::new(full_read_schema.clone())),
-        1 => plans.remove(0),
-        _ => UnionExec::try_new(plans)?,
-    })
+    Ok((
+        match plans.len() {
+            0 => Arc::new(EmptyExec::new(full_read_schema.clone())),
+            1 => plans.remove(0),
+            _ => UnionExec::try_new(plans)?,
+        },
+        assumed_ordering,
+    ))
 }
 
 // Small helper to reuse some code between exec and exec_meta
@@ -2094,8 +2338,12 @@ mod tests {
     }
 
     fn group_paths(group: &FileGroup) -> Vec<String> {
-        group
-            .iter()
+        file_names(group.iter())
+    }
+
+    fn file_names<'a>(files: impl IntoIterator<Item = &'a PartitionedFile>) -> Vec<String> {
+        files
+            .into_iter()
             .map(|file| file.object_meta.location.to_string())
             .collect()
     }
@@ -2110,8 +2358,14 @@ mod tests {
             stats_file("b", 100, 199),
         ];
 
-        let groups =
-            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+        let (groups, assumed) = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            2,
+            OverlapPolicy::Prove,
+        );
+        assert!(!assumed);
 
         assert_eq!(groups.len(), 2);
         assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "b.parquet"]);
@@ -2122,8 +2376,14 @@ mod tests {
     fn test_split_file_groups_more_targets_than_files() {
         let files = vec![stats_file("a", 0, 99), stats_file("b", 100, 199)];
 
-        let groups =
-            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 8);
+        let (groups, assumed) = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            8,
+            OverlapPolicy::Prove,
+        );
+        assert!(!assumed);
 
         assert_eq!(groups.len(), 2);
     }
@@ -2137,8 +2397,14 @@ mod tests {
             stats_file("c", 200, 299),
         ];
 
-        let groups =
-            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+        let (groups, assumed) = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            2,
+            OverlapPolicy::Prove,
+        );
+        assert!(!assumed);
 
         // Files within each group must still be non-overlapping.
         assert!(groups.len() >= 2);
@@ -2174,7 +2440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_overlapping_file_order_rejects_null_bounds() {
+    fn test_arrange_non_overlapping_files_rejects_null_bounds() {
         // `b` carries typed-null bounds, as a file whose statistics omit the
         // sort column does once parsed against the table schema. Its real
         // rows could fall anywhere, so no order is non-overlapping.
@@ -2191,9 +2457,311 @@ mod tests {
         }));
         let files = vec![stats_file("a", 0, 99), unbounded, stats_file("c", 100, 199)];
 
-        let result = non_overlapping_file_order(files, |file| file, &int64_asc_ordering());
+        let result = arrange_non_overlapping_files(
+            files,
+            |file| file,
+            &int64_asc_ordering(),
+            OverlapPolicy::Prove,
+        );
 
         assert!(result.is_err());
+    }
+
+    /// A `PartitionedFile` with exact statistics for two Int64 sort columns,
+    /// given as per-column `(min, max)` pairs.
+    fn two_column_stats_file(path: &str, first: (i64, i64), second: (i64, i64)) -> PartitionedFile {
+        let column = |(min, max): (i64, i64)| ColumnStatistics {
+            null_count: Precision::Exact(0),
+            min_value: Precision::Exact(ScalarValue::Int64(Some(min))),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(max))),
+            ..Default::default()
+        };
+        let mut file = PartitionedFile::new(format!("{path}.parquet"), 100);
+        file.statistics = Some(Arc::new(Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![column(first), column(second)],
+        }));
+        file
+    }
+
+    fn two_column_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("date", DataType::Int64, false),
+            Field::new("time", DataType::Int64, false),
+        ]))
+    }
+
+    fn two_column_asc_ordering() -> LexOrdering {
+        LexOrdering::new(vec![
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("date", 0)),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            ),
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("time", 1)),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            ),
+        ])
+        .expect("non-empty ordering")
+    }
+
+    fn assumed_order(files: Vec<PartitionedFile>, ordering: &LexOrdering) -> Option<Vec<String>> {
+        arrange_non_overlapping_files(files, |file| file, ordering, OverlapPolicy::Assume)
+            .ok()
+            .map(|(ordered, _)| file_names(&ordered))
+    }
+
+    #[test]
+    fn test_assumed_order_sorts_on_lexicographic_endpoints() {
+        // Day-boundary files: per-column statistics overlap on `time`, so only
+        // the assertion can place them. Deliberately out of order.
+        let files = vec![
+            two_column_stats_file("b", (1, 2), (0, 23)),
+            two_column_stats_file("a", (0, 1), (0, 23)),
+        ];
+
+        assert_eq!(
+            assumed_order(files.clone(), &two_column_asc_ordering()),
+            Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
+        );
+        // The same files are refused when the order has to be proven.
+        assert!(
+            arrange_non_overlapping_files(
+                files,
+                |file| file,
+                &two_column_asc_ordering(),
+                OverlapPolicy::Prove
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_assumed_order_breaks_equal_starts_on_the_end() {
+        // Both files start at the same key, so only the end separates them.
+        let files = vec![
+            two_column_stats_file("wide", (5, 6), (0, 23)),
+            two_column_stats_file("narrow", (5, 5), (0, 23)),
+        ];
+
+        assert_eq!(
+            assumed_order(files, &two_column_asc_ordering()),
+            Some(vec![
+                "narrow.parquet".to_string(),
+                "wide.parquet".to_string()
+            ])
+        );
+    }
+
+    /// Files meeting at a millisecond boundary, as the log reports them: `a`
+    /// truly ends at 100ms, but a timestamp maximum landing exactly on a
+    /// millisecond is read back rounded up to the next one. The widened bound
+    /// makes the files overlap, which the proof refuses, but under an
+    /// ascending order the files are placed on where they start, so the
+    /// widened maximum cannot put them the wrong way round.
+    #[test]
+    fn test_assumed_order_places_files_meeting_at_a_widened_maximum() {
+        let files = vec![stats_file("b", 100, 200), stats_file("a", 0, 101)];
+
+        assert!(
+            arrange_non_overlapping_files(
+                files.clone(),
+                |file| file,
+                &int64_asc_ordering(),
+                OverlapPolicy::Prove
+            )
+            .is_err()
+        );
+        assert_eq!(
+            assumed_order(files, &int64_asc_ordering()),
+            Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_assumed_order_reverses_for_a_descending_ordering() {
+        let files = vec![
+            two_column_stats_file("a", (0, 1), (0, 23)),
+            two_column_stats_file("b", (1, 2), (0, 23)),
+        ];
+        let descending = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("date", 0)),
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )])
+        .expect("non-empty ordering");
+
+        assert_eq!(
+            assumed_order(files, &descending),
+            Some(vec!["b.parquet".to_string(), "a.parquet".to_string()])
+        );
+    }
+
+    /// Identical bounds on a column the files span describe an overlap however
+    /// the table is declared, so the files are refused rather than ordered
+    /// arbitrarily.
+    #[test]
+    fn test_assumed_order_refuses_files_sharing_both_endpoints() {
+        let files = vec![
+            two_column_stats_file("a", (5, 5), (0, 23)),
+            two_column_stats_file("b", (5, 5), (0, 23)),
+        ];
+
+        assert_eq!(assumed_order(files, &two_column_asc_ordering()), None);
+    }
+
+    /// A file sitting inside one value of the leading column, followed by one
+    /// that crosses into the next value. Only the leading column's bounds are
+    /// the file's first and last key: the crossing file's second-column
+    /// minimum belongs to its *later* rows, so reading it would place that
+    /// file first. The leading column separates them on its own.
+    #[test]
+    fn test_assumed_order_ignores_later_columns_while_the_leading_one_spans() {
+        // a covers (5, 5)..(5, 10); b covers (5, 20)..(6, 1).
+        let files = vec![
+            two_column_stats_file("b", (5, 6), (1, 20)),
+            two_column_stats_file("a", (5, 5), (5, 10)),
+        ];
+
+        assert_eq!(
+            assumed_order(files, &two_column_asc_ordering()),
+            Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
+        );
+    }
+
+    /// Two files covering the same span of the leading column meet somewhere
+    /// inside it, so nothing the later columns say can place them.
+    #[test]
+    fn test_assumed_order_refuses_files_spanning_the_same_leading_range() {
+        let files = vec![
+            two_column_stats_file("a", (5, 6), (0, 9)),
+            two_column_stats_file("b", (5, 6), (10, 20)),
+        ];
+
+        assert_eq!(assumed_order(files, &two_column_asc_ordering()), None);
+    }
+
+    /// With the leading column pinned to one value in both files, the second
+    /// column's bounds are their first and last keys and do place them.
+    #[test]
+    fn test_assumed_order_reads_the_second_column_under_a_constant_first() {
+        let files = vec![
+            two_column_stats_file("late", (5, 5), (10, 20)),
+            two_column_stats_file("early", (5, 5), (0, 9)),
+        ];
+
+        assert_eq!(
+            assumed_order(files, &two_column_asc_ordering()),
+            Some(vec![
+                "early.parquet".to_string(),
+                "late.parquet".to_string()
+            ])
+        );
+    }
+
+    /// Two files pinned to the same single key hold nothing but that key, so
+    /// either order is sorted and both are kept.
+    #[test]
+    fn test_assumed_order_keeps_files_sharing_one_constant_key() {
+        let files = vec![
+            two_column_stats_file("b", (5, 5), (7, 7)),
+            two_column_stats_file("a", (5, 5), (7, 7)),
+        ];
+
+        assert_eq!(
+            assumed_order(files, &two_column_asc_ordering()),
+            Some(vec!["b.parquet".to_string(), "a.parquet".to_string()])
+        );
+    }
+
+    /// A file with no statistics at all cannot be placed. One whose bounds are
+    /// merely marked inexact can be: Delta marks every bound exact whether or
+    /// not it was widened, so screening on the mark would catch nothing that
+    /// matters while refusing files that are fine.
+    #[test]
+    fn test_assumed_order_places_inexact_bounds_but_not_missing_ones() {
+        let mut inexact = stats_file("b", 100, 199);
+        let stats = Arc::make_mut(inexact.statistics.as_mut().expect("statistics"));
+        stats.column_statistics[0].min_value = Precision::Inexact(ScalarValue::Int64(Some(100)));
+
+        assert_eq!(
+            assumed_order(vec![stats_file("a", 0, 99), inexact], &int64_asc_ordering()),
+            Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
+        );
+        assert_eq!(
+            assumed_order(
+                vec![
+                    stats_file("a", 0, 99),
+                    PartitionedFile::new("memory:///b.parquet", 100),
+                ],
+                &int64_asc_ordering()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_split_file_groups_assuming_no_overlap_groups_unprovable_files() {
+        let files = vec![
+            two_column_stats_file("b", (1, 2), (0, 23)),
+            two_column_stats_file("a", (0, 1), (0, 23)),
+        ];
+
+        // Without the assertion the files look overlapping and land in
+        // separate groups; with it they form one ordered run.
+        let (proven, assumed) = split_file_groups_for_ordering(
+            files.clone(),
+            &two_column_asc_ordering(),
+            &two_column_schema(),
+            1,
+            OverlapPolicy::Prove,
+        );
+        assert!(!assumed);
+        assert_eq!(proven.len(), 2);
+
+        let (groups, assumed) = split_file_groups_for_ordering(
+            files,
+            &two_column_asc_ordering(),
+            &two_column_schema(),
+            1,
+            OverlapPolicy::Assume,
+        );
+        assert!(assumed);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "b.parquet"]);
+    }
+
+    #[test]
+    fn test_split_file_groups_assuming_no_overlap_falls_back_without_statistics() {
+        let files = vec![
+            PartitionedFile::new("memory:///a.parquet", 100),
+            PartitionedFile::new("memory:///b.parquet", 100),
+        ];
+
+        let (groups, assumed) = split_file_groups_for_ordering(
+            files.clone(),
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            2,
+            OverlapPolicy::Assume,
+        );
+
+        assert!(!assumed, "the assertion must not be reported as applied");
+        // Same grouping as an unordered scan: round robin across target partitions.
+        let default_groups = partitioned_files_to_file_groups(files, 2);
+        assert_eq!(
+            groups.iter().map(group_paths).collect_vec(),
+            default_groups.iter().map(group_paths).collect_vec()
+        );
     }
 
     #[test]
@@ -2203,12 +2771,14 @@ mod tests {
             PartitionedFile::new("memory:///b.parquet", 100),
         ];
 
-        let groups = split_file_groups_for_ordering(
+        let (groups, assumed) = split_file_groups_for_ordering(
             files.clone(),
             &int64_asc_ordering(),
             &int64_sort_schema(),
             2,
+            OverlapPolicy::Prove,
         );
+        assert!(!assumed);
 
         // Same grouping as an unordered scan: round robin across target partitions.
         let default_groups = partitioned_files_to_file_groups(files, 2);
@@ -2546,7 +3116,7 @@ mod tests {
         let parquet_predicate_schema =
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -2556,6 +3126,7 @@ mod tests {
             None,
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2571,7 +3142,7 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &batches);
 
         // respect limits
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -2581,6 +3152,7 @@ mod tests {
             None,
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2601,7 +3173,7 @@ mod tests {
         ]));
         let parquet_predicate_schema_extended =
             build_parquet_predicate_schema(&arrow_schema_extended, &file_id_field);
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema_extended,
@@ -2611,6 +3183,7 @@ mod tests {
             None,
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2677,7 +3250,7 @@ mod tests {
         let parquet_predicate_schema =
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -2687,6 +3260,7 @@ mod tests {
             None,
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2717,7 +3291,7 @@ mod tests {
         ]));
         let parquet_predicate_schema_extended =
             build_parquet_predicate_schema(&arrow_schema_extended, &file_id_field);
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema_extended,
@@ -2727,6 +3301,7 @@ mod tests {
             None,
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2906,7 +3481,7 @@ mod tests {
         let parquet_predicate_schema =
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -2916,6 +3491,7 @@ mod tests {
             None,
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2928,6 +3504,152 @@ mod tests {
             "+----+-------+-----------------------------+",
         ];
         assert_batches_sorted_eq!(&expected, &batches);
+
+        Ok(())
+    }
+
+    /// The file groups of every parquet scan in a plan, in plan order.
+    fn plan_file_groups(plan: &Arc<dyn ExecutionPlan>) -> Vec<Vec<String>> {
+        let mut groups = Vec::new();
+        if let Some(source) = plan.downcast_ref::<DataSourceExec>()
+            && let Some(config) = source
+                .data_source()
+                .as_ref()
+                .downcast_ref::<FileScanConfig>()
+        {
+            groups.extend(config.file_groups.iter().map(group_paths));
+        }
+        for child in plan.children() {
+            groups.extend(plan_file_groups(child));
+        }
+        groups
+    }
+
+    async fn read_plan_file_groups(
+        state: &dyn Session,
+        files_by_store: Vec<FilesByStore>,
+        parquet_read_schema: &SchemaRef,
+        file_id_field: &FieldRef,
+        overlap: OverlapPolicy,
+    ) -> TestResult<(Vec<Vec<String>>, Option<LexOrdering>)> {
+        let parquet_predicate_schema =
+            build_parquet_predicate_schema(parquet_read_schema, file_id_field);
+        let (plan, assumed_ordering) = get_read_plan(
+            state,
+            files_by_store,
+            parquet_read_schema,
+            &parquet_predicate_schema,
+            None,
+            file_id_field,
+            None,
+            None,
+            Some(&int64_asc_ordering()),
+            overlap,
+        )
+        .await?;
+        Ok((plan_file_groups(&plan), assumed_ordering))
+    }
+
+    /// Files spanning several stores are grouped on their statistics alone,
+    /// whatever the table asserts: the per-store plans are unioned, so an
+    /// assumed arrangement could not be declared for the result and taking one
+    /// would only displace the grouping DataFusion can certify by itself.
+    #[tokio::test]
+    async fn test_multi_store_read_plan_ignores_no_overlap_assertion() -> TestResult {
+        let store_url_1 = Url::parse("first:///")?;
+        let store_url_2 = Url::parse("second:///")?;
+        let mut state = create_session().into_inner().state();
+        // Two groups per store, so an assumed arrangement and a proven one cut
+        // the same files differently.
+        state.config_mut().options_mut().execution.target_partitions = 2;
+        state
+            .runtime_env()
+            .register_object_store(&store_url_1, Arc::new(InMemory::new()));
+        state
+            .runtime_env()
+            .register_object_store(&store_url_2, Arc::new(InMemory::new()));
+
+        let file_id_field =
+            crate::delta_datafusion::file_id::file_id_field(Some(FILE_ID_COLUMN_DEFAULT));
+        let parquet_read_schema = int64_sort_schema();
+
+        // Ranges that overlap their neighbours, so no order can be proven and
+        // the assertion would otherwise place the files itself.
+        let store_files = |store: &str| {
+            [(0, 99), (50, 149), (100, 199), (150, 249)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (min, max))| {
+                    let name = format!("{store}-f{index}");
+                    let mut file = stats_file(&name, min, max);
+                    file.partition_values
+                        .push(wrap_file_id_value(format!("{store}:///{name}.parquet")));
+                    file
+                })
+                .collect_vec()
+        };
+        let one_store = vec![(
+            store_url_1.as_object_store_url(),
+            store_files("first"),
+            false,
+            None,
+        )];
+        let two_stores = vec![
+            (
+                store_url_1.as_object_store_url(),
+                store_files("first"),
+                false,
+                None,
+            ),
+            (
+                store_url_2.as_object_store_url(),
+                store_files("second"),
+                false,
+                None,
+            ),
+        ];
+
+        // These files are ones the assertion really does regroup, so the
+        // multi-store check below cannot pass for want of a difference.
+        let (proven, _) = read_plan_file_groups(
+            &state,
+            one_store.clone(),
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Prove,
+        )
+        .await?;
+        let (asserted, assumed_ordering) = read_plan_file_groups(
+            &state,
+            one_store,
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Assume,
+        )
+        .await?;
+        assert_ne!(proven, asserted);
+        assert!(assumed_ordering.is_some());
+
+        let (proven, _) = read_plan_file_groups(
+            &state,
+            two_stores.clone(),
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Prove,
+        )
+        .await?;
+        let (asserted, assumed_ordering) = read_plan_file_groups(
+            &state,
+            two_stores,
+            &parquet_read_schema,
+            &file_id_field,
+            OverlapPolicy::Assume,
+        )
+        .await?;
+        assert_eq!(proven, asserted);
+        // And with nothing arranged on the assertion, nothing is left for the
+        // exec to re-declare.
+        assert!(assumed_ordering.is_none());
 
         Ok(())
     }
@@ -2972,7 +3694,7 @@ mod tests {
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
         let predicate = col("id").eq(lit(2i32));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -2982,6 +3704,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -3037,7 +3760,7 @@ mod tests {
             build_parquet_predicate_schema(&logical_schema, &file_id_field);
         let predicate = col("missing").eq(lit(1i32));
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -3047,6 +3770,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -3115,7 +3839,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col("name").eq(lit(ScalarValue::Utf8View(Some("bob".to_string()))));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -3125,6 +3849,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -3190,7 +3915,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col("name").eq(lit("bob"));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -3200,6 +3925,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -3266,7 +3992,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col(physical_name).eq(lit("bob"));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -3276,6 +4002,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -3354,7 +4081,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col("data").eq(lit(ScalarValue::BinaryView(Some(b"bbb".to_vec()))));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -3364,6 +4091,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            OverlapPolicy::Prove,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
