@@ -3,7 +3,9 @@
 //! Evaluates the sort-order support on the table provider: tables whose
 //! parquet files are all sorted by a timestamp column can be scanned with a
 //! `SortPreservingMergeExec` instead of a full `SortExec` when the ordering is
-//! declared (`with_file_sort_order`).
+//! declared (`with_file_sort_order`). When the file ranges are additionally
+//! mutually non-overlapping, the merge is replaced by a `ProgressiveEvalExec`
+//! that plainly concatenates the range-ordered scan partitions.
 //!
 //! The generated table writes one commit per day, each containing a single
 //! record batch sorted by `timestamp`. Day ranges never overlap, so file
@@ -17,9 +19,12 @@ use deltalake_core::arrow::array::{ArrayRef, Float32Array, TimestampMicrosecondA
 use deltalake_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use deltalake_core::arrow::record_batch::RecordBatch;
 use deltalake_core::datafusion::catalog::Session;
+use deltalake_core::datafusion::execution::SessionStateBuilder;
 use deltalake_core::datafusion::physical_plan::{displayable, execute_stream};
+use deltalake_core::datafusion::prelude::{SessionConfig, SessionContext};
+use deltalake_core::delta_datafusion::planner::DeltaPlanner;
 use deltalake_core::delta_datafusion::{
-    create_session, DeltaRuntimeEnvBuilder, DeltaSessionContext, FileSortColumn,
+    create_session, DeltaRuntimeEnvBuilder, DeltaSessionConfig, FileSortColumn, ProgressiveEvalRule,
 };
 use deltalake_core::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 // parquet deprecates its object store reader, but unlike
@@ -156,6 +161,8 @@ pub async fn generate_sorted_table(table_url: &Url, params: &SortDataParams) -> 
             .with_save_mode(mode)
             .with_session_state(write_session.clone())
             .with_writer_properties(writer_properties())
+            // Increase target file size to avoid writes being split
+            .with_target_file_size(Some((10_000 * 1024 * 1024).try_into().unwrap()))
             .await?;
         println!(
             "day={day} rows={} gen_ms={} write_ms={}",
@@ -291,6 +298,15 @@ pub struct SortBenchParams {
     /// Override `datafusion.execution.target_partitions` (defaults to the
     /// number of CPU cores).
     pub target_partitions: Option<usize>,
+    /// Override `delta.progressive_eval_num_prefetch_input_streams`: how many
+    /// scan partitions `ProgressiveEvalExec` executes ahead of the one being
+    /// streamed.
+    pub prefetch_streams: Option<usize>,
+    /// Whether to install the `ProgressiveEvalRule` physical optimizer rule.
+    /// When disabled, non-overlapping ordered scans keep their
+    /// `SortPreservingMergeExec` instead of being concatenated by a
+    /// `ProgressiveEvalExec`.
+    pub progressive_eval: bool,
     /// Verify that the streamed timestamps are globally non-decreasing. Off by
     /// default because the per-row check adds time to the measured run.
     pub check_order: bool,
@@ -302,6 +318,7 @@ pub struct SortBenchReport {
     pub plan: String,
     pub has_sort_exec: bool,
     pub has_sort_preserving_merge: bool,
+    pub has_progressive_eval: bool,
     /// Time to build the table provider.
     pub provider: Duration,
     /// Time to plan the query.
@@ -567,6 +584,7 @@ async fn run_sequential_read(
         ),
         has_sort_exec: false,
         has_sort_preserving_merge: false,
+        has_progressive_eval: false,
         provider: provider_elapsed,
         planning: Duration::ZERO,
         first_batch: state.first_batch,
@@ -599,18 +617,47 @@ pub async fn run_sort_bench_once(
     let extra_columns = extra_column_names(&table)?;
     let sql = build_query(&extra_columns, params);
 
-    let ctx = match params.memory_limit_bytes {
-        Some(bytes) => DeltaSessionContext::with_runtime_env(
-            DeltaRuntimeEnvBuilder::new()
-                .with_max_spill_size(bytes)
-                .build(),
-        ),
-        None => create_session(),
+    let mut config: SessionConfig = DeltaSessionConfig::default().into();
+    if params.mode == SortBenchMode::Declared {
+        // Byte-range splitting of file scans defeats the progressive-eval
+        // concatenation (the ranges carry whole-file statistics, so scan
+        // partitions overlap). Only the declared mode needs it disabled;
+        // the other modes keep the DataFusion default.
+        config
+            .options_mut()
+            .set("datafusion.optimizer.repartition_file_scans", "false")?;
     }
-    .into_inner();
+    let planner = DeltaPlanner::new();
+    let runtime_env = match params.memory_limit_bytes {
+        Some(bytes) => DeltaRuntimeEnvBuilder::new()
+            .with_max_spill_size(bytes)
+            .build(),
+        None => DeltaRuntimeEnvBuilder::new().build(),
+    };
+    let mut state_builder = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(config)
+        .with_runtime_env(runtime_env)
+        .with_query_planner(planner);
+    if params.progressive_eval {
+        state_builder =
+            state_builder.with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()));
+    }
+    let state = state_builder.build();
+
+    let ctx = SessionContext::new_with_state(state);
+
     if let Some(partitions) = params.target_partitions {
         ctx.sql(&format!(
             "SET datafusion.execution.target_partitions = {partitions}"
+        ))
+        .await?
+        .collect()
+        .await?;
+    }
+    if let Some(streams) = params.prefetch_streams {
+        ctx.sql(&format!(
+            "SET delta.progressive_eval_num_prefetch_input_streams = {streams}"
         ))
         .await?
         .collect()
@@ -682,6 +729,7 @@ pub async fn run_sort_bench_once(
     Ok(SortBenchReport {
         has_sort_exec: rendered.contains("SortExec"),
         has_sort_preserving_merge: rendered.contains("SortPreservingMergeExec"),
+        has_progressive_eval: rendered.contains("ProgressiveEvalExec"),
         plan: rendered,
         provider: provider_elapsed,
         planning: planning_elapsed,

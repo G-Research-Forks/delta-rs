@@ -529,6 +529,21 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // When this scan declares an output ordering, partitioning the input further
+        // is not desirable as this loses exact statistics and ordering information,
+        // which can prevent certain optimizations such as using a sort-preserving
+        // merge or progressive evaluation to handle sorted reads.
+        // Unordered scans keep the default behaviour and benefit from the added
+        // parallelism of round-robin repartitioning.
+        let has_ordering = !self
+            .properties
+            .equivalence_properties()
+            .oeq_class()
+            .is_empty();
+        vec![!has_ordering]
+    }
+
     // TODO: setting this will fail certain tests, but why
     // fn maintains_input_order(&self) -> Vec<bool> {
     //     vec![true]

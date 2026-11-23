@@ -235,15 +235,21 @@ cargo run --release -p delta-benchmarks -- sort-bench --table-path ./data/sorted
 
 For each mode the query `SELECT ... FROM t ORDER BY timestamp` is planned and
 streamed to completion, reporting plan shape (`sort_exec`, `spm` =
-SortPreservingMergeExec), planning time, time to first batch, total time, and —
-when `--check-order` is passed — whether the streamed rows were actually in
-order (`sorted`).
+SortPreservingMergeExec, `progressive_eval` = ProgressiveEvalExec), planning
+time, time to first batch, total time, and — when `--check-order` is passed —
+whether the streamed rows were actually in order (`sorted`).
 
 - `--modes <baseline,declared,unordered,sequential-read,sequential-read-async>`:
   configurations to compare (default all). `baseline` declares no ordering and
   needs a full `SortExec`; `declared` uses `with_file_sort_order`, satisfying
-  the ORDER BY at planning time with a merge over parallel pre-grouped ordered
-  partitions; `unordered` drops the ORDER BY entirely, reading in arbitrary
+  the ORDER BY at planning time — when the file ranges are mutually
+  non-overlapping (as `sort-gen` produces), the scan partitions are contiguous
+  range-ordered chunks and the merge is replaced by a `ProgressiveEvalExec`
+  concatenation, otherwise a merge over parallel pre-grouped ordered
+  partitions remains (this mode alone disables
+  `datafusion.optimizer.repartition_file_scans`, whose byte-range splitting
+  would otherwise defeat the concatenation; the other modes keep the
+  DataFusion default); `unordered` drops the ORDER BY entirely, reading in arbitrary
   order with no sorting needed, as a lower bound for comparison;
   `sequential-read` bypasses the delta-rs scan and DataFusion entirely and
   reads the parquet files directly with the parquet crate, single-threaded and
@@ -263,6 +269,13 @@ order (`sorted`).
 - `--memory-limit-gb <n>`: memory budget backed by a spill pool, so the
   baseline full sort spills instead of exhausting memory (default 0 = no
   limit)
+- `--prefetch-streams <n>`: sets
+  `delta.progressive_eval_num_prefetch_input_streams` — how many scan
+  partitions `ProgressiveEvalExec` executes ahead of the one being streamed
+  (default 1, minimum 0 = no read-ahead). Higher values
+  overlap more read I/O with streaming at the cost of eagerly executing more
+  partitions; only affects `declared` runs that plan the progressive-eval
+  concatenation.
 - `--target-partitions <n>`: override `datafusion.execution.target_partitions`
 - `--check-order`: verify that the streamed timestamps are globally
   non-decreasing, reported as `sorted` with a description of the first

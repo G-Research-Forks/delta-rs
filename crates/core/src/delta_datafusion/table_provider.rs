@@ -473,6 +473,22 @@ impl TableProviderBuilder {
     /// The number of groups is bounded, however, so if the reordering requires
     /// too many groups, DataFusion will fall back to a regular sort.
     ///
+    /// When no files overlap at all, the groups themselves are arranged as
+    /// contiguous non-overlapping ranges and even the sort-preserving merge is
+    /// avoided: sessions with the
+    /// [`ProgressiveEvalRule`](crate::delta_datafusion::ProgressiveEvalRule)
+    /// physical optimizer rule registered (the default for
+    /// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext)
+    /// sessions) concatenate the scan partitions in range order instead.
+    ///
+    /// Note that when there are fewer files than
+    /// `datafusion.execution.target_partitions`, DataFusion may split
+    /// individual files into byte ranges to fill the target. Each range
+    /// carries the whole file's statistics, so the resulting scan partitions
+    /// overlap and the `ProgressiveEvalRule` cannot apply. To keep the
+    /// progressive-eval concatenation available regardless of file count or
+    /// CPU cores, set `datafusion.optimizer.repartition_file_scans` to false.
+    ///
     /// Scans of tables with deletion vectors, or scans that retain a row index
     /// column, must read through a single stream and do not expose the
     /// ordering, so ordered queries over them still sort.

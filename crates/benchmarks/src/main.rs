@@ -143,6 +143,19 @@ enum Command {
         #[arg(long)]
         target_partitions: Option<usize>,
 
+        /// Number of scan partitions ProgressiveEvalExec executes ahead of
+        /// the one being streamed (sets
+        /// delta.progressive_eval_num_prefetch_input_streams).
+        /// Only affects plans that use the progressive-eval concatenation.
+        #[arg(long)]
+        prefetch_streams: Option<usize>,
+
+        /// Disable the ProgressiveEvalRule physical optimizer rule:
+        /// non-overlapping ordered scans keep their SortPreservingMergeExec
+        /// instead of being concatenated by a ProgressiveEvalExec.
+        #[arg(long)]
+        disable_progressive_eval: bool,
+
         /// Verify that the streamed timestamps are globally non-decreasing.
         /// Off by default because the per-row check adds time to the measured
         /// run.
@@ -316,6 +329,8 @@ async fn main() -> anyhow::Result<()> {
             iterations,
             memory_limit_gb,
             target_partitions,
+            prefetch_streams,
+            disable_progressive_eval,
             check_order,
             show_plan,
         } => {
@@ -342,6 +357,8 @@ async fn main() -> anyhow::Result<()> {
                     limit,
                     memory_limit_bytes,
                     target_partitions,
+                    prefetch_streams,
+                    progressive_eval: !disable_progressive_eval,
                     check_order,
                 };
                 for iter in 0..iterations {
@@ -350,10 +367,11 @@ async fn main() -> anyhow::Result<()> {
                         println!("--- {} plan ---\n{}", mode.name(), report.plan.trim_end());
                     }
                     println!(
-                        "mode={} iter={iter} sort_exec={} spm={} provider_ms={} plan_ms={} first_batch_ms={} total_ms={} rows={} batches={} sorted={} peak_rss_mb={}",
+                        "mode={} iter={iter} sort_exec={} spm={} progressive_eval={} provider_ms={} plan_ms={} first_batch_ms={} total_ms={} rows={} batches={} sorted={} peak_rss_mb={}",
                         mode.name(),
                         report.has_sort_exec,
                         report.has_sort_preserving_merge,
+                        report.has_progressive_eval,
                         report.provider.as_millis(),
                         report.planning.as_millis(),
                         report

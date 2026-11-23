@@ -78,7 +78,7 @@ pub(crate) use table_provider::next::RuntimeFileFilter;
 pub(crate) use table_provider::next::normalize_path_as_file_id;
 pub use table_provider::{
     DeltaScanConfig, DeltaScanConfigBuilder, FileSortColumn, TableProviderBuilder,
-    next::DeltaScanExec,
+    next::{DeltaScanExec, ProgressiveEvalRule},
 };
 pub(crate) use table_provider::{
     next::FILE_ID_COLUMN_DEFAULT, resolve_file_column_name, update_datafusion_session,

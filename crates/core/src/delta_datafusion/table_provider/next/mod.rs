@@ -57,10 +57,11 @@ use crate::logstore::LogStoreRef;
 use crate::protocol::SaveMode;
 use crate::table::normalize_table_url;
 
-// Not yet wired into planning; the ProgressiveEval optimizer rule will use it.
-#[allow(dead_code)]
 mod progressive_eval;
+mod progressive_eval_rule;
 mod scan;
+
+pub use self::progressive_eval_rule::ProgressiveEvalRule;
 
 /// Default column name for the file id column we add to files read from disk.
 pub(crate) use crate::delta_datafusion::file_id::FILE_ID_COLUMN_DEFAULT;
