@@ -453,13 +453,16 @@ impl WriteBuilder {
                         })?;
                     #[cfg(feature = "nanosecond-timestamps")]
                     PROTOCOL.check_can_write_timestamp_nanos(snapshot, &schema)?;
-                    #[cfg(feature = "float16")]
-                    PROTOCOL.check_can_write_float16(snapshot, &schema)?;
-                    #[cfg(feature = "unsigned-integers")]
+                    #[cfg(any(
+                        feature = "float16",
+                        feature = "unsigned-integers",
+                        feature = "nanosecond-time"
+                    ))]
                     {
-                        // Data for existing columns is cast to the table's type, so unsigned
-                        // input into a signed column is fine. Only new columns could add an
-                        // unsigned type to the table.
+                        // Data for existing columns is cast to the table's type, so for
+                        // example float16 input into a float column, or unsigned input into a
+                        // signed column, is fine. Only new columns could add these types to
+                        // the table.
                         let table_schema = snapshot.schema();
                         let new_fields = StructType::try_new(
                             schema
@@ -467,10 +470,13 @@ impl WriteBuilder {
                                 .filter(|f| table_schema.field(f.name()).is_none())
                                 .cloned(),
                         )?;
+                        #[cfg(feature = "float16")]
+                        PROTOCOL.check_can_write_float16(snapshot, &new_fields)?;
+                        #[cfg(feature = "unsigned-integers")]
                         PROTOCOL.check_can_write_unsigned_integers(snapshot, &new_fields)?;
+                        #[cfg(feature = "nanosecond-time")]
+                        PROTOCOL.check_can_write_time_nanos(snapshot, &new_fields)?;
                     }
-                    #[cfg(feature = "nanosecond-time")]
-                    PROTOCOL.check_can_write_time_nanos(snapshot, &schema)?;
                     PROTOCOL.check_can_write_variant(snapshot, &schema)?;
                 }
                 match self.mode {
@@ -4033,6 +4039,68 @@ mod tests {
         assert_eq!(
             stat(files[0].max_values()),
             Scalar::TimeNanos(47_167_123_456_789)
+        );
+    }
+
+    #[cfg(feature = "float16")]
+    #[rstest::rstest]
+    #[case::no_schema_mode(None)]
+    #[case::merge_schema(Some(SchemaMode::Merge))]
+    #[tokio::test]
+    async fn test_append_float16_to_float_column(#[case] schema_mode: Option<SchemaMode>) {
+        use arrow_array::{Float16Array, Float32Array};
+        use delta_kernel::table_features::TableFeature;
+
+        let float_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Float32,
+            true,
+        )]));
+        let floats = RecordBatch::try_new(
+            float_schema,
+            vec![Arc::new(Float32Array::from(vec![Some(1.0), None]))],
+        )
+        .unwrap();
+        let table = DeltaTable::new_in_memory()
+            .write(vec![floats])
+            .await
+            .unwrap();
+
+        let half_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Float16,
+            true,
+        )]));
+        let halves = RecordBatch::try_new(
+            half_schema,
+            vec![Arc::new(Float16Array::from(vec![
+                f16::from_f32(2.5),
+                f16::from_f32(-0.5),
+            ]))],
+        )
+        .unwrap();
+        let mut write = table.write(vec![halves]).with_save_mode(SaveMode::Append);
+        if let Some(schema_mode) = schema_mode {
+            write = write.with_schema_mode(schema_mode);
+        }
+        let table = write.await.unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            !protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        assert_eq!(
+            batches[0]
+                .schema()
+                .field_with_name("x")
+                .unwrap()
+                .data_type(),
+            &DataType::Float32
         );
     }
 
