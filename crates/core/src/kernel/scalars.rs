@@ -78,11 +78,11 @@ pub(crate) fn format_time_nanos(nanos: i64) -> Option<String> {
 }
 
 #[cfg(feature = "nanosecond-time")]
-/// Formats a [`Scalar::TimeNanos`] value, which conversions into a [`Scalar`] in this
-/// crate only create for values within a single day.
+/// Formats a [`Scalar::TimeNanos`] value. Conversions into a [`Scalar`] in this crate only
+/// create values within a single day, but other code can construct any value, and those are
+/// formatted as the raw number of nanoseconds, as [`Scalar`]'s `Display` does.
 fn format_time_nanos_scalar(nanos: i64) -> String {
-    format_time_nanos(nanos)
-        .unwrap_or_else(|| panic!("TimeNanos value {nanos} does not lie within a single day"))
+    format_time_nanos(nanos).unwrap_or_else(|| nanos.to_string())
 }
 
 /// Auxiliary methods for dealing with kernel scalars
@@ -635,6 +635,10 @@ mod tests {
             assert_eq!(format_time_nanos(nanos), None, "{nanos}");
             let array = Time64NanosecondArray::from(vec![nanos]);
             assert_eq!(Scalar::from_array(&array, 0), None, "{nanos}");
+            // A scalar constructed directly is serialized without panicking
+            let scalar = Scalar::TimeNanos(nanos);
+            assert_eq!(scalar.serialize(), nanos.to_string());
+            assert_eq!(scalar.to_json(), serde_json::json!(nanos.to_string()));
         }
     }
 
