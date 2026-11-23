@@ -793,11 +793,6 @@ fn apply_min_max_for_column(
     }
 }
 
-/// Map the old (old!) [parquet::basic::ConvertedType] into the more modern
-/// [parquet::basic::LogicalType]
-///
-/// Because this is a legacy format helper function, ro types which might not be easy to convert
-/// from one struct to the other, it will just return `None`
 #[cfg(feature = "unsigned-integers")]
 static UNSIGNED_INTEGER_LOGICAL_TYPES: [LogicalType; 4] = [
     LogicalType::Integer(IntType {
@@ -818,6 +813,11 @@ static UNSIGNED_INTEGER_LOGICAL_TYPES: [LogicalType; 4] = [
     }),
 ];
 
+/// Map the old (old!) [parquet::basic::ConvertedType] into the more modern
+/// [parquet::basic::LogicalType]
+///
+/// Because this is a legacy format helper function, ro types which might not be easy to convert
+/// from one struct to the other, it will just return `None`
 fn converted_to_logical_type(converted: ConvertedType) -> Option<&'static LogicalType> {
     match converted {
         ConvertedType::UTF8 => Some(&LogicalType::String),
