@@ -2493,8 +2493,10 @@ fn scalar_to_py<'py>(value: &Scalar, py_date: &Bound<'py, PyAny>) -> PyResult<Bo
         Uint16(val) => val.into_py_any(py)?,
         #[cfg(feature = "unsigned-integers")]
         Uint32(val) => val.into_py_any(py)?,
+        // pyarrow infers int64 for a Python int, which overflows above i64::MAX, so pass the
+        // value as text to be cast to the column type, as for decimals
         #[cfg(feature = "unsigned-integers")]
-        Uint64(val) => val.into_py_any(py)?,
+        Uint64(_) => value.serialize().into_py_any(py)?,
         #[cfg(feature = "nanosecond-time")]
         TimeNanos(val) => val.into_py_any(py)?,
         Float(val) => val.into_py_any(py)?,

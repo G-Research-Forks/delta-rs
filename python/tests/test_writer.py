@@ -1934,6 +1934,28 @@ def test_partition_large_arrow_types(tmp_path: pathlib.Path):
     assert expected == result
 
 
+@pytest.mark.pyarrow
+@pytest.mark.skipif(
+    not _UNSIGNED_INTEGERS, reason="unsigned integer support not enabled"
+)
+def test_uint64_partition_above_signed_maximum(tmp_path: pathlib.Path):
+    import pyarrow as pa
+
+    values = [1, 2**63, 2**64 - 1]
+    data = pa.table(
+        {
+            "id": pa.array([0, 1, 2], pa.int32()),
+            "u64": pa.array(values, pa.uint64()),
+        }
+    )
+    write_deltalake(tmp_path, data, partition_by=["u64"])
+
+    dt = DeltaTable(tmp_path)
+    result = dt.to_pyarrow_table().sort_by("id")
+    assert result.schema.field("u64").type == pa.uint64()
+    assert result["u64"].to_pylist() == values
+
+
 def test_uint_arrow_types(tmp_path: pathlib.Path):
     table = Table(
         {
