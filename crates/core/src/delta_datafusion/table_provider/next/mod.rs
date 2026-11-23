@@ -57,6 +57,9 @@ use crate::logstore::LogStoreRef;
 use crate::protocol::SaveMode;
 use crate::table::normalize_table_url;
 
+// Not yet wired into planning; the ProgressiveEval optimizer rule will use it.
+#[allow(dead_code)]
+mod progressive_eval;
 mod scan;
 
 /// Default column name for the file id column we add to files read from disk.

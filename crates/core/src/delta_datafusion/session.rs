@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::common::extensions_options;
+use datafusion::config::ConfigExtension;
 use datafusion::{
     catalog::Session as DataFusionSession,
     execution::{
@@ -18,6 +20,32 @@ use crate::delta_datafusion::engine::AsObjectStoreUrl;
 use crate::delta_datafusion::planner::DeltaPlanner;
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::logstore::LogStore;
+
+extensions_options! {
+    /// Delta-specific DataFusion session options, registered under the
+    /// `delta.` prefix (e.g. `SET delta.progressive_eval_num_prefetch_input_streams = 4`).
+    ///
+    /// Registered by default on sessions created through
+    /// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext);
+    /// other sessions can register it via
+    /// `SessionConfig::with_option_extension(DeltaConfigOptions::default())`.
+    pub struct DeltaConfigOptions {
+        /// Number of input streams to prefetch before they are required for ProgressiveEvalExec.
+        /// Since ProgressiveEvalExec only polls one stream at a time in order,
+        /// we do not need to prefetch all streams at once, saving resources. However, if the
+        /// streams' IO time is much greater than their CPU/processing time, prefetching them will
+        /// help improve performance.
+        /// Default is 1 which means we will prefetch one extra stream before it is polled.
+        /// 0 means streams are only fetched immediately before they are required.
+        /// Increase this value if IO time to read a stream is often much more than CPU time to
+        /// process the previous one.
+        pub progressive_eval_num_prefetch_input_streams: usize, default = 1
+    }
+}
+
+impl ConfigExtension for DeltaConfigOptions {
+    const PREFIX: &'static str = "delta";
+}
 
 /// Create a default [`DeltaSessionContext`], a DataFusion session pre-configured with the
 /// settings delta-rs relies on (custom planner, object-store registration, etc.).
@@ -275,6 +303,7 @@ impl Default for DeltaSessionConfig {
     fn default() -> Self {
         DeltaSessionConfig {
             inner: SessionConfig::default()
+                .with_option_extension(DeltaConfigOptions::default())
                 .set_bool("datafusion.sql_parser.enable_ident_normalization", false)
                 .set_bool("datafusion.execution.parquet.schema_force_view_types", true)
                 // Workaround: hash-join dynamic filtering (IN-list pushdown) can panic when join
@@ -407,6 +436,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::test_utils::datafusion::{WrapperSession, make_test_scalar_udf};
+
+    #[tokio::test]
+    async fn test_delta_config_options_settable_via_sql() {
+        let ctx = create_session().into_inner();
+        let prefetch = |ctx: &SessionContext| {
+            ctx.state()
+                .config()
+                .options()
+                .extensions
+                .get::<DeltaConfigOptions>()
+                .map(|options| options.progressive_eval_num_prefetch_input_streams)
+        };
+        assert_eq!(prefetch(&ctx), Some(1));
+
+        ctx.sql("SET delta.progressive_eval_num_prefetch_input_streams = 4")
+            .await
+            .unwrap();
+        assert_eq!(prefetch(&ctx), Some(4));
+    }
 
     const TEST_UDF_NAME: &str = "delta_rs_test_udf";
 
