@@ -2497,6 +2497,7 @@ fn scalar_to_py<'py>(value: &Scalar, py_date: &Bound<'py, PyAny>) -> PyResult<Bo
         // value as text to be cast to the column type, as for decimals
         #[cfg(feature = "unsigned-integers")]
         Uint64(_) => value.serialize().into_py_any(py)?,
+        // pyarrow can't cast a string to time64, so pass nanoseconds since midnight as an integer
         #[cfg(feature = "nanosecond-time")]
         TimeNanos(val) => val.into_py_any(py)?,
         Float(val) => val.into_py_any(py)?,
