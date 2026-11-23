@@ -632,10 +632,45 @@ fn compare_scaled(a: i128, a_exponent: i32, b: i128, b_exponent: i32) -> Orderin
     }
 }
 
+/// A minimum or maximum aggregated across row groups
+#[derive(Debug, Clone, PartialEq)]
+enum AggregatedBound {
+    /// No row group has this bound, e.g. because all values are null
+    Missing,
+    Value(StatsScalar),
+    /// A row group's bound couldn't be parsed, so the bound of the whole file is unknown.
+    /// Keeping another row group's bound instead could exclude values the file contains.
+    Unknown,
+}
+
+impl AggregatedBound {
+    /// Combines two bounds, keeping the value that compares as `keep` to the other.
+    fn combine(self, other: Self, keep: Ordering) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Missing, bound) | (bound, Self::Missing) => bound,
+            (Self::Value(lhs), Self::Value(rhs)) => {
+                if lhs.partial_cmp(&rhs) == Some(keep) {
+                    Self::Value(lhs)
+                } else {
+                    Self::Value(rhs)
+                }
+            }
+        }
+    }
+
+    fn into_value(self) -> Option<StatsScalar> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Missing | Self::Unknown => None,
+        }
+    }
+}
+
 /// Aggregated stats
 struct AggregatedStats {
-    pub min: Option<StatsScalar>,
-    pub max: Option<StatsScalar>,
+    pub min: AggregatedBound,
+    pub max: AggregatedBound,
     pub null_count: u64,
 }
 
@@ -644,17 +679,19 @@ impl From<(&Statistics, Option<&LogicalType>)> for AggregatedStats {
         let (stats, logical_type) = value;
         let null_count = stats.null_count_opt().unwrap_or_default();
         if stats.min_bytes_opt().is_some() && stats.max_bytes_opt().is_some() {
-            let min = StatsScalar::try_from_stats(stats, logical_type, true).ok();
-            let max = StatsScalar::try_from_stats(stats, logical_type, false).ok();
+            let bound = |use_min| match StatsScalar::try_from_stats(stats, logical_type, use_min) {
+                Ok(value) => AggregatedBound::Value(value),
+                Err(_) => AggregatedBound::Unknown,
+            };
             Self {
-                min,
-                max,
+                min: bound(true),
+                max: bound(false),
                 null_count,
             }
         } else {
             Self {
-                min: None,
-                max: None,
+                min: AggregatedBound::Missing,
+                max: AggregatedBound::Missing,
                 null_count,
             }
         }
@@ -663,27 +700,10 @@ impl From<(&Statistics, Option<&LogicalType>)> for AggregatedStats {
 
 impl AddAssign for AggregatedStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.min = match (self.min.take(), rhs.min) {
-            (Some(lhs), Some(rhs)) => {
-                if lhs < rhs {
-                    Some(lhs)
-                } else {
-                    Some(rhs)
-                }
-            }
-            (lhs, rhs) => lhs.or(rhs),
-        };
-        self.max = match (self.max.take(), rhs.max) {
-            (Some(lhs), Some(rhs)) => {
-                if lhs > rhs {
-                    Some(lhs)
-                } else {
-                    Some(rhs)
-                }
-            }
-            (lhs, rhs) => lhs.or(rhs),
-        };
-
+        let min = std::mem::replace(&mut self.min, AggregatedBound::Missing);
+        self.min = min.combine(rhs.min, Ordering::Less);
+        let max = std::mem::replace(&mut self.max, AggregatedBound::Missing);
+        self.max = max.combine(rhs.max, Ordering::Greater);
         self.null_count += rhs.null_count;
     }
 }
@@ -706,11 +726,19 @@ fn apply_min_max_for_column(
         (1, _) => {
             let key = column_descr.name().to_string();
 
-            if let Some(min) = statistics.min.and_then(|min| min.into_json(true)) {
+            if let Some(min) = statistics
+                .min
+                .into_value()
+                .and_then(|min| min.into_json(true))
+            {
                 min_values.insert(key.clone(), ColumnValueStat::Value(min));
             }
 
-            if let Some(max) = statistics.max.and_then(|max| max.into_json(false)) {
+            if let Some(max) = statistics
+                .max
+                .into_value()
+                .and_then(|max| max.into_json(false))
+            {
                 max_values.insert(key.clone(), ColumnValueStat::Value(max));
             }
 
@@ -1498,8 +1526,11 @@ mod tests {
         ));
         let mut stats = AggregatedStats::from((&small, logical_type.as_ref()));
         stats += AggregatedStats::from((&large, logical_type.as_ref()));
-        assert_eq!(stats.min, Some(StatsScalar::UInt64(1)));
-        assert_eq!(stats.max, Some(StatsScalar::UInt64(u64::MAX)));
+        assert_eq!(stats.min, AggregatedBound::Value(StatsScalar::UInt64(1)));
+        assert_eq!(
+            stats.max,
+            AggregatedBound::Value(StatsScalar::UInt64(u64::MAX))
+        );
     }
 
     #[cfg(feature = "unsigned-integers")]
@@ -1569,6 +1600,64 @@ mod tests {
         assert_eq!(value(&stats.max_values, "u32"), json!(u32::MAX));
         assert_eq!(value(&stats.min_values, "u64"), json!(1));
         assert_eq!(value(&stats.max_values, "u64"), json!(u64::MAX));
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_unparseable_row_group_bound_omits_file_bound() {
+        use arrow_array::{RecordBatch, Time64NanosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Time64(TimeUnit::Nanosecond),
+            true,
+        )]));
+        // Two row groups. The first one's minimum isn't a valid time of day, so the file's
+        // minimum is unknown, and using the second row group's minimum of 100 would wrongly
+        // exclude the 50 in the first row group.
+        let times = Time64NanosecondArray::from(vec![-5, 50, 100, 200]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(times)]).unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        let stats = stats_from_file_metadata(
+            &IndexMap::new(),
+            reader.metadata(),
+            DataSkippingNumIndexedCols::AllColumns,
+            &None::<Vec<String>>,
+        )
+        .unwrap();
+
+        assert!(!stats.min_values.contains_key("t"), "{stats:?}");
+        assert_eq!(
+            stats.max_values["t"].as_value().cloned().unwrap(),
+            json!("00:00:00.000000200")
+        );
+    }
+
+    #[test]
+    fn test_aggregated_bound_combine() {
+        use AggregatedBound::*;
+        let value = |v| Value(StatsScalar::Int32(v));
+
+        assert_eq!(value(1).combine(value(2), Ordering::Less), value(1));
+        assert_eq!(value(1).combine(value(2), Ordering::Greater), value(2));
+        assert_eq!(Missing.combine(value(2), Ordering::Less), value(2));
+        assert_eq!(value(1).combine(Missing, Ordering::Less), value(1));
+        assert_eq!(Missing.combine(Missing, Ordering::Less), Missing);
+        assert_eq!(Unknown.combine(value(2), Ordering::Less), Unknown);
+        assert_eq!(value(1).combine(Unknown, Ordering::Greater), Unknown);
+        assert_eq!(Missing.combine(Unknown, Ordering::Less), Unknown);
     }
 
     #[tokio::test]
