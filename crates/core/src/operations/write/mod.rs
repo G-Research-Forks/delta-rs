@@ -456,7 +456,19 @@ impl WriteBuilder {
                     #[cfg(feature = "float16")]
                     PROTOCOL.check_can_write_float16(snapshot, &schema)?;
                     #[cfg(feature = "unsigned-integers")]
-                    PROTOCOL.check_can_write_unsigned_integers(snapshot, &schema)?;
+                    {
+                        // Data for existing columns is cast to the table's type, so unsigned
+                        // input into a signed column is fine. Only new columns could add an
+                        // unsigned type to the table.
+                        let table_schema = snapshot.schema();
+                        let new_fields = StructType::try_new(
+                            schema
+                                .fields()
+                                .filter(|f| table_schema.field(f.name()).is_none())
+                                .cloned(),
+                        )?;
+                        PROTOCOL.check_can_write_unsigned_integers(snapshot, &new_fields)?;
+                    }
                     #[cfg(feature = "nanosecond-time")]
                     PROTOCOL.check_can_write_time_nanos(snapshot, &schema)?;
                     PROTOCOL.check_can_write_variant(snapshot, &schema)?;
@@ -4021,6 +4033,62 @@ mod tests {
         assert_eq!(
             stat(files[0].max_values()),
             Scalar::TimeNanos(47_167_123_456_789)
+        );
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[tokio::test]
+    async fn test_append_unsigned_integers_to_signed_columns() {
+        use arrow_array::{Int8Array, UInt8Array};
+        use delta_kernel::table_features::TableFeature;
+
+        let signed_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "foo",
+            DataType::Int8,
+            true,
+        )]));
+        let signed = RecordBatch::try_new(
+            signed_schema,
+            vec![Arc::new(Int8Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let table = DeltaTable::new_in_memory()
+            .write(vec![signed])
+            .await
+            .unwrap();
+
+        let unsigned_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "foo",
+            DataType::UInt8,
+            true,
+        )]));
+        let unsigned = RecordBatch::try_new(
+            unsigned_schema,
+            vec![Arc::new(UInt8Array::from(vec![Some(2), Some(127)]))],
+        )
+        .unwrap();
+        let table = table
+            .write(vec![unsigned])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            !protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::UnsignedIntegerTypes)
+        );
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        assert_eq!(
+            batches[0]
+                .schema()
+                .field_with_name("foo")
+                .unwrap()
+                .data_type(),
+            &DataType::Int8
         );
     }
 
