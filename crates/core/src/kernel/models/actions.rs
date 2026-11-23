@@ -152,19 +152,25 @@ impl MetadataExt for Metadata {
     }
 }
 
+/// Checks if a datatype, or any of its inner types, satisfies a predicate.
+fn any_datatype(dtype: &DataType, predicate: &impl Fn(&DataType) -> bool) -> bool {
+    predicate(dtype)
+        || match dtype {
+            DataType::Array(inner) => any_datatype(inner.element_type(), predicate),
+            DataType::Struct(inner) => inner
+                .fields()
+                .any(|f| any_datatype(f.data_type(), predicate)),
+            DataType::Map(inner) => {
+                any_datatype(inner.key_type(), predicate)
+                    || any_datatype(inner.value_type(), predicate)
+            }
+            _ => false,
+        }
+}
+
 /// Checks if a datatype matches another type, or any of its inner fields match.
 fn matches_datatype(dtype_to_check: &DataType, dtype: &DataType) -> bool {
-    match dtype_to_check {
-        to_check if dtype == to_check => true,
-        DataType::Array(inner) => matches_datatype(inner.element_type(), dtype),
-        DataType::Struct(inner) => inner
-            .fields()
-            .any(|f| matches_datatype(f.data_type(), dtype)),
-        DataType::Map(inner) => {
-            matches_datatype(inner.key_type(), dtype) || matches_datatype(inner.value_type(), dtype)
-        }
-        _ => false,
-    }
+    any_datatype(dtype_to_check, &|to_check| to_check == dtype)
 }
 
 /// checks if table contains timestamp_ntz in any field including nested fields.
@@ -178,8 +184,9 @@ pub fn contains_timestampntz<'a>(mut fields: impl Iterator<Item = &'a StructFiel
 /// `timestampNanos` table feature.
 pub fn contains_timestamp_nanos<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
     fields.any(|f| {
-        matches_datatype(f.data_type(), &DataType::TIMESTAMP_NANOS)
-            || matches_datatype(f.data_type(), &DataType::TIMESTAMP_NANOS_NTZ)
+        any_datatype(f.data_type(), &|dtype| {
+            dtype == &DataType::TIMESTAMP_NANOS || dtype == &DataType::TIMESTAMP_NANOS_NTZ
+        })
     })
 }
 
@@ -216,14 +223,10 @@ pub fn contains_time_nanos<'a>(mut fields: impl Iterator<Item = &'a StructField>
 /// checks if table contains unsigned integers in any field including nested fields.
 pub fn contains_unsigned_integers<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
     fields.any(|f| {
-        [
-            DataType::UINT8,
-            DataType::UINT16,
-            DataType::UINT32,
-            DataType::UINT64,
-        ]
-        .iter()
-        .any(|dtype| matches_datatype(f.data_type(), dtype))
+        any_datatype(f.data_type(), &|dtype| {
+            use delta_kernel::schema::PrimitiveType::*;
+            matches!(dtype, DataType::Primitive(Uint8 | Uint16 | Uint32 | Uint64))
+        })
     })
 }
 
