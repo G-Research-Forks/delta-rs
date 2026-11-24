@@ -522,9 +522,13 @@ impl TableProviderBuilder {
     /// progressive-eval concatenation available regardless of file count or
     /// CPU cores, set `datafusion.optimizer.repartition_file_scans` to false.
     ///
-    /// Scans of tables with deletion vectors, or scans that retain a row index
-    /// column, must read through a single stream and do not expose the
-    /// ordering, so ordered queries over them still sort.
+    /// Scans of tables with deletion vectors must read through a single
+    /// stream. When such a scan has more than one file group, the groups are
+    /// coalesced into that stream without regard to their order, so the
+    /// ordering is lost and ordered queries still sort. A scan whose files fit
+    /// in a single group keeps the ordering.
+    /// Scans that retain a row index column read through a single stream too,
+    /// and may lose the ordering in the same way.
     pub fn with_file_sort_order(
         mut self,
         columns: impl IntoIterator<Item = FileSortColumn>,
@@ -563,8 +567,10 @@ impl TableProviderBuilder {
     /// may be aggregated in streaming mode and emit a key twice, and a window
     /// function or sort-merge join computed over the ordering gives wrong
     /// values. This does nothing unless a file sort order is also declared,
-    /// and nothing for scans of tables with deletion vectors, which do not
-    /// expose the file sort order.
+    /// and nothing for scans of tables with deletion vectors: the assertion
+    /// is ignored for them, and they keep the file sort order only as far as
+    /// the statistics prove it (see
+    /// [`with_file_sort_order`](Self::with_file_sort_order)).
     ///
     /// Overlap is all this relaxes. Float sort columns, which may contain NaN,
     /// sort columns that may contain nulls, sort
