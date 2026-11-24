@@ -3,9 +3,9 @@ name: python_build
 on:
   merge_group:
   push:
-    branches: [main]
+    branches: [main, "*-gr"]
   pull_request:
-    branches: [main, next, next/*]
+    branches: [main, next, next/*, "*-gr"]
 
 defaults:
   run:

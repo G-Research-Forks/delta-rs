@@ -2,9 +2,9 @@ name: build
 
 on:
   push:
-    branches: [main, "rust-v*"]
+    branches: [main, "rust-v*", "*-gr"]
   pull_request:
-    branches: [main, "rust-v*", next, next/*]
+    branches: [main, "rust-v*", next, next/*, "*-gr"]
   merge_group:
 
 env:
