@@ -3445,3 +3445,118 @@ async fn delta_table_assumed_disjoint_reaches_through_a_projection() -> TestResu
     assert_sorted(&keys, "(date, time)");
     Ok(())
 }
+
+/// Create a table with a non-nullable `Double` column `x`, one file per entry
+/// of `files`, each written as given.
+async fn float_delta_table(files: Vec<Vec<f64>>) -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![StructField::new(
+            "x".to_string(),
+            DeltaDataType::Primitive(PrimitiveType::Double),
+            false,
+        )])
+        .await?;
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
+    let expected_files = files.len();
+    for values in files {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow_array::Float64Array::from(values))],
+        )?;
+        table = table
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), expected_files);
+    Ok(table)
+}
+
+fn collect_floats(batches: &[RecordBatch]) -> Vec<f64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Compare float results exactly, NaN included.
+fn assert_floats_eq(actual: &[f64], expected: &[f64], rendered: &str) {
+    assert!(
+        actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.total_cmp(b).is_eq()),
+        "expected {expected:?}, got {actual:?} from plan:\n{rendered}"
+    );
+}
+
+/// NaN sorts after every other value but is left out of the min/max
+/// statistics, and nothing counts it. Two files sorted on a float column whose
+/// statistics look disjoint may therefore not be: the first file's NaN belongs
+/// after the second file's values. Neither reading the files back-to-back in
+/// one group nor concatenating one group per file is safe.
+#[tokio::test]
+async fn delta_table_float_sort_order_with_nan_stays_sorted() -> TestResult<()> {
+    let table = float_delta_table(vec![vec![1.0, 2.0, f64::NAN], vec![3.0, 4.0, 5.0]]).await?;
+    for assume_no_overlap in [false, true] {
+        for target_partitions in [1, 2] {
+            let (rendered, batches) = run_query_assuming(
+                &table,
+                &[FileSortColumn::asc("x")],
+                &[
+                    (
+                        "datafusion.execution.target_partitions",
+                        &target_partitions.to_string(),
+                    ),
+                    ("datafusion.optimizer.repartition_file_scans", "false"),
+                ],
+                "SELECT x FROM test_table ORDER BY x",
+                assume_no_overlap,
+            )
+            .await?;
+            assert!(
+                !rendered.contains("ProgressiveEvalExec"),
+                "float statistics must not prove partitions disjoint:\n{rendered}"
+            );
+            assert_floats_eq(
+                &collect_floats(&batches),
+                &[1.0, 2.0, 3.0, 4.0, 5.0, f64::NAN],
+                &rendered,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The same hazard without any declared sort order: the per-partition sorts
+/// of an ordinary `ORDER BY` are not concatenated on the strength of float
+/// statistics either.
+#[tokio::test]
+async fn delta_table_float_order_by_with_nan_without_sort_order_stays_sorted() -> TestResult<()> {
+    let table = float_delta_table(vec![vec![1.0, f64::NAN, 2.0], vec![5.0, 3.0, 4.0]]).await?;
+    let (rendered, batches) = run_query(
+        &table,
+        &[],
+        &[("datafusion.execution.target_partitions", "2")],
+        "SELECT x FROM test_table WHERE x > 0 ORDER BY x DESC",
+    )
+    .await?;
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "float statistics must not prove partitions disjoint:\n{rendered}"
+    );
+    assert_floats_eq(
+        &collect_floats(&batches),
+        &[f64::NAN, 5.0, 4.0, 3.0, 2.0, 1.0],
+        &rendered,
+    );
+    Ok(())
+}

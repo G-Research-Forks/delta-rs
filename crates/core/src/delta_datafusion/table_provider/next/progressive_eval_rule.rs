@@ -327,6 +327,11 @@ fn scan_keeps_files_local(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// they would follow), and nulls sorting first anywhere in the later one.
 /// Columns after a strict break are never relied on, so their nulls are
 /// harmless.
+///
+/// NaN is excluded from the statistics in the same way, but unlike nulls
+/// nothing reports how many there are, so there is no proving a float column
+/// free of them. A boundary that would have to be decided on a float column
+/// is rejected.
 fn ordered_partition_ranges(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
@@ -357,6 +362,11 @@ fn ordered_partition_ranges(
                     prev_null_counts[i]
                 };
                 if boundary_null_count != 0 {
+                    return None;
+                }
+                // Min/max statistics leave NaN out as well, and nothing counts
+                // them, so a float column's bounds cannot place a boundary.
+                if starts[i].data_type().is_floating() {
                     return None;
                 }
                 // Incomparable values (partial_cmp is None) bail out rather

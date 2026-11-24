@@ -490,6 +490,14 @@ impl TableProviderBuilder {
     /// nulls: each file's nulls would otherwise surface mid-stream, where they
     /// violate the ordering.
     ///
+    /// Floating point sort columns are supported in the same limited way. NaN
+    /// sorts after every other value and is left out of the file statistics,
+    /// which do not count it either, so a float column can never be shown to
+    /// be free of it. The ordering is used up to the first float column when
+    /// several files are read back-to-back, and scan partitions are never
+    /// concatenated in range order on the strength of a float column's
+    /// statistics; such queries merge or sort instead.
+    ///
     /// Overlap between sort-column values in different files is handled.
     /// Files are grouped such that each group has non-overlapping values,
     /// and then groups are merged using a sort-preserving merge.
@@ -558,7 +566,8 @@ impl TableProviderBuilder {
     /// and nothing for scans of tables with deletion vectors, which do not
     /// expose the file sort order.
     ///
-    /// Overlap is all this relaxes. Sort columns that may contain nulls, sort
+    /// Overlap is all this relaxes. Float sort columns, which may contain NaN,
+    /// sort columns that may contain nulls, sort
     /// keys whose types cannot be compared, and files whose sort-column
     /// statistics are missing are all still handled exactly as they are
     /// without it, as are two files that span the same range of a sort

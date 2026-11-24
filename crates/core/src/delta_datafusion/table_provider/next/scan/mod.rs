@@ -279,13 +279,18 @@ fn resolve_file_sort_order(
 }
 
 /// The longest prefix of `ordering` whose columns provably contain no nulls
-/// in any of the files: either the column is non-nullable in the read schema,
-/// or every file's statistics report an exact null count of zero.
+/// in any of the files, and cannot contain NaN: the column is not a float,
+/// and either it is non-nullable in the read schema or every file's
+/// statistics report an exact null count of zero.
 ///
 /// Nulls sort at one end of *each file*, so concatenating multiple files into
 /// one ordered group interleaves each file's nulls into the middle of the
 /// group's stream. Min/max statistics cannot detect this, so an ordering on a
 /// column that may contain nulls must not be declared for multi-file groups.
+///
+/// NaN does the same - it sorts after every other value of its file and is
+/// left out of the min/max statistics - but no statistic counts it, so a
+/// float column can never be shown free of it and always ends the prefix.
 fn null_free_ordering_prefix<'a>(
     ordering: &LexOrdering,
     read_schema: &SchemaRef,
@@ -297,7 +302,11 @@ fn null_free_ordering_prefix<'a>(
             let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
                 return false;
             };
-            if !read_schema.field(column.index()).is_nullable() {
+            let field = read_schema.field(column.index());
+            if field.data_type().is_floating() {
+                return false;
+            }
+            if !field.is_nullable() {
                 return true;
             }
             files.clone().into_iter().all(|file| {
@@ -1712,20 +1721,20 @@ async fn get_read_plan(
                     overlap,
                 );
                 // A single sorted file per group upholds the full ordering even
-                // when sort columns contain nulls; multi-file groups only
-                // uphold the prefix of the ordering that is provably null-free
-                // (see `null_free_ordering_prefix`).
+                // when sort columns contain nulls or NaN; multi-file groups
+                // only uphold the prefix of the ordering that is provably free
+                // of both (see `null_free_ordering_prefix`).
                 let store_sort_order = if file_groups.iter().all(|group| group.len() <= 1) {
                     Some(ordering.clone())
                 } else {
                     if null_free_len < ordering.len() {
                         debug!(
-                            "file sort order columns may contain nulls; declaring only the null-free prefix of the ordering"
+                            "file sort order columns may contain nulls or NaN; declaring only the prefix of the ordering that is free of both"
                         );
                     }
                     null_free_prefix.clone()
                 };
-                // Nulls within files prevent ordering even when the table asserts
+                // Nulls or NaN within files prevent ordering even when the table asserts
                 // an ordering, so we can only declare the null-free prefix as an assumed order.
                 if assumed {
                     assumed_ordering = null_free_prefix;

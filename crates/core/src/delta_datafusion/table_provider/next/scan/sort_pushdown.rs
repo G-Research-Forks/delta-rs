@@ -270,9 +270,9 @@ pub(super) fn plan_sort_pushdown(
         let bucket = match shape.suffix.as_ref() {
             Some(suffix) if bucket.len() >= 2 => {
                 // Concatenating several files into one group interleaves each
-                // file's nulls into the middle of the group's stream, which
-                // min/max cannot detect, so every suffix column must be
-                // provably null-free.
+                // file's nulls and NaN into the middle of the group's stream,
+                // which min/max cannot detect, so every suffix column must be
+                // provably free of both.
                 let null_free =
                     null_free_ordering_prefix(suffix, parquet_read_schema, bucket.iter().copied());
                 if null_free.is_none_or(|p| p.len() < suffix.len()) {
