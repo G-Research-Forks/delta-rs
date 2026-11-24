@@ -613,9 +613,18 @@ impl DeltaScanExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        // A column that does not survive the crossing into the child's schema
-        // - a partition column above all, which is materialised here and
-        // absent from the parquet child - cannot be asked of it.
+        // A column this exec materialises is not the child's to order by, even
+        // when the child has one of the same name: the child's file id column
+        // holds compact ids rather than the paths this exec reports under it,
+        // and they do not sort alike.
+        if order
+            .iter()
+            .any(|sort_expr| self.references_delta_materialized_column(&sort_expr.expr))
+        {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        // Nor can a column that does not survive the crossing into the child's
+        // schema for any other reason be asked of it.
         let Some(child_order) = super::sort_pushdown::rebind_ordering(
             order,
             &self.scan_plan.contract.output_schema,
@@ -1757,6 +1766,41 @@ mod tests {
         ];
         assert_batches_sorted_eq!(&expected, &batches);
 
+        Ok(())
+    }
+
+    /// The file column is materialised by this exec from the child's compact
+    /// file ids, which share its name but not its values or their order, so an
+    /// ordering on it must not be handed to the child.
+    #[tokio::test]
+    async fn test_sort_on_file_id_is_not_pushed_to_child() -> TestResult {
+        let table = open_fs_path("../test/tests/data/multi_partitioned");
+        let provider = table.table_provider().with_file_column("file_id").await?;
+        let session = Arc::new(create_session().into_inner());
+        let scan = provider.scan(&session.state(), None, &[], None).await?;
+        let exec = scan.downcast_ref::<DeltaScanExec>().unwrap();
+
+        let schema = scan.schema();
+        let sort_on = |name: &str| {
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                name,
+                schema.index_of(name).unwrap(),
+            )))
+        };
+        for order in [
+            vec![sort_on("file_id")],
+            vec![sort_on("number"), sort_on("file_id")],
+        ] {
+            assert!(matches!(
+                exec.try_pushdown_sort(&order)?,
+                SortOrderPushdownResult::Unsupported
+            ));
+        }
+        // A data column alone is still offered to the child.
+        assert!(!matches!(
+            exec.try_pushdown_sort(&[sort_on("number")])?,
+            SortOrderPushdownResult::Unsupported
+        ));
         Ok(())
     }
 
