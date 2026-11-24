@@ -453,6 +453,30 @@ impl WriteBuilder {
                         })?;
                     #[cfg(feature = "nanosecond-timestamps")]
                     PROTOCOL.check_can_write_timestamp_nanos(snapshot, &schema)?;
+                    #[cfg(any(
+                        feature = "float16",
+                        feature = "unsigned-integers",
+                        feature = "nanosecond-time"
+                    ))]
+                    {
+                        // Data for existing columns is cast to the table's type, so for
+                        // example float16 input into a float column, or unsigned input into a
+                        // signed column, is fine. Only new columns could add these types to
+                        // the table.
+                        let table_schema = snapshot.schema();
+                        let new_fields = StructType::try_new(
+                            schema
+                                .fields()
+                                .filter(|f| table_schema.field(f.name()).is_none())
+                                .cloned(),
+                        )?;
+                        #[cfg(feature = "float16")]
+                        PROTOCOL.check_can_write_float16(snapshot, &new_fields)?;
+                        #[cfg(feature = "unsigned-integers")]
+                        PROTOCOL.check_can_write_unsigned_integers(snapshot, &new_fields)?;
+                        #[cfg(feature = "nanosecond-time")]
+                        PROTOCOL.check_can_write_time_nanos(snapshot, &new_fields)?;
+                    }
                     PROTOCOL.check_can_write_variant(snapshot, &schema)?;
                 }
                 match self.mode {
@@ -712,6 +736,8 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::schema::MetadataValue;
     use futures::TryStreamExt;
+    #[cfg(feature = "float16")]
+    use half::f16;
     use itertools::Itertools;
     use serde_json::{Value, json};
 
@@ -3863,6 +3889,374 @@ mod tests {
         assert_eq!(
             result_field.data_type(),
             &DataType::Timestamp(unit, tz.clone()),
+        );
+    }
+
+    #[cfg(feature = "float16")]
+    #[tokio::test]
+    async fn test_write_float16() {
+        use arrow_array::Float16Array;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("x", DataType::Float16, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float16Array::from(vec![
+                    f16::from_f32(1.0),
+                    f16::from_f32(2.5),
+                    f16::INFINITY,
+                    f16::NAN,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let schema = batches[0].schema();
+        let result_field = schema.field_with_name("x").unwrap();
+        assert_eq!(result_field.data_type(), &DataType::Float16,);
+    }
+
+    #[cfg(feature = "float16")]
+    #[tokio::test]
+    async fn test_write_float16_array() {
+        use arrow::datatypes::Float16Type;
+        use arrow_array::ListArray;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("xs", DataType::new_list(DataType::Float16, true), true),
+        ]));
+
+        let data = vec![
+            Some(vec![
+                Some(f16::from_f32(0.0)),
+                Some(f16::from_f32(2.5)),
+                Some(f16::from_f32(0.25)),
+            ]),
+            None,
+            Some(vec![]),
+            Some(vec![Some(f16::from_f32(0.125))]),
+        ];
+        let list_array = Arc::new(ListArray::from_iter_primitive::<Float16Type, _, _>(data));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])), list_array],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let schema = batches[0].schema();
+        let result_field = schema.field_with_name("xs").unwrap();
+        assert!(
+            matches!(result_field.data_type(), DataType::List(inner) if inner.data_type() == &DataType::Float16)
+        );
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[tokio::test]
+    async fn test_write_time_nanos_records_min_and_max_stats() {
+        use arrow_array::Time64NanosecondArray;
+        use delta_kernel::expressions::Scalar;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "t",
+            DataType::Time64(TimeUnit::Nanosecond),
+            true,
+        )]));
+        let times = vec![Some(47_167_123_456_789), Some(1), None];
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Time64NanosecondArray::from(times))])
+                .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let files: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .snapshot()
+            .file_views(&table.log_store(), None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let stat = |values: Option<Scalar>| -> Scalar {
+            let Some(Scalar::Struct(data)) = values else {
+                panic!("expected struct stats, got {values:?}");
+            };
+            data.values()[0].clone()
+        };
+        assert_eq!(stat(files[0].min_values()), Scalar::TimeNanos(1));
+        assert_eq!(
+            stat(files[0].max_values()),
+            Scalar::TimeNanos(47_167_123_456_789)
+        );
+    }
+
+    #[cfg(feature = "float16")]
+    #[rstest::rstest]
+    #[case::no_schema_mode(None)]
+    #[case::merge_schema(Some(SchemaMode::Merge))]
+    #[tokio::test]
+    async fn test_append_float16_to_float_column(#[case] schema_mode: Option<SchemaMode>) {
+        use arrow_array::{Float16Array, Float32Array};
+        use delta_kernel::table_features::TableFeature;
+
+        let float_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Float32,
+            true,
+        )]));
+        let floats = RecordBatch::try_new(
+            float_schema,
+            vec![Arc::new(Float32Array::from(vec![Some(1.0), None]))],
+        )
+        .unwrap();
+        let table = DeltaTable::new_in_memory()
+            .write(vec![floats])
+            .await
+            .unwrap();
+
+        let half_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Float16,
+            true,
+        )]));
+        let halves = RecordBatch::try_new(
+            half_schema,
+            vec![Arc::new(Float16Array::from(vec![
+                f16::from_f32(2.5),
+                f16::from_f32(-0.5),
+            ]))],
+        )
+        .unwrap();
+        let mut write = table.write(vec![halves]).with_save_mode(SaveMode::Append);
+        if let Some(schema_mode) = schema_mode {
+            write = write.with_schema_mode(schema_mode);
+        }
+        let table = write.await.unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            !protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        assert_eq!(
+            batches[0]
+                .schema()
+                .field_with_name("x")
+                .unwrap()
+                .data_type(),
+            &DataType::Float32
+        );
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[tokio::test]
+    async fn test_append_unsigned_integers_to_signed_columns() {
+        use arrow_array::{Int8Array, UInt8Array};
+        use delta_kernel::table_features::TableFeature;
+
+        let signed_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "foo",
+            DataType::Int8,
+            true,
+        )]));
+        let signed = RecordBatch::try_new(
+            signed_schema,
+            vec![Arc::new(Int8Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let table = DeltaTable::new_in_memory()
+            .write(vec![signed])
+            .await
+            .unwrap();
+
+        let unsigned_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "foo",
+            DataType::UInt8,
+            true,
+        )]));
+        let unsigned = RecordBatch::try_new(
+            unsigned_schema,
+            vec![Arc::new(UInt8Array::from(vec![Some(2), Some(127)]))],
+        )
+        .unwrap();
+        let table = table
+            .write(vec![unsigned])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            !protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::UnsignedIntegerTypes)
+        );
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        assert_eq!(
+            batches[0]
+                .schema()
+                .field_with_name("foo")
+                .unwrap()
+                .data_type(),
+            &DataType::Int8
+        );
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[tokio::test]
+    async fn test_write_unsigned_integers() {
+        use arrow::datatypes::UInt32Type;
+        use arrow_array::{ListArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
+        use delta_kernel::expressions::Scalar;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("u32s", DataType::new_list(DataType::UInt32, true), true),
+        ]));
+        // Include values above the signed maximum to check they are not reinterpreted as negative
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(UInt8Array::from(vec![Some(0), Some(u8::MAX), None])),
+                Arc::new(UInt16Array::from(vec![Some(0), Some(u16::MAX), None])),
+                Arc::new(UInt32Array::from(vec![Some(1), Some(u32::MAX), None])),
+                Arc::new(UInt64Array::from(vec![Some(1), Some(u64::MAX), None])),
+                Arc::new(ListArray::from_iter_primitive::<UInt32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(u32::MAX)]),
+                    None,
+                    Some(vec![]),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::UnsignedIntegerTypes)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::UnsignedIntegerTypes)
+        );
+
+        let files: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .snapshot()
+            .file_views(&table.log_store(), None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let stat = |values: Option<Scalar>, name: &str| -> Scalar {
+            let Some(Scalar::Struct(data)) = values else {
+                panic!("expected struct stats, got {values:?}");
+            };
+            let index = data.fields().iter().position(|f| f.name() == name).unwrap();
+            data.values()[index].clone()
+        };
+        let min_values = files[0].min_values();
+        let max_values = files[0].max_values();
+        assert_eq!(stat(min_values.clone(), "u8"), Scalar::Uint8(0));
+        assert_eq!(stat(max_values.clone(), "u8"), Scalar::Uint8(u8::MAX));
+        assert_eq!(stat(min_values.clone(), "u16"), Scalar::Uint16(0));
+        assert_eq!(stat(max_values.clone(), "u16"), Scalar::Uint16(u16::MAX));
+        assert_eq!(stat(min_values.clone(), "u32"), Scalar::Uint32(1));
+        assert_eq!(stat(max_values.clone(), "u32"), Scalar::Uint32(u32::MAX));
+        assert_eq!(stat(min_values, "u64"), Scalar::Uint64(1));
+        assert_eq!(stat(max_values, "u64"), Scalar::Uint64(u64::MAX));
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let schema = batches[0].schema();
+        for (name, data_type) in [
+            ("u8", DataType::UInt8),
+            ("u16", DataType::UInt16),
+            ("u32", DataType::UInt32),
+            ("u64", DataType::UInt64),
+        ] {
+            assert_eq!(
+                schema.field_with_name(name).unwrap().data_type(),
+                &data_type
+            );
+        }
+        let list_field = schema.field_with_name("u32s").unwrap();
+        assert!(
+            matches!(list_field.data_type(), DataType::List(inner) if inner.data_type() == &DataType::UInt32)
         );
     }
 

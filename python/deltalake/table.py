@@ -25,6 +25,9 @@ from arro3.core.types import (
 )
 
 from deltalake._internal import (
+    _FLOAT16,
+    _NANOSECOND_TIME,
+    _UNSIGNED_INTEGERS,
     PyMergeBuilder,
     RawDeltaTable,
     TableFeatures,
@@ -75,6 +78,16 @@ SUPPORTED_READER_FEATURES = {
     "variantType",
     "variantType-preview",
 }
+
+if _FLOAT16:
+    SUPPORTED_WRITER_FEATURES.add("float16")
+    SUPPORTED_READER_FEATURES.add("float16")
+if _UNSIGNED_INTEGERS:
+    SUPPORTED_WRITER_FEATURES.add("unsignedIntegerTypes-dev")
+    SUPPORTED_READER_FEATURES.add("unsignedIntegerTypes-dev")
+if _NANOSECOND_TIME:
+    SUPPORTED_WRITER_FEATURES.add("timeNanos-dev")
+    SUPPORTED_READER_FEATURES.add("timeNanos-dev")
 
 FSCK_METRICS_FILES_REMOVED_LABEL = "files_removed"
 

@@ -269,6 +269,31 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
             Some(value) => Ok(Scalar::Long(*value)),
             None => Ok(Scalar::Null(DataType::LONG)),
         },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt8(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint8(*value)),
+            None => Ok(Scalar::Null(DataType::UINT8)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt16(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint16(*value)),
+            None => Ok(Scalar::Null(DataType::UINT16)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt32(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint32(*value)),
+            None => Ok(Scalar::Null(DataType::UINT32)),
+        },
+        #[cfg(feature = "unsigned-integers")]
+        ScalarValue::UInt64(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Uint64(*value)),
+            None => Ok(Scalar::Null(DataType::UINT64)),
+        },
+        #[cfg(feature = "float16")]
+        ScalarValue::Float16(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Float16(*value)),
+            None => Ok(Scalar::Null(DataType::FLOAT16)),
+        },
         ScalarValue::Float32(maybe_value) => match maybe_value {
             Some(value) => Ok(Scalar::Float(*value)),
             None => Ok(Scalar::Null(DataType::FLOAT)),
@@ -298,6 +323,16 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
         ScalarValue::Date32(maybe_value) => match maybe_value {
             Some(value) => Ok(Scalar::Date(*value)),
             None => Ok(Scalar::Null(DataType::DATE)),
+        },
+        // Arrow doesn't validate the range of `Time64` values, so check that the value is a
+        // time of day before accepting it.
+        #[cfg(feature = "nanosecond-time")]
+        ScalarValue::Time64Nanosecond(maybe_value) => match maybe_value {
+            Some(value) if (0..86_400_000_000_000).contains(value) => Ok(Scalar::TimeNanos(*value)),
+            Some(value) => {
+                plan_err!("Time64(Nanosecond) value {value} does not lie within a single day")
+            }
+            None => Ok(Scalar::Null(DataType::TIME_NANOS)),
         },
         ScalarValue::Binary(maybe_value)
         | ScalarValue::LargeBinary(maybe_value)

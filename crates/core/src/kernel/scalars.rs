@@ -52,6 +52,39 @@ fn encode_partition_value(value: &str) -> String {
 
 use crate::NULL_PARTITION_VALUE_DATA_PATH;
 
+#[cfg(feature = "nanosecond-time")]
+/// Returns whether nanoseconds since midnight lie within a single day.
+///
+/// Arrow doesn't validate the range of `Time64` values, so this must be checked
+/// before a value is accepted as a time of day.
+pub(crate) fn is_valid_time_nanos(nanos: i64) -> bool {
+    const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+    (0..NANOS_PER_DAY).contains(&nanos)
+}
+
+#[cfg(feature = "nanosecond-time")]
+/// Formats nanoseconds since midnight as "HH:MM:SS.fffffffff",
+/// or returns `None` if the value doesn't lie within a single day.
+pub(crate) fn format_time_nanos(nanos: i64) -> Option<String> {
+    const NANOS_PER_SECOND: i64 = 1_000_000_000;
+    if !is_valid_time_nanos(nanos) {
+        return None;
+    }
+    // Both parts fit in a u32 now that the value is known to lie within one day
+    let seconds = (nanos / NANOS_PER_SECOND) as u32;
+    let subsecond_nanos = (nanos % NANOS_PER_SECOND) as u32;
+    let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(seconds, subsecond_nanos)?;
+    Some(time.format("%H:%M:%S%.9f").to_string())
+}
+
+#[cfg(feature = "nanosecond-time")]
+/// Formats a [`Scalar::TimeNanos`] value. Conversions into a [`Scalar`] in this crate only
+/// create values within a single day, but other code can construct any value, and those are
+/// formatted as the raw number of nanoseconds, as [`Scalar`]'s `Display` does.
+fn format_time_nanos_scalar(nanos: i64) -> String {
+    format_time_nanos(nanos).unwrap_or_else(|| nanos.to_string())
+}
+
 /// Auxiliary methods for dealing with kernel scalars
 pub trait ScalarExt: Sized {
     /// Serialize to string
@@ -86,6 +119,16 @@ impl ScalarExt for Scalar {
             Self::Short(s) => s.to_string(),
             Self::Integer(i) => i.to_string(),
             Self::Long(l) => l.to_string(),
+            #[cfg(feature = "float16")]
+            Self::Float16(f) => f.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint8(u) => u.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint16(u) => u.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint32(u) => u.to_string(),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint64(u) => u.to_string(),
             Self::Float(f) => f.to_string(),
             Self::Double(d) => d.to_string(),
             Self::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
@@ -110,6 +153,8 @@ impl ScalarExt for Scalar {
                 // Timestamp without timezone keeps the offset-less representation.
                 ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
             }
+            #[cfg(feature = "nanosecond-time")]
+            Self::TimeNanos(nanos) => format_time_nanos_scalar(*nanos),
             Self::Date(days) => {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 date.format("%Y-%m-%d").to_string()
@@ -205,22 +250,53 @@ impl ScalarExt for Scalar {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .map(|v| checked(v, index, Self::Long(v.value(index)))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt8 => arr
                 .as_any()
                 .downcast_ref::<UInt8Array>()
                 .map(|v| checked(v, index, Self::Byte(v.value(index) as i8))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt8 => arr
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .map(|v| checked(v, index, Self::Uint8(v.value(index)))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt16 => arr
                 .as_any()
                 .downcast_ref::<UInt16Array>()
                 .map(|v| checked(v, index, Self::Short(v.value(index) as i16))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt16 => arr
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .map(|v| checked(v, index, Self::Uint16(v.value(index)))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt32 => arr
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .map(|v| checked(v, index, Self::Integer(v.value(index) as i32))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt32 => arr
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .map(|v| checked(v, index, Self::Uint32(v.value(index)))),
+            #[cfg(not(feature = "unsigned-integers"))]
             UInt64 => arr
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .map(|v| checked(v, index, Self::Long(v.value(index) as i64))),
+            #[cfg(feature = "unsigned-integers")]
+            UInt64 => arr
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .map(|v| checked(v, index, Self::Uint64(v.value(index)))),
+            #[cfg(feature = "float16")]
+            Float16 => arr
+                .as_any()
+                .downcast_ref::<Float16Array>()
+                .map(|v| checked(v, index, Self::Float16(v.value(index)))),
+            #[cfg(not(feature = "float16"))]
+            Float16 => None,
             Float32 => arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -261,6 +337,12 @@ impl ScalarExt for Scalar {
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .map(|v| checked(v, index, Self::TimestampNanosNtz(v.value(index)))),
+            #[cfg(feature = "nanosecond-time")]
+            Time64(TimeUnit::Nanosecond) => arr
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .filter(|v| is_valid_time_nanos(v.value(index)))
+                .map(|v| checked(v, index, Self::TimeNanos(v.value(index)))),
             Struct(fields) => {
                 let struct_fields = fields
                     .iter()
@@ -308,8 +390,7 @@ impl ScalarExt for Scalar {
                     _ => None,
                 }
             }
-            Float16
-            | Decimal32(_, _)
+            Decimal32(_, _)
             | Decimal64(_, _)
             | Decimal256(_, _)
             | List(_)
@@ -339,8 +420,19 @@ impl ScalarExt for Scalar {
             Self::Short(s) => Value::Number(serde_json::Number::from(*s)),
             Self::Integer(i) => Value::Number(serde_json::Number::from(*i)),
             Self::Long(l) => Value::Number(serde_json::Number::from(*l)),
-            Self::Float(f) => Value::Number(serde_json::Number::from_f64(*f as f64).unwrap()),
-            Self::Double(d) => Value::Number(serde_json::Number::from_f64(*d).unwrap()),
+            #[cfg(feature = "float16")]
+            Self::Float16(f) => Value::from(f.to_f64()),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint8(u) => Value::Number(serde_json::Number::from(*u)),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint16(u) => Value::Number(serde_json::Number::from(*u)),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint32(u) => Value::Number(serde_json::Number::from(*u)),
+            #[cfg(feature = "unsigned-integers")]
+            Self::Uint64(u) => Value::Number(serde_json::Number::from(*u)),
+            // JSON has no representation of NaN or infinity, which become null
+            Self::Float(f) => Value::from(*f),
+            Self::Double(d) => Value::from(*d),
             Self::Boolean(b) => Value::Bool(*b),
             #[cfg(feature = "nanosecond-timestamps")]
             Self::TimestampNanos(ts) => {
@@ -357,6 +449,8 @@ impl ScalarExt for Scalar {
                 let ts = Utc.timestamp_micros(*ts).single().unwrap();
                 Value::String(ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
             }
+            #[cfg(feature = "nanosecond-time")]
+            Self::TimeNanos(nanos) => Value::String(format_time_nanos_scalar(*nanos)),
             Self::Date(days) => {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 Value::String(date.format("%Y-%m-%d").to_string())
@@ -432,6 +526,8 @@ mod tests {
     use super::*;
     use arrow_array::*;
     use delta_kernel::expressions::Scalar;
+    #[cfg(feature = "float16")]
+    use half::f16;
 
     #[test]
     fn test_encode_partition_value() {
@@ -467,6 +563,15 @@ mod tests {
         assert_eq!(Scalar::Long(123456789).serialize(), "123456789");
         assert_eq!(Scalar::Float(3.14).serialize(), "3.14");
         assert_eq!(Scalar::Double(2.71828).serialize(), "2.71828");
+        #[cfg(feature = "float16")]
+        assert_eq!(Scalar::Float16(f16::from_f32(1.5)).serialize(), "1.5");
+        #[cfg(feature = "unsigned-integers")]
+        {
+            assert_eq!(Scalar::Uint8(u8::MAX).serialize(), "255");
+            assert_eq!(Scalar::Uint16(u16::MAX).serialize(), "65535");
+            assert_eq!(Scalar::Uint32(u32::MAX).serialize(), "4294967295");
+            assert_eq!(Scalar::Uint64(u64::MAX).serialize(), "18446744073709551615");
+        }
     }
 
     #[test]
@@ -494,6 +599,48 @@ mod tests {
             scalar.serialize_encoded(),
             "2023-01-01T12%3A00%3A00.000000Z"
         );
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_scalar_time_nanos_serializes_and_reads_from_array() {
+        let nanos = 47_167_123_456_789;
+        let scalar = Scalar::TimeNanos(nanos);
+        assert_eq!(scalar.serialize(), "13:06:07.123456789");
+        assert_eq!(scalar.to_json(), serde_json::json!("13:06:07.123456789"));
+
+        let array = Time64NanosecondArray::from(vec![Some(nanos), None]);
+        assert_eq!(Scalar::from_array(&array, 0).unwrap(), scalar);
+        assert!(Scalar::from_array(&array, 1).unwrap().is_null());
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_time_nanos_outside_of_one_day() {
+        use super::format_time_nanos;
+
+        assert_eq!(format_time_nanos(0).unwrap(), "00:00:00.000000000");
+        assert_eq!(
+            format_time_nanos(86_399_999_999_999).unwrap(),
+            "23:59:59.999999999"
+        );
+        // Includes values that would wrap to a valid time if narrowed to u32 seconds
+        let invalid = [
+            -1,
+            86_400_000_000_000,
+            (1 << 32) * 1_000_000_000,
+            i64::MIN,
+            i64::MAX,
+        ];
+        for nanos in invalid {
+            assert_eq!(format_time_nanos(nanos), None, "{nanos}");
+            let array = Time64NanosecondArray::from(vec![nanos]);
+            assert_eq!(Scalar::from_array(&array, 0), None, "{nanos}");
+            // A scalar constructed directly is serialized without panicking
+            let scalar = Scalar::TimeNanos(nanos);
+            assert_eq!(scalar.serialize(), nanos.to_string());
+            assert_eq!(scalar.to_json(), serde_json::json!(nanos.to_string()));
+        }
     }
 
     #[cfg(feature = "nanosecond-timestamps")]
@@ -724,6 +871,31 @@ mod tests {
     }
 
     #[test]
+    fn test_scalar_to_json_floats() {
+        assert_eq!(Scalar::Float(1.5).to_json(), serde_json::json!(1.5));
+        assert_eq!(Scalar::Double(-2.25).to_json(), serde_json::json!(-2.25));
+        #[cfg(feature = "float16")]
+        assert_eq!(
+            Scalar::Float16(f16::from_f32(1.5)).to_json(),
+            serde_json::json!(1.5)
+        );
+
+        // JSON can't represent non-finite values
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                Scalar::Float(value as f32).to_json(),
+                serde_json::Value::Null
+            );
+            assert_eq!(Scalar::Double(value).to_json(), serde_json::Value::Null);
+            #[cfg(feature = "float16")]
+            assert_eq!(
+                Scalar::Float16(f16::from_f64(value)).to_json(),
+                serde_json::Value::Null
+            );
+        }
+    }
+
+    #[test]
     fn test_scalar_to_json_timestamp() {
         let timestamp_micros = 1672574400000000; // 2023-01-01 12:00:00 UTC
         let scalar = Scalar::Timestamp(timestamp_micros);
@@ -830,6 +1002,7 @@ mod tests {
         assert!(result.is_null());
     }
 
+    #[cfg(not(feature = "unsigned-integers"))]
     #[test]
     fn test_scalar_from_array_unsigned_integers() {
         // Test UInt8
@@ -853,6 +1026,42 @@ mod tests {
         assert_eq!(scalar, Scalar::Long(42));
     }
 
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_scalar_from_array_unsigned_integers() {
+        let uint8_array = UInt8Array::from(vec![Some(u8::MAX), None]);
+        let scalar = Scalar::from_array(&uint8_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint8(u8::MAX));
+
+        let uint16_array = UInt16Array::from(vec![Some(u16::MAX), None]);
+        let scalar = Scalar::from_array(&uint16_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint16(u16::MAX));
+
+        let uint32_array = UInt32Array::from(vec![Some(u32::MAX), None]);
+        let scalar = Scalar::from_array(&uint32_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint32(u32::MAX));
+
+        let uint64_array = UInt64Array::from(vec![Some(u64::MAX), None]);
+        let scalar = Scalar::from_array(&uint64_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Uint64(u64::MAX));
+        assert!(Scalar::from_array(&uint64_array, 1).unwrap().is_null());
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_scalar_to_json_unsigned_integers() {
+        assert_eq!(Scalar::Uint8(u8::MAX).to_json(), serde_json::json!(255));
+        assert_eq!(Scalar::Uint16(u16::MAX).to_json(), serde_json::json!(65535));
+        assert_eq!(
+            Scalar::Uint32(u32::MAX).to_json(),
+            serde_json::json!(u32::MAX)
+        );
+        assert_eq!(
+            Scalar::Uint64(u64::MAX).to_json(),
+            serde_json::json!(u64::MAX)
+        );
+    }
+
     #[test]
     fn test_scalar_from_array_float_types() {
         // Test Float32
@@ -864,6 +1073,15 @@ mod tests {
         let double_array = Float64Array::from(vec![Some(2.71828_f64), None]);
         let scalar = Scalar::from_array(&double_array, 0).unwrap();
         assert_eq!(scalar, Scalar::Double(2.71828));
+    }
+
+    #[cfg(feature = "float16")]
+    #[test]
+    fn test_scalar_from_array_float16() {
+        let float_array = Float16Array::from(vec![Some(f16::from_f32(3.25)), None]);
+        let scalar = Scalar::from_array(&float_array, 0).unwrap();
+        assert_eq!(scalar, Scalar::Float16(f16::from_f32(3.25)));
+        assert!(Scalar::from_array(&float_array, 1).is_none_or(|s| s.is_null()));
     }
 
     #[test]
@@ -1023,5 +1241,11 @@ mod tests {
         // Test negative numbers
         assert_eq!(Scalar::Integer(-42).serialize(), "-42");
         assert_eq!(Scalar::Float(-3.14).serialize(), "-3.14");
+
+        #[cfg(feature = "float16")]
+        {
+            assert_eq!(Scalar::Float16(f16::from_f32(0.0)).serialize(), "0");
+            assert_eq!(Scalar::Float16(f16::from_f32(-2.5)).serialize(), "-2.5");
+        }
     }
 }

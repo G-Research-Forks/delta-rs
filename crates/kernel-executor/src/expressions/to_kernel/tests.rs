@@ -535,6 +535,79 @@ fn test_null_literals() {
     }
 }
 
+#[cfg(feature = "float16")]
+#[test]
+fn test_float16_literals() {
+    use half::f16;
+
+    let delta_expr =
+        to_delta_expression(&lit(ScalarValue::Float16(Some(f16::from_f32(1.5))))).unwrap();
+    assert_eq!(
+        delta_expr,
+        Expression::Literal(Scalar::Float16(f16::from_f32(1.5)))
+    );
+
+    let delta_expr = to_delta_expression(&lit(ScalarValue::Float16(None))).unwrap();
+    assert_eq!(
+        delta_expr,
+        Expression::Literal(Scalar::Null(DataType::FLOAT16))
+    );
+}
+
+#[cfg(feature = "unsigned-integers")]
+#[test]
+fn test_unsigned_integer_literals() {
+    let test_cases = vec![
+        (lit(u8::MAX), Scalar::Uint8(u8::MAX)),
+        (lit(u16::MAX), Scalar::Uint16(u16::MAX)),
+        (lit(u32::MAX), Scalar::Uint32(u32::MAX)),
+        (lit(u64::MAX), Scalar::Uint64(u64::MAX)),
+        (lit(ScalarValue::UInt8(None)), Scalar::Null(DataType::UINT8)),
+        (
+            lit(ScalarValue::UInt16(None)),
+            Scalar::Null(DataType::UINT16),
+        ),
+        (
+            lit(ScalarValue::UInt32(None)),
+            Scalar::Null(DataType::UINT32),
+        ),
+        (
+            lit(ScalarValue::UInt64(None)),
+            Scalar::Null(DataType::UINT64),
+        ),
+    ];
+
+    for (expr, expected) in test_cases {
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        assert_eq!(delta_expr, Expression::Literal(expected));
+    }
+}
+
+#[cfg(feature = "nanosecond-time")]
+#[test]
+fn test_time_nanos_literals() {
+    let test_cases = vec![
+        (
+            lit(ScalarValue::Time64Nanosecond(Some(47_167_123_456_789))),
+            Scalar::TimeNanos(47_167_123_456_789),
+        ),
+        (
+            lit(ScalarValue::Time64Nanosecond(None)),
+            Scalar::Null(DataType::TIME_NANOS),
+        ),
+    ];
+
+    for (expr, expected) in test_cases {
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        assert_eq!(delta_expr, Expression::Literal(expected));
+    }
+
+    for nanos in [-1, 86_400_000_000_000] {
+        let expr = lit(ScalarValue::Time64Nanosecond(Some(nanos)));
+        assert!(to_delta_expression(&expr).is_err(), "{nanos}");
+    }
+}
+
 #[test]
 fn test_between_expressions() {
     // Test BETWEEN (not negated) - should be equivalent to: NOT (x < low OR x > high)

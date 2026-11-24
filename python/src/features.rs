@@ -14,6 +14,15 @@ pub enum TableFeatures {
     TimestampNanos,
     /// timestamps without timezone support
     TimestampWithoutTimezone,
+    #[cfg(feature = "float16")]
+    /// Float16 data type
+    Float16,
+    #[cfg(feature = "unsigned-integers")]
+    /// Unsigned integer data types
+    UnsignedIntegerTypes,
+    #[cfg(feature = "nanosecond-time")]
+    /// Time of day in nanoseconds data type
+    TimeNanos,
     /// version 2 of checkpointing
     V2Checkpoint,
     /// Append Only Tables
@@ -50,6 +59,12 @@ impl From<TableFeatures> for KernelTableFeatures {
             TableFeatures::TimestampWithoutTimezone => {
                 KernelTableFeatures::TimestampWithoutTimezone
             }
+            #[cfg(feature = "float16")]
+            TableFeatures::Float16 => KernelTableFeatures::Float16,
+            #[cfg(feature = "unsigned-integers")]
+            TableFeatures::UnsignedIntegerTypes => KernelTableFeatures::UnsignedIntegerTypes,
+            #[cfg(feature = "nanosecond-time")]
+            TableFeatures::TimeNanos => KernelTableFeatures::TimeNanos,
             TableFeatures::V2Checkpoint => KernelTableFeatures::V2Checkpoint,
             TableFeatures::AppendOnly => KernelTableFeatures::AppendOnly,
             TableFeatures::Invariants => KernelTableFeatures::Invariants,

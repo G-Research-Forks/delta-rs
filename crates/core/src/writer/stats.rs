@@ -10,8 +10,14 @@ use std::{
 use chrono::Timelike;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::table_properties::DataSkippingNumIndexedCols;
+#[cfg(feature = "float16")]
+use half::f16;
 use indexmap::IndexMap;
 use itertools::Itertools;
+#[cfg(feature = "unsigned-integers")]
+use parquet::basic::IntType;
+#[cfg(feature = "nanosecond-time")]
+use parquet::basic::TimeType;
 use parquet::basic::Type;
 use parquet::basic::{ConvertedType, DecimalType, LogicalType};
 use parquet::file::metadata::ParquetMetaData;
@@ -23,11 +29,14 @@ use parquet::{
 use tracing::warn;
 
 use super::*;
+#[cfg(feature = "nanosecond-time")]
+use crate::kernel::scalars::{format_time_nanos, is_valid_time_nanos};
 use crate::kernel::{Add, scalars::ScalarExt};
 use crate::protocol::{ColumnValueStat, Stats};
 
-/// Creates an [`Add`] log action struct.
-pub(crate) fn create_add(
+/// Creates an [`Add`] log action struct for a data file that has already been
+/// written, computing its statistics from the parquet `file_metadata`.
+pub fn create_add(
     partition_values: &IndexMap<String, Scalar>,
     path: String,
     size: i64,
@@ -267,9 +276,17 @@ enum StatsScalar {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
+    #[cfg(feature = "unsigned-integers")]
+    UInt32(u32),
+    #[cfg(feature = "unsigned-integers")]
+    UInt64(u64),
+    #[cfg(feature = "float16")]
+    Float16(f16),
     Float32(f32),
     Float64(f64),
     Date(chrono::NaiveDate),
+    #[cfg(feature = "nanosecond-time")]
+    TimeNanos(i64),
     Timestamp(chrono::NaiveDateTime),
     TimestampNtz(chrono::NaiveDateTime),
     // All values of a column share one precision and scale, so this orders by the unscaled value
@@ -312,6 +329,15 @@ impl StatsScalar {
                 precision: decimal_type.precision,
                 scale: decimal_type.scale,
             }),
+            // Unsigned integers are stored with a signed physical type but are ordered as
+            // unsigned values, so reinterpret the bits. 8 and 16 bit values are zero-extended.
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Statistics::Int32(v),
+                Some(LogicalType::Integer(IntType {
+                    is_signed: false, ..
+                })),
+            ) => Ok(Self::UInt32(get_stat!(v) as u32)),
             (Statistics::Int32(v), _) => Ok(Self::Int32(get_stat!(v))),
             // Int64 can be timestamp, decimal, or integer
             (Statistics::Int64(v), Some(LogicalType::Timestamp(timestamp_type))) => {
@@ -338,11 +364,36 @@ impl StatsScalar {
                     Ok(Self::TimestampNtz(timestamp.naive_utc()))
                 }
             }
+            #[cfg(feature = "nanosecond-time")]
+            (
+                Statistics::Int64(v),
+                Some(LogicalType::Time(TimeType {
+                    unit: TimeUnit::NANOS,
+                    ..
+                })),
+            ) => {
+                let nanos = get_stat!(v);
+                if is_valid_time_nanos(nanos) {
+                    Ok(Self::TimeNanos(nanos))
+                } else {
+                    Err(DeltaWriterError::StatsParsingFailed {
+                        debug_value: nanos.to_string(),
+                        logical_type: logical_type.cloned(),
+                    })
+                }
+            }
             (Statistics::Int64(v), Some(LogicalType::Decimal(decimal_type))) => Ok(Self::Decimal {
                 unscaled: get_stat!(v).into(),
                 precision: decimal_type.precision,
                 scale: decimal_type.scale,
             }),
+            #[cfg(feature = "unsigned-integers")]
+            (
+                Statistics::Int64(v),
+                Some(LogicalType::Integer(IntType {
+                    is_signed: false, ..
+                })),
+            ) => Ok(Self::UInt64(get_stat!(v) as u64)),
             (Statistics::Int64(v), _) => Ok(Self::Int64(get_stat!(v))),
             (Statistics::Float(v), _) => Ok(Self::Float32(get_stat!(v))),
             (Statistics::Double(v), _) => Ok(Self::Float64(get_stat!(v))),
@@ -366,6 +417,23 @@ impl StatsScalar {
                     _ => Err(DeltaWriterError::StatsParsingFailed {
                         debug_value: format!("{bytes:?}"),
                         logical_type: logical_type.cloned(),
+                    }),
+                }
+            }
+            #[cfg(feature = "float16")]
+            (Statistics::FixedLenByteArray(v), Some(LogicalType::Float16)) => {
+                let bytes = if use_min {
+                    v.min_bytes_opt()
+                } else {
+                    v.max_bytes_opt()
+                }
+                .unwrap_or_default();
+
+                match <[u8; 2]>::try_from(bytes) {
+                    Ok(bytes) => Ok(Self::Float16(f16::from_le_bytes(bytes))),
+                    Err(_) => Err(DeltaWriterError::StatsParsingFailed {
+                        debug_value: format!("{bytes:?}"),
+                        logical_type: Some(LogicalType::Float16),
                     }),
                 }
             }
@@ -444,9 +512,19 @@ impl StatsScalar {
             StatsScalar::Boolean(v) => serde_json::Value::Bool(v),
             StatsScalar::Int32(v) => serde_json::Value::from(v),
             StatsScalar::Int64(v) => serde_json::Value::from(v),
+            #[cfg(feature = "unsigned-integers")]
+            StatsScalar::UInt32(v) => serde_json::Value::from(v),
+            #[cfg(feature = "unsigned-integers")]
+            StatsScalar::UInt64(v) => serde_json::Value::from(v),
+            #[cfg(feature = "float16")]
+            StatsScalar::Float16(v) => serde_json::Value::from(v.to_f32()),
             StatsScalar::Float32(v) => serde_json::Value::from(v),
             StatsScalar::Float64(v) => serde_json::Value::from(v),
             StatsScalar::Date(v) => serde_json::Value::from(v.format("%Y-%m-%d").to_string()),
+            #[cfg(feature = "nanosecond-time")]
+            StatsScalar::TimeNanos(v) => serde_json::Value::from(
+                format_time_nanos(v).expect("validated when parsing the statistics"),
+            ),
             StatsScalar::Timestamp(v) => {
                 // Timestamps must be truncated to millisecond precision when writing
                 // to JSON for compatibility with the Delta Protocol.
@@ -554,10 +632,45 @@ fn compare_scaled(a: i128, a_exponent: i32, b: i128, b_exponent: i32) -> Orderin
     }
 }
 
+/// A minimum or maximum aggregated across row groups
+#[derive(Debug, Clone, PartialEq)]
+enum AggregatedBound {
+    /// No row group has this bound, e.g. because all values are null
+    Missing,
+    Value(StatsScalar),
+    /// A row group's bound couldn't be parsed, so the bound of the whole file is unknown.
+    /// Keeping another row group's bound instead could exclude values the file contains.
+    Unknown,
+}
+
+impl AggregatedBound {
+    /// Combines two bounds, keeping the value that compares as `keep` to the other.
+    fn combine(self, other: Self, keep: Ordering) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Missing, bound) | (bound, Self::Missing) => bound,
+            (Self::Value(lhs), Self::Value(rhs)) => {
+                if lhs.partial_cmp(&rhs) == Some(keep) {
+                    Self::Value(lhs)
+                } else {
+                    Self::Value(rhs)
+                }
+            }
+        }
+    }
+
+    fn into_value(self) -> Option<StatsScalar> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Missing | Self::Unknown => None,
+        }
+    }
+}
+
 /// Aggregated stats
 struct AggregatedStats {
-    pub min: Option<StatsScalar>,
-    pub max: Option<StatsScalar>,
+    pub min: AggregatedBound,
+    pub max: AggregatedBound,
     pub null_count: u64,
 }
 
@@ -566,17 +679,19 @@ impl From<(&Statistics, Option<&LogicalType>)> for AggregatedStats {
         let (stats, logical_type) = value;
         let null_count = stats.null_count_opt().unwrap_or_default();
         if stats.min_bytes_opt().is_some() && stats.max_bytes_opt().is_some() {
-            let min = StatsScalar::try_from_stats(stats, logical_type, true).ok();
-            let max = StatsScalar::try_from_stats(stats, logical_type, false).ok();
+            let bound = |use_min| match StatsScalar::try_from_stats(stats, logical_type, use_min) {
+                Ok(value) => AggregatedBound::Value(value),
+                Err(_) => AggregatedBound::Unknown,
+            };
             Self {
-                min,
-                max,
+                min: bound(true),
+                max: bound(false),
                 null_count,
             }
         } else {
             Self {
-                min: None,
-                max: None,
+                min: AggregatedBound::Missing,
+                max: AggregatedBound::Missing,
                 null_count,
             }
         }
@@ -585,27 +700,10 @@ impl From<(&Statistics, Option<&LogicalType>)> for AggregatedStats {
 
 impl AddAssign for AggregatedStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.min = match (self.min.take(), rhs.min) {
-            (Some(lhs), Some(rhs)) => {
-                if lhs < rhs {
-                    Some(lhs)
-                } else {
-                    Some(rhs)
-                }
-            }
-            (lhs, rhs) => lhs.or(rhs),
-        };
-        self.max = match (self.max.take(), rhs.max) {
-            (Some(lhs), Some(rhs)) => {
-                if lhs > rhs {
-                    Some(lhs)
-                } else {
-                    Some(rhs)
-                }
-            }
-            (lhs, rhs) => lhs.or(rhs),
-        };
-
+        let min = std::mem::replace(&mut self.min, AggregatedBound::Missing);
+        self.min = min.combine(rhs.min, Ordering::Less);
+        let max = std::mem::replace(&mut self.max, AggregatedBound::Missing);
+        self.max = max.combine(rhs.max, Ordering::Greater);
         self.null_count += rhs.null_count;
     }
 }
@@ -628,11 +726,19 @@ fn apply_min_max_for_column(
         (1, _) => {
             let key = column_descr.name().to_string();
 
-            if let Some(min) = statistics.min.and_then(|min| min.into_json(true)) {
+            if let Some(min) = statistics
+                .min
+                .into_value()
+                .and_then(|min| min.into_json(true))
+            {
                 min_values.insert(key.clone(), ColumnValueStat::Value(min));
             }
 
-            if let Some(max) = statistics.max.and_then(|max| max.into_json(false)) {
+            if let Some(max) = statistics
+                .max
+                .into_value()
+                .and_then(|max| max.into_json(false))
+            {
                 max_values.insert(key.clone(), ColumnValueStat::Value(max));
             }
 
@@ -687,6 +793,26 @@ fn apply_min_max_for_column(
     }
 }
 
+#[cfg(feature = "unsigned-integers")]
+static UNSIGNED_INTEGER_LOGICAL_TYPES: [LogicalType; 4] = [
+    LogicalType::Integer(IntType {
+        bit_width: 8,
+        is_signed: false,
+    }),
+    LogicalType::Integer(IntType {
+        bit_width: 16,
+        is_signed: false,
+    }),
+    LogicalType::Integer(IntType {
+        bit_width: 32,
+        is_signed: false,
+    }),
+    LogicalType::Integer(IntType {
+        bit_width: 64,
+        is_signed: false,
+    }),
+];
+
 /// Map the old (old!) [parquet::basic::ConvertedType] into the more modern
 /// [parquet::basic::LogicalType]
 ///
@@ -698,6 +824,16 @@ fn converted_to_logical_type(converted: ConvertedType) -> Option<&'static Logica
         ConvertedType::DATE => Some(&LogicalType::Date),
         ConvertedType::JSON => Some(&LogicalType::Json),
         ConvertedType::BSON => Some(&LogicalType::Bson),
+        // Older writers annotate unsigned integer columns with only the legacy converted type,
+        // so map them to the equivalent logical type to read their statistics as unsigned.
+        #[cfg(feature = "unsigned-integers")]
+        ConvertedType::UINT_8 => Some(&UNSIGNED_INTEGER_LOGICAL_TYPES[0]),
+        #[cfg(feature = "unsigned-integers")]
+        ConvertedType::UINT_16 => Some(&UNSIGNED_INTEGER_LOGICAL_TYPES[1]),
+        #[cfg(feature = "unsigned-integers")]
+        ConvertedType::UINT_32 => Some(&UNSIGNED_INTEGER_LOGICAL_TYPES[2]),
+        #[cfg(feature = "unsigned-integers")]
+        ConvertedType::UINT_64 => Some(&UNSIGNED_INTEGER_LOGICAL_TYPES[3]),
         _others => None,
     }
 }
@@ -1331,6 +1467,197 @@ mod tests {
         let max_stat = parse_decimal_stat(stat_text("maxValues"), 38, 18);
         assert!(min_stat <= min, "minValues {min_stat} is above {min}");
         assert!(max_stat >= max, "maxValues {max_stat} is below {max}");
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_stats_scalar_serialization_unsigned() {
+        let unsigned = |bit_width| {
+            Some(LogicalType::Integer(IntType {
+                bit_width,
+                is_signed: false,
+            }))
+        };
+        let cases = &[
+            (
+                simple_parquet_stat!(Statistics::Int32, 255),
+                unsigned(8),
+                Value::from(255),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int32, 65535),
+                unsigned(16),
+                Value::from(65535),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int32, u32::MAX as i32),
+                unsigned(32),
+                Value::from(u32::MAX),
+            ),
+            (
+                simple_parquet_stat!(Statistics::Int64, u64::MAX as i64),
+                unsigned(64),
+                Value::from(u64::MAX),
+            ),
+        ];
+
+        for (stats, logical_type, expected) in cases {
+            let scalar = StatsScalar::try_from_stats(stats, logical_type.as_ref(), true).unwrap();
+            let actual = scalar.into_json(true).unwrap();
+            assert_eq!(&actual, expected);
+        }
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_aggregated_stats_unsigned_ordering() {
+        // Values above the signed maximum must sort after smaller values
+        let logical_type = Some(LogicalType::Integer(IntType {
+            bit_width: 64,
+            is_signed: false,
+        }));
+        let small = Statistics::Int64(ValueStatistics::new(Some(1), Some(2), None, Some(0), false));
+        let large = Statistics::Int64(ValueStatistics::new(
+            Some((u64::MAX - 1) as i64),
+            Some(u64::MAX as i64),
+            None,
+            Some(0),
+            false,
+        ));
+        let mut stats = AggregatedStats::from((&small, logical_type.as_ref()));
+        stats += AggregatedStats::from((&large, logical_type.as_ref()));
+        assert_eq!(stats.min, AggregatedBound::Value(StatsScalar::UInt64(1)));
+        assert_eq!(
+            stats.max,
+            AggregatedBound::Value(StatsScalar::UInt64(u64::MAX))
+        );
+    }
+
+    #[cfg(feature = "unsigned-integers")]
+    #[test]
+    fn test_stats_unsigned_legacy_converted_type() {
+        use parquet::basic::{ConvertedType, Repetition};
+        use parquet::data_type::{Int32Type, Int64Type};
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as SchemaType;
+
+        // Older writers annotate unsigned columns with only the legacy converted type
+        let column = |name: &str, physical_type, converted_type| {
+            Arc::new(
+                SchemaType::primitive_type_builder(name, physical_type)
+                    .with_repetition(Repetition::REQUIRED)
+                    .with_converted_type(converted_type)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let schema = Arc::new(
+            SchemaType::group_type_builder("schema")
+                .with_fields(vec![
+                    column("u32", Type::INT32, ConvertedType::UINT_32),
+                    column("u64", Type::INT64, ConvertedType::UINT_64),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut buffer = Vec::new();
+        let mut writer =
+            SerializedFileWriter::new(&mut buffer, schema, Arc::new(Default::default())).unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        let mut column_writer = row_group.next_column().unwrap().unwrap();
+        column_writer
+            .typed::<Int32Type>()
+            .write_batch(&[1, u32::MAX as i32], None, None)
+            .unwrap();
+        column_writer.close().unwrap();
+        let mut column_writer = row_group.next_column().unwrap().unwrap();
+        column_writer
+            .typed::<Int64Type>()
+            .write_batch(&[1, u64::MAX as i64], None, None)
+            .unwrap();
+        column_writer.close().unwrap();
+        row_group.close().unwrap();
+        writer.close().unwrap();
+
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        let column_descr = reader.metadata().file_metadata().schema_descr().column(1);
+        assert_eq!(column_descr.logical_type_ref(), None);
+
+        let stats = stats_from_file_metadata(
+            &IndexMap::new(),
+            reader.metadata(),
+            DataSkippingNumIndexedCols::AllColumns,
+            &None::<Vec<String>>,
+        )
+        .unwrap();
+
+        let value = |values: &HashMap<String, ColumnValueStat>, name: &str| {
+            values[name].as_value().cloned().unwrap()
+        };
+        assert_eq!(value(&stats.min_values, "u32"), json!(1));
+        assert_eq!(value(&stats.max_values, "u32"), json!(u32::MAX));
+        assert_eq!(value(&stats.min_values, "u64"), json!(1));
+        assert_eq!(value(&stats.max_values, "u64"), json!(u64::MAX));
+    }
+
+    #[cfg(feature = "nanosecond-time")]
+    #[test]
+    fn test_unparsable_row_group_bound_omits_file_bound() {
+        use arrow_array::{RecordBatch, Time64NanosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Time64(TimeUnit::Nanosecond),
+            true,
+        )]));
+        // Two row groups. The first one's minimum isn't a valid time of day, so the file's
+        // minimum is unknown, and using the second row group's minimum of 100 would wrongly
+        // exclude the 50 in the first row group.
+        let times = Time64NanosecondArray::from(vec![-5, 50, 100, 200]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(times)]).unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        let stats = stats_from_file_metadata(
+            &IndexMap::new(),
+            reader.metadata(),
+            DataSkippingNumIndexedCols::AllColumns,
+            &None::<Vec<String>>,
+        )
+        .unwrap();
+
+        assert!(!stats.min_values.contains_key("t"), "{stats:?}");
+        assert_eq!(
+            stats.max_values["t"].as_value().cloned().unwrap(),
+            json!("00:00:00.000000200")
+        );
+    }
+
+    #[test]
+    fn test_aggregated_bound_combine() {
+        use AggregatedBound::*;
+        let value = |v| Value(StatsScalar::Int32(v));
+
+        assert_eq!(value(1).combine(value(2), Ordering::Less), value(1));
+        assert_eq!(value(1).combine(value(2), Ordering::Greater), value(2));
+        assert_eq!(Missing.combine(value(2), Ordering::Less), value(2));
+        assert_eq!(value(1).combine(Missing, Ordering::Less), value(1));
+        assert_eq!(Missing.combine(Missing, Ordering::Less), Missing);
+        assert_eq!(Unknown.combine(value(2), Ordering::Less), Unknown);
+        assert_eq!(value(1).combine(Unknown, Ordering::Greater), Unknown);
+        assert_eq!(Missing.combine(Unknown, Ordering::Less), Unknown);
     }
 
     #[tokio::test]

@@ -206,6 +206,13 @@ impl LogicalFileView {
             })
     }
 
+    /// Returns the tags stored in the log for this file, if any.
+    ///
+    /// Tags are a free-form metadata map from string keys to optional string values on Add actions.
+    pub fn tags(&self) -> Option<HashMap<String, Option<String>>> {
+        self.file_constant_map(FIELD_NAME_TAGS)
+    }
+
     fn file_constant_values(&self) -> Option<&StructArray> {
         self.files
             .column_by_name(FIELD_NAME_FILE_CONSTANT_VALUES)
@@ -359,7 +366,7 @@ impl LogicalFileView {
             modification_time: self.modification_time(),
             data_change: true,
             stats: self.stats(),
-            tags: self.file_constant_map(FIELD_NAME_TAGS),
+            tags: self.tags(),
             deletion_vector: self.deletion_vector().map(|dv| dv.descriptor()),
             base_row_id: self.file_constant_i64(FIELD_NAME_BASE_ROW_ID),
             default_row_commit_version: self
@@ -388,7 +395,7 @@ impl LogicalFileView {
             size: Some(self.size()),
             partition_values: Some(self.partition_values_map()),
             deletion_vector: self.deletion_vector().map(|dv| dv.descriptor()),
-            tags: None,
+            tags: self.tags(),
             base_row_id: None,
             default_row_commit_version: None,
         }
@@ -1014,6 +1021,74 @@ mod tests {
         assert_eq!(view.add_action().stats.as_deref(), Some(full_stats_json));
         assert_eq!(view.num_records(), Some(11));
         assert!(view.min_values().is_none());
+    }
+
+    #[test]
+    fn logical_file_view_reads_tags_from_file_constant_values() {
+        use arrow_array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+
+        let base_schema: arrow_schema::Schema =
+            scan_row_schema().as_ref().try_into_arrow().unwrap();
+        let mut columns: Vec<ArrayRef> = base_schema
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), 1))
+            .collect();
+        columns[base_schema.index_of("path").unwrap()] =
+            Arc::new(StringArray::from(vec![Some("part-000.parquet")]));
+        columns[base_schema.index_of("size").unwrap()] = Arc::new(Int64Array::from(vec![1]));
+        columns[base_schema.index_of("modificationTime").unwrap()] =
+            Arc::new(Int64Array::from(vec![1]));
+
+        let fcv_idx = base_schema.index_of("fileConstantValues").unwrap();
+        let ArrowDataType::Struct(fcv_fields) = base_schema.field(fcv_idx).data_type().clone()
+        else {
+            panic!("fileConstantValues should be a struct");
+        };
+        let map_names = MapFieldNames {
+            entry: "key_value".into(),
+            key: "key".into(),
+            value: "value".into(),
+        };
+        let children: Vec<ArrayRef> = fcv_fields
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "tags" => {
+                    let mut tags = MapBuilder::new(
+                        Some(map_names.clone()),
+                        StringBuilder::new(),
+                        StringBuilder::new(),
+                    );
+                    tags.keys().append_value("foo");
+                    tags.values().append_value("bar");
+                    tags.keys().append_value("no-value");
+                    tags.values().append_null();
+                    tags.append(true).unwrap();
+                    Arc::new(tags.finish()) as ArrayRef
+                }
+                _ => new_null_array(field.data_type(), 1),
+            })
+            .collect();
+        columns[fcv_idx] = Arc::new(StructArray::new(fcv_fields, children, None));
+
+        let batch = RecordBatch::try_new(Arc::new(base_schema), columns).unwrap();
+        let view = LogicalFileView::new(batch, 0);
+
+        let tags = view.tags().expect("tags map should be present");
+        assert_eq!(tags.get("foo"), Some(&Some("bar".to_string())));
+        assert_eq!(tags.get("no-value"), Some(&None));
+        // to_add must preserve the tags rather than dropping them.
+        assert_eq!(view.to_add().tags, Some(tags.clone()));
+        // Remove actions declare extendedFileMetadata, so they must carry the tags too.
+        assert_eq!(view.remove_action(true).tags, Some(tags));
+    }
+
+    #[test]
+    fn logical_file_view_tags_absent_when_file_constant_values_null() {
+        let view = logical_file_view_without_raw_stats();
+        assert!(view.tags().is_none());
+        assert!(view.to_add().tags.is_none());
+        assert!(view.remove_action(true).tags.is_none());
     }
 
     #[test]

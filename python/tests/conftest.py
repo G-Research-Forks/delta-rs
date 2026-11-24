@@ -19,7 +19,7 @@ from deltalake import (
     enable_nanosecond_timestamps,
     write_deltalake,
 )
-from deltalake._internal import _NANOSECOND_TIMESTAMPS
+from deltalake._internal import _FLOAT16, _NANOSECOND_TIMESTAMPS, _UNSIGNED_INTEGERS
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -264,6 +264,13 @@ def sample_data_pyarrow(request) -> "pa.Table":
         extras["timestamp_ns_ntz"] = pa.array(
             [pa.scalar(i, type=pa.timestamp("ns", None)) for i in range(nrows)]
         )
+    if _FLOAT16:
+        extras["float16"] = pa.array([float(x) for x in range(nrows)], pa.float16())
+    if _UNSIGNED_INTEGERS:
+        extras["uint64"] = pa.array(list(range(nrows)), pa.uint64())
+        extras["uint32"] = pa.array(list(range(nrows)), pa.uint32())
+        extras["uint16"] = pa.array(list(range(nrows)), pa.uint16())
+        extras["uint8"] = pa.array(list(range(nrows)), pa.uint8())
 
     table = pa.table(
         {

@@ -346,13 +346,20 @@ pub(crate) fn get_null_of_arrow_type(t: &ArrowDataType) -> DeltaResult<ScalarVal
                 TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(None, tz),
             })
         }
+        #[cfg(feature = "nanosecond-time")]
+        ArrowDataType::Time64(TimeUnit::Nanosecond) => Ok(ScalarValue::Time64Nanosecond(None)),
         ArrowDataType::Dictionary(k, v) => Ok(ScalarValue::Dictionary(
             k.clone(),
             Box::new(get_null_of_arrow_type(v)?),
         )),
+        #[cfg(feature = "float16")]
+        ArrowDataType::Float16 => Ok(ScalarValue::Float16(None)),
         //Unsupported types...
-        ArrowDataType::Float16
-        | ArrowDataType::Decimal32(_, _)
+        #[cfg(not(feature = "float16"))]
+        ArrowDataType::Float16 => Err(DeltaTableError::Generic(
+            "Unsupported data type for Delta Lake Float16".into(),
+        )),
+        ArrowDataType::Decimal32(_, _)
         | ArrowDataType::Decimal64(_, _)
         | ArrowDataType::Decimal256(_, _)
         | ArrowDataType::Union(_, _)
@@ -640,6 +647,8 @@ mod tests {
     use datafusion::prelude::SessionConfig;
     use delta_kernel::schema::ArrayType;
     use futures::{StreamExt, TryStreamExt};
+    #[cfg(feature = "float16")]
+    use half::f16;
     use object_store::ObjectStoreExt as _;
     use serde_json::json;
     use std::ops::Range;
@@ -694,6 +703,12 @@ mod tests {
                 json!("2015"),
                 ArrowDataType::Int64,
                 ScalarValue::Int64(Some(2015)),
+            ),
+            #[cfg(feature = "float16")]
+            (
+                json!("2015"),
+                ArrowDataType::Float16,
+                ScalarValue::Float16(Some(f16::from_f32(2015.))),
             ),
             (
                 json!("2015"),

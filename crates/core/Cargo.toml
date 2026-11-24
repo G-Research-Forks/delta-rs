@@ -99,6 +99,7 @@ rand = "0.10"
 sqlparser = "0.64"
 humantime = { version = "2.1.0", optional = true }
 validator = { version = "0.21", features = ["derive"] }
+half = { version = "2.7.1", optional = true }
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"]}
@@ -140,6 +141,28 @@ delta-cache = ["foyer", "tempfile", "url/serde"]
 nanosecond-timestamps = [
     "delta_kernel/nanosecond-timestamps",
     "deltalake-kernel-executor?/nanosecond-timestamps",
+]
+
+# Experimental support for the float16 primitive type
+float16 = [
+    "delta_kernel/float16",
+    "delta_kernel_default_engine/float16",
+    "deltalake-kernel-executor?/float16",
+    "dep:half",
+]
+
+# Experimental support for unsigned integer primitive types
+unsigned-integers = [
+    "delta_kernel/unsigned-integers",
+    "delta_kernel_default_engine/unsigned-integers",
+    "deltalake-kernel-executor?/unsigned-integers",
+]
+
+# Experimental support for the time of day in nanoseconds primitive type
+nanosecond-time = [
+    "delta_kernel/nanosecond-time",
+    "delta_kernel_default_engine/nanosecond-time",
+    "deltalake-kernel-executor?/nanosecond-time",
 ]
 
 integration_test = []

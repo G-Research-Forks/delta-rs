@@ -22,7 +22,10 @@ from deltalake import (
     write_deltalake,
 )
 from deltalake._internal import (
+    _FLOAT16,
+    _NANOSECOND_TIME,
     _NANOSECOND_TIMESTAMPS,
+    _UNSIGNED_INTEGERS,
     CommitFailedError,
     Field,
     PrimitiveType,
@@ -682,7 +685,9 @@ def test_roundtrip_metadata(tmp_path: pathlib.Path, sample_table: Table):
         # "binary",
         "date32",
         "timestamp",
-    ],
+    ]
+    + (["float16"] if _FLOAT16 else [])
+    + (["uint64", "uint32", "uint16", "uint8"] if _UNSIGNED_INTEGERS else []),
 )
 def test_roundtrip_partitioned(
     tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Table", column: str
@@ -1082,6 +1087,12 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
     if _nanosecond_timestamps_enabled():
         expected_mins["timestamp_ns"] = "1970-01-01T00:00:00Z"
         expected_mins["timestamp_ns_ntz"] = "1970-01-01 00:00:00"
+    if _FLOAT16:
+        # Parquet writes a zero float minimum as -0.0.
+        expected_mins["float16"] = -0.0
+    if _UNSIGNED_INTEGERS:
+        for column in ["uint64", "uint32", "uint16", "uint8"]:
+            expected_mins[column] = 0
 
     assert stats["minValues"] == expected_mins
 
@@ -1106,6 +1117,11 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
         # in the add action statistics.
         expected_maxs["timestamp_ns"] = "1970-01-01T00:00:00.000Z"
         expected_maxs["timestamp_ns_ntz"] = "1970-01-01 00:00:00.000"
+    if _FLOAT16:
+        expected_maxs["float16"] = 4.0
+    if _UNSIGNED_INTEGERS:
+        for column in ["uint64", "uint32", "uint16", "uint8"]:
+            expected_maxs[column] = 4
 
     assert stats["maxValues"] == expected_maxs
 
@@ -1918,6 +1934,28 @@ def test_partition_large_arrow_types(tmp_path: pathlib.Path):
     assert expected == result
 
 
+@pytest.mark.pyarrow
+@pytest.mark.skipif(
+    not _UNSIGNED_INTEGERS, reason="unsigned integer support not enabled"
+)
+def test_uint64_partition_above_signed_maximum(tmp_path: pathlib.Path):
+    import pyarrow as pa
+
+    values = [1, 2**63, 2**64 - 1]
+    data = pa.table(
+        {
+            "id": pa.array([0, 1, 2], pa.int32()),
+            "u64": pa.array(values, pa.uint64()),
+        }
+    )
+    write_deltalake(tmp_path, data, partition_by=["u64"])
+
+    dt = DeltaTable(tmp_path)
+    result = dt.to_pyarrow_table().sort_by("id")
+    assert result.schema.field("u64").type == pa.uint64()
+    assert result["u64"].to_pylist() == values
+
+
 def test_uint_arrow_types(tmp_path: pathlib.Path):
     table = Table(
         {
@@ -1941,6 +1979,48 @@ def test_uint_arrow_types(tmp_path: pathlib.Path):
     )
 
     write_deltalake(tmp_path, table)
+
+    dt = DeltaTable(tmp_path)
+    if _UNSIGNED_INTEGERS:
+        expected_types = ["uint8", "uint16", "uint32", "uint64"]
+        protocol = dt.protocol()
+        assert protocol.reader_features is not None
+        assert "unsignedIntegerTypes-dev" in protocol.reader_features
+        assert protocol.writer_features is not None
+        assert "unsignedIntegerTypes-dev" in protocol.writer_features
+    else:
+        expected_types = ["byte", "short", "integer", "long"]
+    assert [f.type.type for f in dt.schema().fields] == expected_types
+
+
+@pytest.mark.pyarrow
+@pytest.mark.skipif(not _NANOSECOND_TIME, reason="nanosecond time not enabled")
+def test_time_nanos_partitions_and_stats(tmp_path: pathlib.Path):
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    # 13:06:07.123456789, with sub-microsecond digits to check nothing truncates them
+    afternoon = 47_167_123_456_789
+    times = pa.array([0, afternoon, afternoon + 1, None], pa.time64("ns"))
+    data = pa.table({"id": pa.array([0, 1, 2, 3], pa.int32()), "t": times})
+
+    partitioned_path = tmp_path / "partitioned"
+    write_deltalake(partitioned_path, data, partition_by=["t"])
+    result = DeltaTable(partitioned_path).to_pyarrow_table().sort_by("id")
+    assert result.schema.field("t").type == pa.time64("ns")
+    assert result["t"] == data["t"]
+
+    # Two files that differ only below the microsecond, so stats skipping has to keep
+    # full precision for the filter to return the right file.
+    stats_path = tmp_path / "stats"
+    write_deltalake(stats_path, data.slice(0, 2))
+    write_deltalake(stats_path, data.slice(2, 2), mode="append")
+    dataset = DeltaTable(stats_path).to_pyarrow_dataset()
+    threshold = pa.scalar(afternoon, pa.time64("ns"))
+    fragments = list(dataset.get_fragments(filter=ds.field("t") > threshold))
+    assert len(fragments) == 1
+    result = dataset.to_table(filter=ds.field("t") > threshold)
+    assert result["id"].to_pylist() == [2]
 
 
 @pytest.mark.pyarrow

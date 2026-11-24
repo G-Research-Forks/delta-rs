@@ -1,0 +1,56 @@
+name: experimental_types
+
+# Builds and tests the experimental data type features, which the other workflows leave disabled
+
+on:
+  push:
+    branches: ["*-gr"]
+  pull_request:
+    branches: ["*-gr"]
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  TYPE_FEATURES: "float16,nanosecond-timestamps,unsigned-integers,nanosecond-time"
+
+jobs:
+  rust:
+    name: Rust tests with experimental types
+    runs-on: ubuntu-latest
+    env:
+      CORE_FEATURES: "deltalake-core/datafusion,deltalake-core/float16,deltalake-core/nanosecond-timestamps,deltalake-core/unsigned-integers,deltalake-core/nanosecond-time"
+    steps:
+      # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: ./.github/actions/setup-builder
+
+      - name: load DAT
+        run: make setup-dat
+
+      - name: Check build without datafusion
+        run: cargo check --profile=ci --package deltalake-core --features "$TYPE_FEATURES"
+
+      - name: Run tests
+        run: |
+          cargo test --profile=ci --package deltalake-core --package deltalake-kernel-executor \
+            --features "$CORE_FEATURES"
+
+  python:
+    name: Python tests with experimental types
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./python
+    env:
+      PROFILE: ci
+    steps:
+      # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      - name: Build and install deltalake
+        run: make develop MATURIN_EXTRA_ARGS="--features $TYPE_FEATURES"
+
+      - name: Run tests
+        run: make unit-test

@@ -4,10 +4,14 @@ import pytest
 from arro3.core import Array, DataType, Table
 
 from deltalake import DeltaTable, write_deltalake
+from deltalake._internal import _UNSIGNED_INTEGERS
 from deltalake.exceptions import DeltaError
 from deltalake.query import QueryBuilder
 
 
+@pytest.mark.skipif(
+    _UNSIGNED_INTEGERS, reason="unsigned integers are not cast to signed"
+)
 def test_unsafe_cast(tmp_path):
     tbl = Table.from_pydict({"foo": Array([1, 2, 3, 200], DataType.uint8())})
 
@@ -22,6 +26,87 @@ def test_safe_cast(tmp_path):
     tbl = Table.from_pydict({"foo": Array([1, 2, 3, 4], DataType.uint8())})
 
     write_deltalake(tmp_path, tbl)
+
+
+@pytest.mark.skipif(
+    not _UNSIGNED_INTEGERS, reason="unsigned integer support not enabled"
+)
+def test_no_cast_with_unsigned_integers(tmp_path):
+    tbl = Table.from_pydict({"foo": Array([1, 2, 3, 200], DataType.uint8())})
+
+    write_deltalake(tmp_path, tbl)
+
+    result = (
+        QueryBuilder()
+        .register("tbl", DeltaTable(tmp_path))
+        .execute("select foo from tbl")
+        .read_all()
+    )
+    assert result.schema.field("foo").type == DataType.uint8()
+    assert result["foo"].to_pylist() == [1, 2, 3, 200]
+
+
+def test_append_unsigned_to_signed_column(tmp_path):
+    write_deltalake(
+        tmp_path, Table.from_pydict({"foo": Array([1, 2], DataType.int8())})
+    )
+    write_deltalake(
+        tmp_path,
+        Table.from_pydict({"foo": Array([3, 4], DataType.uint8())}),
+        mode="append",
+    )
+
+    dt = DeltaTable(tmp_path)
+    assert "unsignedIntegerTypes-dev" not in (dt.protocol().writer_features or [])
+    result = (
+        QueryBuilder().register("tbl", dt).execute("select foo from tbl").read_all()
+    )
+    assert result.schema.field("foo").type == DataType.int8()
+    assert sorted(result["foo"].to_pylist()) == [1, 2, 3, 4]
+
+
+def test_append_unsigned_to_wider_signed_column(tmp_path):
+    write_deltalake(
+        tmp_path, Table.from_pydict({"foo": Array([1, 2], DataType.int64())})
+    )
+    # 200 doesn't fit in int8 but does fit in the existing int64 column
+    write_deltalake(
+        tmp_path,
+        Table.from_pydict({"foo": Array([3, 200], DataType.uint8())}),
+        mode="append",
+    )
+
+    dt = DeltaTable(tmp_path)
+    assert "unsignedIntegerTypes-dev" not in (dt.protocol().writer_features or [])
+    result = (
+        QueryBuilder().register("tbl", dt).execute("select foo from tbl").read_all()
+    )
+    assert result.schema.field("foo").type == DataType.int64()
+    assert sorted(result["foo"].to_pylist()) == [1, 2, 3, 200]
+
+
+@pytest.mark.skipif(
+    not _UNSIGNED_INTEGERS, reason="unsigned integer support not enabled"
+)
+def test_overwrite_schema_signed_column_with_unsigned(tmp_path):
+    write_deltalake(
+        tmp_path, Table.from_pydict({"foo": Array([1, 2], DataType.int8())})
+    )
+    # 200 doesn't fit in int8, so this only works if the column becomes uint8
+    write_deltalake(
+        tmp_path,
+        Table.from_pydict({"foo": Array([3, 200], DataType.uint8())}),
+        mode="overwrite",
+        schema_mode="overwrite",
+    )
+
+    dt = DeltaTable(tmp_path)
+    assert "unsignedIntegerTypes-dev" in (dt.protocol().writer_features or [])
+    result = (
+        QueryBuilder().register("tbl", dt).execute("select foo from tbl").read_all()
+    )
+    assert result.schema.field("foo").type == DataType.uint8()
+    assert sorted(result["foo"].to_pylist()) == [3, 200]
 
 
 @pytest.mark.parametrize("schema_mode", [None, "merge"])

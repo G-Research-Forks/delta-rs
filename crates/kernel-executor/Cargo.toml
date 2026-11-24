@@ -43,6 +43,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dashmap = "6"
+half = { version = "2.7.1", optional = true }
 indexmap = "2.2.1"
 itertools = "0.15"
 thiserror = { workspace = true }
@@ -62,6 +63,12 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [features]
 # Experimental support for nanosecond timestamps primitive type
 nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]
+# Experimental support for the float16 primitive type
+float16 = ["delta_kernel/float16", "dep:half"]
+# Experimental support for unsigned integer primitive types
+unsigned-integers = ["delta_kernel/unsigned-integers"]
+# Experimental support for the time of day in nanoseconds primitive type
+nanosecond-time = ["delta_kernel/nanosecond-time"]
 
 [lints]
 workspace = true
