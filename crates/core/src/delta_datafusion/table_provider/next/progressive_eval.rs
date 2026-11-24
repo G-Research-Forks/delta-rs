@@ -204,6 +204,10 @@ impl ExecutionPlan for ProgressiveEvalExec {
         match options.children_properties {
             ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
                 input,
+                // The rebuilt node is a new execution, as it is for DataFusion's
+                // own operators: sharing the set would add its counts to those
+                // of the node it replaces.
+                metrics: ExecutionPlanMetricsSet::new(),
                 ..Self::clone(&self)
             })),
             ChildrenPropertiesMode::Recompute => Ok(Arc::new(Self::new(
@@ -1865,6 +1869,60 @@ mod tests {
 
         assert!(saw_start);
         assert!(saw_end);
+    }
+
+    /// `reset_state` rebuilds the node so that a plan can be executed again,
+    /// and the rebuilt node must count from zero rather than add to the
+    /// metrics of the execution before it.
+    #[tokio::test]
+    async fn test_reset_state_starts_fresh_metrics() {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let b1 = RecordBatch::try_from_iter(vec![("a", a)]).unwrap();
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![10, 20]));
+        let b2 = RecordBatch::try_from_iter(vec![("a", a)]).unwrap();
+
+        let schema = b1.schema();
+        let exec = MemorySourceConfig::try_new_exec(&[vec![b1], vec![b2]], schema, None).unwrap();
+        let progressive: Arc<dyn ExecutionPlan> =
+            Arc::new(ProgressiveEvalExec::new(exec, None, None));
+
+        let count = |value: usize| {
+            let count = Count::new();
+            count.add(value);
+            count
+        };
+        let assert_single_execution = |plan: &Arc<dyn ExecutionPlan>| {
+            let metrics = plan.metrics().unwrap();
+            assert_eq!(metrics.output_rows(), Some(4));
+            assert_eq!(
+                metrics.sum_by_name("num_inputs"),
+                Some(MetricValue::Count {
+                    name: Borrowed("num_inputs"),
+                    count: count(2),
+                })
+            );
+            assert_eq!(
+                metrics.sum_by_name("num_read_inputs"),
+                Some(MetricValue::Count {
+                    name: Borrowed("num_read_inputs"),
+                    count: count(2),
+                })
+            );
+        };
+
+        collect(Arc::clone(&progressive), Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        assert_single_execution(&progressive);
+
+        let reset = Arc::clone(&progressive).reset_state().unwrap();
+        assert!(reset.metrics().unwrap().output_rows().is_none());
+        collect(Arc::clone(&reset), Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        assert_single_execution(&reset);
+        // The node that was reset keeps the metrics of its own execution.
+        assert_single_execution(&progressive);
     }
 
     fn nanos_from_timestamp(ts: &Timestamp) -> i64 {
