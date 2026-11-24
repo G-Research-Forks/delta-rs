@@ -1604,7 +1604,7 @@ mod tests {
 
     #[cfg(feature = "nanosecond-time")]
     #[test]
-    fn test_unparseable_row_group_bound_omits_file_bound() {
+    fn test_unparsable_row_group_bound_omits_file_bound() {
         use arrow_array::{RecordBatch, Time64NanosecondArray};
         use arrow_schema::{DataType, Field, Schema, TimeUnit};
         use parquet::arrow::ArrowWriter;
