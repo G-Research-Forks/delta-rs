@@ -11,9 +11,9 @@ def _convert_arro3_schema_to_delta(
     existing_schema: Arro3Schema | None = None,
     replacing_existing_schema: bool = False,
 ) -> Arro3Schema:
-    """Convert a arro3 schema to a schema compatible with Delta Lake. Converts unsigned to signed equivalent
-    (unless built with unsigned integer support and the existing column is not signed), and
-    converts all timestamps to `us` timestamps, except nanosecond timestamps when the experimental nanosecond
+    """Convert a arro3 schema to a schema compatible with Delta Lake. Converts unsigned integers to the type
+    of an existing signed column, or otherwise to their signed equivalent unless built with unsigned integer
+    support, and converts all timestamps to `us` timestamps, except nanosecond timestamps when the experimental nanosecond
     timestamp feature is enabled.
     Also handles null column types by converting them to match
     corresponding fields in the existing table schema.
@@ -57,15 +57,17 @@ def _convert_arro3_schema_to_delta(
             return DataType.timestamp(time_unit, tz=tz)
         elif DataType.is_fixed_size_binary(dtype):
             return DataType.binary()
-        elif DataType.is_unsigned_integer(dtype) and (
-            not _UNSIGNED_INTEGERS
-            # Keep writing unsigned data into existing signed columns as before
-            or (
+        elif DataType.is_unsigned_integer(dtype):
+            if (
                 not replacing_existing_schema
                 and existing_dtype is not None
                 and DataType.is_signed_integer(existing_dtype)
-            )
-        ):
+            ):
+                # Data for an existing signed column is cast to the column's type, so convert
+                # directly to it, as values may not fit in the signed type of the input's width
+                return existing_dtype
+            if _UNSIGNED_INTEGERS:
+                return dtype
             if DataType.is_uint16(dtype):
                 return DataType.int16()
             elif DataType.is_uint32(dtype):

@@ -65,6 +65,26 @@ def test_append_unsigned_to_signed_column(tmp_path):
     assert sorted(result["foo"].to_pylist()) == [1, 2, 3, 4]
 
 
+def test_append_unsigned_to_wider_signed_column(tmp_path):
+    write_deltalake(
+        tmp_path, Table.from_pydict({"foo": Array([1, 2], DataType.int64())})
+    )
+    # 200 doesn't fit in int8 but does fit in the existing int64 column
+    write_deltalake(
+        tmp_path,
+        Table.from_pydict({"foo": Array([3, 200], DataType.uint8())}),
+        mode="append",
+    )
+
+    dt = DeltaTable(tmp_path)
+    assert "unsignedIntegerTypes-dev" not in (dt.protocol().writer_features or [])
+    result = (
+        QueryBuilder().register("tbl", dt).execute("select foo from tbl").read_all()
+    )
+    assert result.schema.field("foo").type == DataType.int64()
+    assert sorted(result["foo"].to_pylist()) == [1, 2, 3, 200]
+
+
 @pytest.mark.skipif(
     not _UNSIGNED_INTEGERS, reason="unsigned integer support not enabled"
 )
