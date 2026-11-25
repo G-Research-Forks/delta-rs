@@ -421,16 +421,69 @@ pub(super) fn arrange_non_overlapping_files<T>(
         return Err(items);
     };
     let options = sort_options(ordering);
-    if let Some(order) = non_overlapping_order(&ranges, &options, OverlapPolicy::Prove) {
-        return Ok((apply_order(items, order), false));
-    }
-    if overlap == OverlapPolicy::Prove {
-        return Err(items);
-    }
-    match non_overlapping_order(&ranges, &options, OverlapPolicy::Assume) {
-        Some(order) => Ok((apply_order(items, order), true)),
+    match non_overlapping_order_with_policy(&ranges, &options, overlap) {
+        Some((order, assumed)) => Ok((apply_order(items, order), assumed)),
         None => Err(items),
     }
+}
+
+fn non_overlapping_order_with_policy(
+    ranges: &[FileRange],
+    options: &[SortOptions],
+    overlap: OverlapPolicy,
+) -> Option<(Vec<usize>, bool)> {
+    if let Some(order) = non_overlapping_order(ranges, options, OverlapPolicy::Prove) {
+        return Some((order, false));
+    }
+    if overlap == OverlapPolicy::Prove {
+        return None;
+    }
+    non_overlapping_order(ranges, options, OverlapPolicy::Assume).map(|order| (order, true))
+}
+
+/// Whether the maximum closed-interval overlap depth across `ranges` exceeds
+/// `limit`, computed via an `O(n log n)` sort-and-sweep.
+///
+/// Closed intervals (`[start, end]`, ordering starts before ends at equal
+/// endpoints) match the strict non-overlap requirement (`prev_end < next_start`)
+/// of `FileScanConfig::split_groups_by_statistics`, and also count degenerate
+/// point ranges `[x, x]` accurately. By interval-graph coloring, the minimum
+/// number of non-overlapping groups equals this maximum overlap depth, so
+/// exceeding `limit` guarantees that `split_groups_by_statistics` would produce
+/// more than `limit` groups and be discarded.
+///
+/// Returns `true` if any range has inverted bounds (`start > end`), since
+/// statistics-based grouping cannot handle such files.
+fn overlap_depth_exceeds(ranges: &[FileRange], options: &[SortOptions], limit: usize) -> bool {
+    let cmp = |a: &[ScalarValue], b: &[ScalarValue]| {
+        compare_rows(a, b, options).expect("endpoints share a non-nested type per column")
+    };
+
+    let mut events: Vec<(&[ScalarValue], bool)> = Vec::with_capacity(ranges.len() * 2);
+    for (start, end, _) in ranges {
+        if cmp(start, end) == Ordering::Greater {
+            return true;
+        }
+        // `false` = start, `true` = end; sorts starts before ends on ties.
+        events.push((start.as_slice(), false));
+        events.push((end.as_slice(), true));
+    }
+    events.sort_unstable_by(|(a_val, a_is_end), (b_val, b_is_end)| {
+        cmp(a_val, b_val).then_with(|| a_is_end.cmp(b_is_end))
+    });
+
+    let mut depth = 0usize;
+    for (_, is_end) in events {
+        if is_end {
+            depth -= 1;
+        } else {
+            depth += 1;
+            if depth > limit {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Each file's range endpoints under `ordering`, in the order the files came
@@ -673,28 +726,48 @@ fn split_file_groups_for_ordering(
     overlap: OverlapPolicy,
 ) -> (Vec<FileGroup>, bool) {
     let max_groups = max_num_groups(target_partitions);
+    let default_grouping =
+        |files: Vec<PartitionedFile>| partitioned_files_to_file_groups(files, target_partitions);
 
-    // Missing/unusable statistics fall through: the grouping below fails the
-    // same way and takes its default-grouping fallback.
-    let files = match arrange_non_overlapping_files(files, |file| file, ordering, overlap) {
-        Ok((ordered_files, assumed)) => {
-            return (
-                chunk_ordered_files(ordered_files, target_partitions),
-                assumed,
+    // Read each file's sort-column bounds once so the non-overlapping fast path
+    // and the overlap-depth cap check share a single walk over file statistics.
+    let Some(ranges) = file_ranges(files.iter(), ordering) else {
+        if overlap == OverlapPolicy::Assume {
+            debug!(
+                "file statistics cannot place every file in the declared sort order; ignoring the no-overlap assertion"
             );
         }
-        Err(files) => {
-            if overlap == OverlapPolicy::Assume {
-                debug!(
-                    "file statistics cannot place every file in the declared sort order; ignoring the no-overlap assertion"
-                );
-            }
-            files
-        }
+        return (default_grouping(files), false);
     };
+    let options = sort_options(ordering);
+
+    if let Some((order, assumed)) = non_overlapping_order_with_policy(&ranges, &options, overlap) {
+        return (
+            chunk_ordered_files(apply_order(files, order), target_partitions),
+            assumed,
+        );
+    }
+    if overlap == OverlapPolicy::Assume {
+        debug!(
+            "file statistics cannot place every file in the declared sort order; ignoring the no-overlap assertion"
+        );
+    }
+
+    // Bound the work before calling DataFusion's statistics-based grouping:
+    // `split_groups_by_statistics_with_target_partitions` is O(files * groups)
+    // and degrades to quadratic on heavily overlapping files, only for the
+    // result to be discarded by `max_groups`.
+    if overlap_depth_exceeds(&ranges, &options, max_groups) {
+        debug!(
+            max_groups,
+            num_files = files.len(),
+            "file sort order overlap depth exceeds group cap; falling back to default grouping"
+        );
+        return (default_grouping(files), false);
+    }
 
     let flat = vec![FileGroup::new(files)];
-    let default_grouping = |flat: Vec<FileGroup>| {
+    let default_from_flat = |flat: Vec<FileGroup>| {
         partitioned_files_to_file_groups(
             flat.into_iter().flat_map(FileGroup::into_inner),
             target_partitions,
@@ -726,14 +799,14 @@ fn split_file_groups_for_ordering(
                     "file sort order grouping exceeded the file-id dictionary key space; falling back to default grouping"
                 );
             }
-            default_grouping(flat)
+            default_from_flat(flat)
         }
         Err(err) => {
             debug!(
                 error = %err,
                 "failed to group files by statistics for the declared file sort order; falling back to default grouping"
             );
-            default_grouping(flat)
+            default_from_flat(flat)
         }
     };
     (groups, false)
@@ -2796,6 +2869,137 @@ mod tests {
             groups.iter().map(group_paths).collect_vec(),
             default_groups.iter().map(group_paths).collect_vec()
         );
+    }
+
+    #[test]
+    fn test_overlap_depth_exceeds_counts_closed_and_point_intervals() {
+        let ordering = int64_asc_ordering();
+        let options = sort_options(&ordering);
+
+        // Two overlapping ranges [0, 150] and [100, 199], followed by disjoint [200, 299]:
+        // max depth is 2.
+        let files = vec![
+            stats_file("a", 0, 150),
+            stats_file("b", 100, 199),
+            stats_file("c", 200, 299),
+        ];
+        let ranges = file_ranges(files.iter(), &ordering).unwrap();
+        assert!(!overlap_depth_exceeds(&ranges, &options, 2));
+        assert!(overlap_depth_exceeds(&ranges, &options, 1));
+
+        // Touching endpoints [0, 100] and [100, 200] count as overlapping (depth 2)
+        // to match `split_groups_by_statistics`'s strict `<` check.
+        let touching = vec![stats_file("a", 0, 100), stats_file("b", 100, 200)];
+        let ranges = file_ranges(touching.iter(), &ordering).unwrap();
+        assert!(!overlap_depth_exceeds(&ranges, &options, 2));
+        assert!(overlap_depth_exceeds(&ranges, &options, 1));
+
+        // Degenerate point ranges [42, 42] all overlap at 42 (depth = count).
+        let points = (0..5)
+            .map(|i| stats_file(&format!("p{i}"), 42, 42))
+            .collect_vec();
+        let ranges = file_ranges(points.iter(), &ordering).unwrap();
+        assert!(!overlap_depth_exceeds(&ranges, &options, 5));
+        assert!(overlap_depth_exceeds(&ranges, &options, 4));
+
+        // Inverted bounds (min > max) are rejected defensively.
+        let inverted = vec![stats_file("bad", 200, 100), stats_file("ok", 0, 50)];
+        let ranges = file_ranges(inverted.iter(), &ordering).unwrap();
+        assert!(overlap_depth_exceeds(&ranges, &options, 100));
+    }
+
+    #[test]
+    fn test_overlap_depth_exceeds_descending_and_multi_column() {
+        let desc_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("t", 0)),
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )])
+        .unwrap();
+        let desc_options = sort_options(&desc_ordering);
+        let files = vec![
+            stats_file("a", 0, 150),
+            stats_file("b", 100, 250),
+            stats_file("c", 120, 200),
+            stats_file("d", 300, 400),
+        ];
+        let ranges = file_ranges(files.iter(), &desc_ordering).unwrap();
+        assert!(!overlap_depth_exceeds(&ranges, &desc_options, 3));
+        assert!(overlap_depth_exceeds(&ranges, &desc_options, 2));
+
+        // Multi-column ordering: two files tie on leading column (1) with
+        // overlapping second-column ranges, while the third sits after them.
+        let multi = two_column_asc_ordering();
+        let multi_options = sort_options(&multi);
+        let files = vec![
+            two_column_stats_file("a", (0, 1), (0, 23)),
+            two_column_stats_file("b", (1, 2), (0, 23)),
+            two_column_stats_file("c", (3, 4), (0, 23)),
+        ];
+        let ranges = file_ranges(files.iter(), &multi).unwrap();
+        assert!(!overlap_depth_exceeds(&ranges, &multi_options, 2));
+        assert!(overlap_depth_exceeds(&ranges, &multi_options, 1));
+    }
+
+    #[test]
+    fn test_split_file_groups_respects_max_groups_cap_boundary() {
+        let target_partitions = 4;
+        let max_groups = max_num_groups(target_partitions);
+
+        // Exactly `max_groups` mutually overlapping files stay within the cap.
+        let at_cap = (0..max_groups)
+            .map(|i| stats_file(&format!("f{i}"), 0, 100))
+            .collect_vec();
+        let (groups, assumed) = split_file_groups_for_ordering(
+            at_cap,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            target_partitions,
+            OverlapPolicy::Prove,
+        );
+        assert!(!assumed);
+        assert_eq!(groups.len(), max_groups);
+
+        // `max_groups + 1` mutually overlapping files trip the overlap-depth
+        // pre-check and fall back to the default grouping.
+        let over_cap = (0..=max_groups)
+            .map(|i| stats_file(&format!("f{i}"), 0, 100))
+            .collect_vec();
+        let default_groups = partitioned_files_to_file_groups(over_cap.clone(), target_partitions);
+        let (groups, assumed) = split_file_groups_for_ordering(
+            over_cap,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            target_partitions,
+            OverlapPolicy::Prove,
+        );
+        assert!(!assumed);
+        assert_eq!(groups.len(), target_partitions);
+        assert_eq!(
+            groups.iter().map(group_paths).collect_vec(),
+            default_groups.iter().map(group_paths).collect_vec()
+        );
+    }
+
+    #[test]
+    fn test_split_file_groups_many_overlapping_files_falls_back_quickly() {
+        let target_partitions = 4;
+        let files = (0..10_000)
+            .map(|i| stats_file(&format!("f{i}"), 0, 100))
+            .collect_vec();
+
+        let (groups, assumed) = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            target_partitions,
+            OverlapPolicy::Prove,
+        );
+        assert!(!assumed);
+        assert_eq!(groups.len(), target_partitions);
+        assert_eq!(groups.iter().map(FileGroup::len).sum::<usize>(), 10_000);
     }
 
     #[test]
