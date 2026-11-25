@@ -629,10 +629,40 @@ fn assumed_range_cmp(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> O
         .unwrap_or(Ordering::Equal)
 }
 
+/// Whether `dt` is a type whose Delta min/max statistics are never widened by
+/// writers (no string/binary prefix truncation or timestamp millisecond
+/// rounding).
+///
+/// For these types, a leading sort column's `min`/`max` are the file's exact
+/// first and last keys, so `a.end > b.start` proves the files truly overlap
+/// and refutes [`OverlapPolicy::Assume`].
+fn bounds_never_widened(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+            | DataType::Date64
+    )
+}
+
 /// Whether the statistics place `a` and `b` apart at all, so that
 /// [`assumed_range_cmp`] ordering them means something.
 ///
-/// Walks the sort columns until one of them settles the pair:
+/// First rejects pairs whose leading sort column has exact (never-widened)
+/// bounds and proves an overlap (`a.end > b.start`): for genuinely
+/// non-overlapping files sorted lexicographically, `a.end <= b.start` always
+/// holds on the leading column, even for multi-column day-boundary files where
+/// `a.end == b.start`.
+///
+/// Then walks the sort columns until one of them settles the pair:
 ///
 /// * When ranges begin at different values, the file beginning earlier is
 ///   ordered first.
@@ -645,6 +675,11 @@ fn assumed_range_cmp(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> O
 /// Running out of columns leaves both files pinned to the same key on every
 /// one of them, so either ordering is valid, and we return true.
 fn assumed_ranges_separate(a: &FileRange, b: &FileRange, options: &[SortOptions]) -> bool {
+    if bounds_never_widened(&a.0[0].data_type())
+        && compare_endpoints(&a.1[0], &b.0[0], 0, options) == Ordering::Greater
+    {
+        return false;
+    }
     let pinned = |range: &FileRange, column: usize| {
         compare_endpoints(&range.0[column], &range.1[column], column, options) == Ordering::Equal
     };
@@ -2650,7 +2685,27 @@ mod tests {
     /// widened maximum cannot put them the wrong way round.
     #[test]
     fn test_assumed_order_places_files_meeting_at_a_widened_maximum() {
-        let files = vec![stats_file("b", 100, 200), stats_file("a", 0, 101)];
+        let ts_file = |path: &str, min_ms: i64, max_ms: i64| {
+            let mut file = PartitionedFile::new(format!("{path}.parquet"), 100);
+            file.statistics = Some(Arc::new(Statistics {
+                num_rows: Precision::Exact(10),
+                total_byte_size: Precision::Exact(100),
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    min_value: Precision::Exact(ScalarValue::TimestampMillisecond(
+                        Some(min_ms),
+                        None,
+                    )),
+                    max_value: Precision::Exact(ScalarValue::TimestampMillisecond(
+                        Some(max_ms),
+                        None,
+                    )),
+                    ..Default::default()
+                }],
+            }));
+            file
+        };
+        let files = vec![ts_file("b", 100, 200), ts_file("a", 0, 101)];
 
         assert!(
             arrange_non_overlapping_files(
@@ -2665,6 +2720,58 @@ mod tests {
             assumed_order(files, &int64_asc_ordering()),
             Some(vec!["a.parquet".to_string(), "b.parquet".to_string()])
         );
+    }
+
+    /// For types whose Delta bounds are never widened (integers, dates,
+    /// booleans), `a.end > b.start` on the leading sort column provably refutes
+    /// [`OverlapPolicy::Assume`] and must be refused rather than misordering
+    /// rows.
+    #[test]
+    fn test_assumed_order_refuses_overlapping_exact_bound_leading_column() {
+        // Single-column Int64: [0, 10] and [5, 7] provably overlap.
+        let files = vec![stats_file("a", 0, 10), stats_file("b", 5, 7)];
+        assert_eq!(assumed_order(files, &int64_asc_ordering()), None);
+
+        // Descending Int64: [0, 10] and [5, 7] still provably overlap.
+        let desc = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("t", 0)),
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )])
+        .unwrap();
+        let files = vec![stats_file("a", 0, 10), stats_file("b", 5, 7)];
+        assert_eq!(assumed_order(files, &desc), None);
+
+        // Multi-column (Int64, Int64): overlapping leading column is refused,
+        // whereas touching day-boundary ranges ([0, 1] and [1, 2]) still pass.
+        let overlapping_multi = vec![
+            two_column_stats_file("a", (0, 10), (0, 23)),
+            two_column_stats_file("b", (5, 7), (0, 23)),
+        ];
+        assert_eq!(
+            assumed_order(overlapping_multi, &two_column_asc_ordering()),
+            None
+        );
+
+        // Date32 is also never widened and refuses overlapping ranges.
+        let date_file = |path: &str, min_d: i32, max_d: i32| {
+            let mut file = PartitionedFile::new(format!("{path}.parquet"), 100);
+            file.statistics = Some(Arc::new(Statistics {
+                num_rows: Precision::Exact(10),
+                total_byte_size: Precision::Exact(100),
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    min_value: Precision::Exact(ScalarValue::Date32(Some(min_d))),
+                    max_value: Precision::Exact(ScalarValue::Date32(Some(max_d))),
+                    ..Default::default()
+                }],
+            }));
+            file
+        };
+        let dates = vec![date_file("a", 0, 10), date_file("b", 5, 7)];
+        assert_eq!(assumed_order(dates, &int64_asc_ordering()), None);
     }
 
     #[test]
@@ -3756,7 +3863,7 @@ mod tests {
             file_id_field,
             None,
             None,
-            Some(&int64_asc_ordering()),
+            Some(&two_column_asc_ordering()),
             overlap,
         )
         .await?;
@@ -3784,17 +3891,18 @@ mod tests {
 
         let file_id_field =
             crate::delta_datafusion::file_id::file_id_field(Some(FILE_ID_COLUMN_DEFAULT));
-        let parquet_read_schema = int64_sort_schema();
+        let parquet_read_schema = two_column_schema();
 
-        // Ranges that overlap their neighbours, so no order can be proven and
-        // the assertion would otherwise place the files itself.
+        // Day-boundary files whose per-column `time` bounds overlap across
+        // neighbours, so no order can be proven and the assertion would
+        // otherwise place the files itself.
         let store_files = |store: &str| {
-            [(0, 99), (50, 149), (100, 199), (150, 249)]
+            [(0, 1), (1, 2), (2, 3), (3, 4)]
                 .into_iter()
                 .enumerate()
-                .map(|(index, (min, max))| {
+                .map(|(index, dates)| {
                     let name = format!("{store}-f{index}");
-                    let mut file = stats_file(&name, min, max);
+                    let mut file = two_column_stats_file(&name, dates, (0, 23));
                     file.partition_values
                         .push(wrap_file_id_value(format!("{store}:///{name}.parquet")));
                     file

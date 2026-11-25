@@ -742,12 +742,38 @@ mod tests {
     /// bucket is ordered on its statistics alone and the pushdown succeeds.
     #[test]
     fn overlapping_files_within_a_partition_are_ordered_when_assumed_disjoint() {
-        let fixture = Fixture::new(&[
+        let mut fixture = Fixture::new(&[
             ("a0", utf8("A"), 0, 150),
             ("a1", utf8("A"), 100, 199),
             ("b0", utf8("B"), 0, 99),
         ]);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
+
+        // Int64 bounds are never widened, so an overlap on the leading suffix
+        // column refutes the assertion and falls back.
+        assert!(
+            fixture
+                .plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)
+                .is_none()
+        );
+
+        // Timestamp bounds may be widened by millisecond rounding, so
+        // `OverlapPolicy::Assume` still places the files on their endpoints.
+        for file in &mut fixture.files {
+            let stats = Arc::make_mut(file.statistics.as_mut().unwrap());
+            let min = match stats.column_statistics[0].min_value.get_value() {
+                Some(ScalarValue::Int64(v)) => *v,
+                other => panic!("expected Int64 min, got {other:?}"),
+            };
+            let max = match stats.column_statistics[0].max_value.get_value() {
+                Some(ScalarValue::Int64(v)) => *v,
+                other => panic!("expected Int64 max, got {other:?}"),
+            };
+            stats.column_statistics[0].min_value =
+                Precision::Exact(ScalarValue::TimestampMillisecond(min, None));
+            stats.column_statistics[0].max_value =
+                Precision::Exact(ScalarValue::TimestampMillisecond(max, None));
+        }
 
         let plan = fixture
             .plan_with(&order, Some(&file_sort_order()), 2, OverlapPolicy::Assume)

@@ -578,7 +578,10 @@ impl TableProviderBuilder {
     /// statistics are missing are all still handled exactly as they are
     /// without it, as are two files that span the same range of a sort
     /// column: files covering the same span of a column meet somewhere inside
-    /// it, which the assertion cannot explain away.
+    /// it, which the assertion cannot explain away. For leading sort columns
+    /// whose bounds are never widened (integers, dates, and booleans), a
+    /// strict overlap (`a.end > b.start`) also refutes the assertion and falls
+    /// back to the merge.
     ///
     /// The arrangement is made when the scan is planned and advertised as its
     /// output ordering for every query on the table, not only the ordered
