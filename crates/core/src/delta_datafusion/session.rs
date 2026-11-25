@@ -260,9 +260,19 @@ fn derive_session_state_from_trait(
         "Derived SessionState from Session trait (catalogs/planners/optimizers not transferable)"
     );
 
+    let mut config = session.config().clone();
+    if config
+        .options()
+        .extensions
+        .get::<DeltaConfigOptions>()
+        .is_none()
+    {
+        config = config.with_option_extension(DeltaConfigOptions::default());
+    }
+
     SessionStateBuilder::new()
         .with_default_features()
-        .with_config(session.config().clone())
+        .with_config(config)
         .with_runtime_env(Arc::clone(session.runtime_env()))
         .with_execution_props(session.execution_props().clone())
         .with_table_options(session.table_options().clone())
@@ -534,6 +544,44 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(Arc::ptr_eq(&original_udf, &derived_udf));
+
+        // Derived sessions without `DeltaConfigOptions` receive defaults.
+        assert_eq!(
+            derived
+                .config()
+                .options()
+                .extensions
+                .get::<DeltaConfigOptions>()
+                .map(|opts| opts.progressive_eval_num_prefetch_input_streams),
+            Some(DeltaConfigOptions::default().progressive_eval_num_prefetch_input_streams)
+        );
+
+        // Existing caller `DeltaConfigOptions` are preserved, not overwritten.
+        let custom_config = SessionConfig::new().with_option_extension(DeltaConfigOptions {
+            progressive_eval_num_prefetch_input_streams: 4,
+        });
+        let custom_wrapper = WrapperSession::new(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(custom_config)
+                .build(),
+        );
+        let (derived_custom, _) = resolve_session_state(
+            Some(&custom_wrapper),
+            SessionFallbackPolicy::DeriveFromTrait,
+            || create_session().state(),
+            ctx("test"),
+        )
+        .unwrap();
+        assert_eq!(
+            derived_custom
+                .config()
+                .options()
+                .extensions
+                .get::<DeltaConfigOptions>()
+                .map(|opts| opts.progressive_eval_num_prefetch_input_streams),
+            Some(4)
+        );
     }
 
     #[test]
