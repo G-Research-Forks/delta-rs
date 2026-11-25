@@ -92,6 +92,11 @@ fn writer_properties() -> WriterProperties {
 /// plus `extra_columns` float32 columns of deterministic pseudo-random values.
 fn day_batch(schema: SchemaRef, day: usize, params: &SortDataParams) -> DeltaResult<RecordBatch> {
     let rows = params.rows_per_day;
+    if rows == 0 {
+        return Err(DeltaTableError::generic(
+            "rows_per_day must be greater than zero",
+        ));
+    }
     let day_start_us = (BASE_EPOCH_SECONDS + day as i64 * 86_400) * 1_000_000;
     let step_us = MICROS_PER_DAY / rows as i64;
     let timestamps: Vec<i64> = (0..rows as i64)
@@ -133,6 +138,11 @@ fn day_batch(schema: SchemaRef, day: usize, params: &SortDataParams) -> DeltaRes
 /// writing, every live file is re-read to verify it is internally sorted and
 /// that no two files have overlapping timestamp ranges.
 pub async fn generate_sorted_table(table_url: &Url, params: &SortDataParams) -> DeltaResult<()> {
+    if params.rows_per_day == 0 {
+        return Err(DeltaTableError::generic(
+            "rows_per_day must be greater than zero",
+        ));
+    }
     let schema = sort_table_schema(params.extra_columns);
     let mut table = DeltaTable::try_from_url(table_url.clone()).await?;
     let start = Instant::now();
