@@ -1382,14 +1382,14 @@ async fn delta_table_overlapping_files_beyond_group_cap_fall_back() -> TestResul
 
 // --- More target partitions than files ---
 //
-// With fewer files than target partitions, `EnforceDistribution` has two
+// With fewer files than target partitions, DataFusion has two
 // independent mechanisms for raising the scan's partition count to the
 // target, and each one would defeat the `ProgressiveEvalExec` optimization:
 //
 // - `enable_round_robin_repartition` inserts a round-robin `RepartitionExec`
 //   above a scan that benefits from input partitioning.
-//   `RepartitionExec::partition_statistics` marks all column statistics
-//   inexact, so `ProgressiveEvalRule` bails.
+//   `RepartitionExec` marks all column statistics inexact, so
+//   `ProgressiveEvalRule` bails.
 //   `DeltaScanExec::benefits_from_input_partitioning` opts out of this
 //   when the scan declares an output ordering.
 // - `repartition_file_scans` splits single-file groups into byte ranges at
@@ -2481,7 +2481,7 @@ async fn delta_table_progressive_eval_matches_sort_baseline() -> TestResult<()> 
 ///
 /// The shape matters: a small build side keeps the join in `CollectLeft` mode,
 /// whose right input order is maintained, and a semi join emits only probe-side
-/// columns - with no `ProjectionExec` in between, `EnforceSorting` pushes the
+/// columns - with no `ProjectionExec` in between, DataFusion pushes the
 /// ordering requirement through the join and down onto the scan.
 ///
 /// The merge above the join must stay a `SortPreservingMergeExec`. A
@@ -2556,10 +2556,10 @@ async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResu
     Ok(())
 }
 
-/// `EnforceDistribution` runs long before `PushdownSort`, so by the time a sort
-/// is offered an unordered scan has already had a round-robin `RepartitionExec`
-/// inserted beneath `DeltaScanExec` for parallelism. The pushdown looks through
-/// it - the regrouping supplies parallelism that carries an order instead.
+/// By the time `PushdownSort` offers a sort, DataFusion has already inserted a
+/// round-robin `RepartitionExec` beneath `DeltaScanExec` for parallelism on an
+/// unordered scan. The pushdown looks through it - the regrouping supplies
+/// parallelism that carries an order instead.
 #[tokio::test]
 async fn delta_table_partition_prefix_pushes_through_round_robin_repartition() -> TestResult<()> {
     let table = sorted_delta_table().await?;
@@ -3372,8 +3372,8 @@ async fn delta_table_assumed_disjoint_survives_byte_range_splitting() -> TestRes
 /// stream and the arrangement is rightly withdrawn. The merge keeps the rows in
 /// order; only the concatenation is lost.
 ///
-/// The scan refusing to repartition itself does not prevent this: the same
-/// request reaches the parquet scan directly from `EnforceDistribution`.
+/// The scan refusing to repartition itself does not prevent this: DataFusion's
+/// optimizer still calls `repartitioned` on the parquet scan directly.
 #[tokio::test]
 async fn delta_table_assumed_disjoint_interleaved_split_keeps_merge() -> TestResult<()> {
     let table = day_boundary_delta_table().await?;

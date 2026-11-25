@@ -529,10 +529,10 @@ impl DeltaScanExec {
         //
         // Withdrawing rather than failing, as the pushed sort does, because
         // this claim is advertised to rules that have not committed to it yet:
-        // it is set at plan construction and DataFusion rebuilds the parquet
-        // scan underneath during `EnforceDistribution`, well before any sort
-        // is removed on its strength. Failing there would refuse plans that
-        // are merely losing an optimization.
+        // it is set at plan construction and DataFusion's optimizer rebuilds
+        // the parquet scan underneath well before any sort is removed on its
+        // strength. Failing there would refuse plans that are merely losing an
+        // optimization.
         //
         // A pushed sort that got this far has already shown the grouping to
         // be unchanged (see `check_pushed_sort_grouping`), which retains the
@@ -995,9 +995,9 @@ impl ExecutionPlan for DeltaScanExec {
             // Repartitioning would interleave files and invalidate an
             // assumed order.
             //
-            // Refusing here does not on its own keep the files whole: the
-            // same request reaches the parquet scan directly from
-            // `EnforceDistribution`, which this cannot intercept.
+            // Refusing here does not on its own keep the files whole:
+            // DataFusion's optimizer still calls `repartitioned` on the
+            // parquet scan directly, which this cannot intercept.
             // If that partitions files, `with_new_input` verifies whether
             // the assumed ordering is still valid.
             return Ok(None);
