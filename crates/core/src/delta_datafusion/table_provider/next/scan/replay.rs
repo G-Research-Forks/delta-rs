@@ -179,28 +179,12 @@ where
 
                 this.metrics.num_scanned += ctx.count;
 
-                let stats_projection = match StatsProjection::for_scan(this.kernel_scan.as_ref()) {
-                    Ok(projection) => projection,
-                    Err(err) => return Poll::Ready(Some(Err(err))),
-                };
                 let snapshot = this.kernel_scan.snapshot();
-                // Also extract stats for file sort order columns so scan file
-                // groups can be formed from per-file min/max values.
-                let stats_projection = if this.scan_config.file_sort_order.is_empty() {
-                    stats_projection
-                } else {
-                    match stats_projection.with_extra_columns(
-                        snapshot,
-                        None,
-                        this.scan_config
-                            .file_sort_order
-                            .iter()
-                            .map(|sort_column| ColumnName::new([sort_column.column.as_str()])),
-                    ) {
+                let stats_projection =
+                    match replay_stats_projection(this.kernel_scan.as_ref(), this.scan_config) {
                         Ok(projection) => projection,
                         Err(err) => return Poll::Ready(Some(Err(err))),
-                    }
-                };
+                    };
                 let stats_schema = match stats_projection.stats_schema(snapshot) {
                     Ok(schema) => schema,
                     Err(err) => return Poll::Ready(Some(Err(err))),
@@ -232,6 +216,27 @@ where
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.stream.size_hint()
     }
+}
+
+/// Build the stats projection for scan replay, adding any declared file sort
+/// order columns resolved against the scan's projected logical schema (matching
+/// [`crate::kernel::ScanBuilder::build`]).
+fn replay_stats_projection(
+    kernel_scan: &KernelScan,
+    scan_config: &DeltaScanConfig,
+) -> DeltaResult<StatsProjection> {
+    let stats_projection = StatsProjection::for_scan(kernel_scan)?;
+    if scan_config.file_sort_order.is_empty() {
+        return Ok(stats_projection);
+    }
+    stats_projection.with_extra_columns(
+        kernel_scan.snapshot(),
+        Some(kernel_scan.logical_schema()),
+        scan_config
+            .file_sort_order
+            .iter()
+            .map(|sort_column| ColumnName::new([sort_column.column.as_str()])),
+    )
 }
 
 /// Extracts DataFusion statistics from parsed file metadata.
@@ -669,5 +674,91 @@ mod tests {
             err.contains("Invariant violation: scan metadata has"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_replay_stats_projection_matches_scan_builder_when_sort_column_unprojected()
+    -> TestResult {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::replay_stats_projection;
+        use crate::DeltaTable;
+        use crate::delta_datafusion::{FileSortColumn, engine::AsObjectStoreUrl as _};
+        use crate::kernel::StatsProjection;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+        let table = DeltaTable::new_in_memory().write(vec![batch]).await?;
+        let snapshot = Snapshot::try_new(&table.log_store(), None).await?;
+        let config = DeltaScanConfig::new().with_file_sort_order([FileSortColumn::asc("ts")]);
+
+        // Project only `value` (index 1); `ts` is not projected, so replay must
+        // match `ScanBuilder::build` and stay `NumRecordsOnly` without asking
+        // for `ts` stats.
+        let unprojected_plan =
+            KernelScanPlan::try_new(&snapshot, Some(&vec![1]), &[], &config, None)?;
+        let unprojected_stats = replay_stats_projection(unprojected_plan.scan.inner(), &config)?;
+        assert_eq!(
+            &unprojected_stats,
+            unprojected_plan
+                .scan
+                .stats_materialization()
+                .stats_projection()
+        );
+        assert_eq!(unprojected_stats, StatsProjection::NumRecordsOnly);
+
+        let session = create_session().into_inner();
+        let log_store = table.log_store();
+        session.state().runtime_env().register_object_store(
+            log_store.root_url().as_object_store_url().as_ref(),
+            log_store.object_store(),
+        );
+        let engine: Arc<dyn Engine> = DataFusionEngine::new_from_session(&session.state());
+        let metadata: Vec<ScanMetadata> = unprojected_plan
+            .scan
+            .scan_metadata(engine.clone())
+            .try_collect()
+            .await?;
+        let replayed: Vec<Vec<ScanFileContext>> = ScanFileStream::new(
+            engine.clone(),
+            &unprojected_plan.scan,
+            config.clone(),
+            None,
+            stream::iter(metadata.into_iter().map(Ok)),
+        )
+        .try_collect()
+        .await?;
+        let files: Vec<ScanFileContext> = replayed.into_iter().flatten().collect();
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].stats.column_statistics.is_empty(),
+            "expected no per-column stats when sort column is not projected"
+        );
+
+        // Project `ts` (index 0); both `ScanBuilder::build` and replay include
+        // `ts` in the stats projection.
+        let projected_plan =
+            KernelScanPlan::try_new(&snapshot, Some(&vec![0]), &[], &config, None)?;
+        let projected_stats = replay_stats_projection(projected_plan.scan.inner(), &config)?;
+        assert_eq!(
+            &projected_stats,
+            projected_plan
+                .scan
+                .stats_materialization()
+                .stats_projection()
+        );
+        assert!(projected_stats.emits_top_level_column_stats("ts"));
+
+        Ok(())
     }
 }
