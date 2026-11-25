@@ -11,6 +11,14 @@
 //! Streaming partitions one after another is only sound when no operator below
 //! the merge needs all of its partitions to be running at once; see
 //! [`contains_hash_join`] for the one that does.
+//!
+//! Because this rule is installed session-wide on
+//! [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext), it is
+//! scoped to merges over [`DeltaScanExec`] subplans (see
+//! [`is_delta_scan_plan`]) so that non-Delta tables registered in the same
+//! session are left untouched. It also skips merges over blocking operators
+//! such as a per-partition `SortExec` (see [`contains_blocking_operator`]), so
+//! those operators keep full multi-core parallelism.
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Statistics;
@@ -21,6 +29,7 @@ use datafusion::physical_expr::{
     EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
 };
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -36,9 +45,9 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// Replace [`SortPreservingMergeExec`] with [`ProgressiveEvalExec`] when its
-/// input partitions are mutually non-overlapping, range-ordered slices of the
-/// merge ordering, so concatenating them already yields globally ordered
-/// output. See the [module docs](self) for background.
+/// input is a Delta scan whose partitions are mutually non-overlapping,
+/// range-ordered slices of the merge ordering, so concatenating them already
+/// yields globally ordered output. See the [module docs](self) for background.
 #[derive(Debug, Default)]
 pub struct ProgressiveEvalRule;
 
@@ -55,37 +64,7 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(|plan| {
-            let Some(merge) =
-                (plan.as_ref() as &dyn ExecutionPlan).downcast_ref::<SortPreservingMergeExec>()
-            else {
-                return Ok(Transformed::no(plan));
-            };
-            let input = merge.input();
-            if contains_hash_join(input)? {
-                return Ok(Transformed::no(plan));
-            }
-            // A Delta scan may declare the partitions disjoint outright - from
-            // a sort pushdown that built them that way, or from the table's
-            // assertion that its files never overlap. That is asked first: it
-            // is a walk over the plan, whereas the proof materialises every
-            // partition's statistics, which the declaration makes redundant.
-            // The ranges are then only descriptive, so it does not matter that
-            // they may be unavailable.
-            let ranges = if partitions_declared_disjoint(input, merge.expr())? {
-                leading_partition_ranges(input, merge.expr())
-            } else {
-                let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
-                    return Ok(Transformed::no(plan));
-                };
-                Some(ranges)
-            };
-            let input = preserve_input_order(Arc::clone(input))?;
-            let replacement =
-                ProgressiveEvalExec::new(input, Some(merge.expr().clone()), ranges, merge.fetch());
-            Ok(Transformed::yes(Arc::new(replacement) as _))
-        })
-        .data()
+        optimize_plan(plan, true)
     }
 
     fn name(&self) -> &str {
@@ -95,6 +74,69 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Core rewrite for [`ProgressiveEvalRule`]. `require_delta_scan` is always
+/// `true` in production; unit tests pass `false` to exercise the statistics
+/// and operator guards over synthetic plan nodes without a full Delta table.
+fn optimize_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    require_delta_scan: bool,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_down(|plan| {
+        let Some(merge) =
+            (plan.as_ref() as &dyn ExecutionPlan).downcast_ref::<SortPreservingMergeExec>()
+        else {
+            return Ok(Transformed::no(plan));
+        };
+        let input = merge.input();
+        if require_delta_scan && !is_delta_scan_plan(input) {
+            return Ok(Transformed::no(plan));
+        }
+        if contains_hash_join(input)? {
+            return Ok(Transformed::no(plan));
+        }
+        if contains_blocking_operator(input)? {
+            return Ok(Transformed::no(plan));
+        }
+        // A Delta scan may declare the partitions disjoint outright - from
+        // a sort pushdown that built them that way, or from the table's
+        // assertion that its files never overlap. That is asked first: it
+        // is a walk over the plan, whereas the proof materialises every
+        // partition's statistics, which the declaration makes redundant.
+        // The ranges are then only descriptive, so it does not matter that
+        // they may be unavailable.
+        let ranges = if partitions_declared_disjoint(input, merge.expr())? {
+            leading_partition_ranges(input, merge.expr())
+        } else {
+            let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
+                return Ok(Transformed::no(plan));
+            };
+            Some(ranges)
+        };
+        let input = preserve_input_order(Arc::clone(input))?;
+        let replacement =
+            ProgressiveEvalExec::new(input, Some(merge.expr().clone()), ranges, merge.fetch());
+        Ok(Transformed::yes(Arc::new(replacement) as _))
+    })
+    .data()
+}
+
+/// Whether every data source feeding `plan` is a [`DeltaScanExec`].
+///
+/// [`ProgressiveEvalRule`] is registered on every
+/// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext), so
+/// scoping it to Delta scans keeps it from altering the execution of non-Delta
+/// tables (such as Parquet listing tables) registered in the same session.
+fn is_delta_scan_plan(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if (plan.as_ref() as &dyn ExecutionPlan)
+        .downcast_ref::<DeltaScanExec>()
+        .is_some()
+    {
+        return true;
+    }
+    let children = plan.children();
+    !children.is_empty() && children.into_iter().all(is_delta_scan_plan)
 }
 
 /// Whether `plan` sits on a Delta scan that *declares* - rather than proves
@@ -274,6 +316,17 @@ fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
     })
 }
 
+/// Whether any node of `plan` is a blocking operator (must consume all of its
+/// input before emitting any output, such as a per-partition `SortExec`).
+///
+/// A [`ProgressiveEvalExec`] executes only `1 + prefetch` partitions at a time
+/// (default 2). Rewriting a merge over a blocking operator serializes
+/// per-partition work that [`SortPreservingMergeExec`] would otherwise run
+/// across all partitions in parallel.
+fn contains_blocking_operator(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    plan.exists(|node| Ok(node.properties().emission_type == EmissionType::Final))
+}
+
 /// Mark the data sources under `plan` order-sensitive, so that they keep the
 /// partition-to-data mapping their per-partition statistics describe.
 ///
@@ -281,9 +334,8 @@ fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
 /// streams steal unopened files from one another at execution time, which is
 /// what `datafusion.execution.enable_file_stream_work_stealing` does by
 /// default. The partition boundaries proven above are then meaningless: a
-/// partition can emit rows planned for another. This is the case for a scan
-/// under a per-partition `SortExec` whose file groups were arranged by
-/// statistics without an ordering being declared for them.
+/// partition can emit rows planned for another. Pinning order-sensitivity here
+/// ensures every file stays on its planned partition.
 ///
 /// Only leaves are asked: the nodes above forward `with_preserve_order` to
 /// their children and rebuild themselves, which the walk already does for the
@@ -449,7 +501,7 @@ mod tests {
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
     use datafusion::physical_plan::buffer::BufferExec;
-    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::execution_plan::Boundedness;
     use datafusion::physical_plan::filter::FilterExecBuilder;
     use datafusion::physical_plan::joins::PartitionMode;
     use datafusion::physical_plan::limit::LocalLimitExec;
@@ -918,13 +970,70 @@ mod tests {
             .unwrap()
     }
 
+    fn optimize_any(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        optimize_plan(plan, false).unwrap()
+    }
+
+    #[test]
+    fn merge_over_non_delta_scan_is_kept() {
+        let plan = ordered_partitions();
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        assert!(
+            ordered_partition_ranges(&plan, &ordering).is_some(),
+            "the partitions should look replaceable on statistics alone"
+        );
+
+        let optimized = optimize(merge_on_t(plan));
+
+        assert!(
+            optimized
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected SortPreservingMergeExec for non-Delta input, got {}",
+            optimized.name()
+        );
+    }
+
     #[test]
     fn merge_over_ordered_partitions_is_replaced() {
-        let optimized = optimize(merge_on_t(ordered_partitions()));
+        let optimized = optimize_any(merge_on_t(ordered_partitions()));
 
         assert!(
             optimized.downcast_ref::<ProgressiveEvalExec>().is_some(),
             "expected ProgressiveEvalExec, got {}",
+            optimized.name()
+        );
+    }
+
+    #[test]
+    fn merge_over_sort_exec_is_kept() {
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        let sort: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(ordering.clone(), ordered_partitions()).with_preserve_partitioning(true),
+        );
+        assert!(
+            ordered_partition_ranges(&sort, &ordering).is_some(),
+            "the per-partition sort should look replaceable on statistics alone"
+        );
+
+        let optimized = optimize_any(merge_on_t(Arc::clone(&sort)));
+        assert!(
+            optimized
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected SortPreservingMergeExec over unbounded SortExec, got {}",
+            optimized.name()
+        );
+
+        let limited_merge = merge_on_t(sort).with_fetch(Some(5)).unwrap();
+        let optimized = optimize_any(limited_merge);
+        assert!(
+            optimized
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected SortPreservingMergeExec over limited SortExec, got {}",
             optimized.name()
         );
     }
@@ -966,7 +1075,7 @@ mod tests {
             "the partitions should look replaceable on statistics alone"
         );
 
-        let optimized = optimize(merge_on_t(plan));
+        let optimized = optimize_any(merge_on_t(plan));
 
         assert!(
             optimized
@@ -1239,7 +1348,7 @@ mod tests {
         let plan: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(local_ordering.clone(), merge));
 
         // 1. ProgressiveEvalRule replaces SortPreservingMergeExec(t) with ProgressiveEvalExec.
-        let after_progressive = optimize(plan);
+        let after_progressive = optimize_any(plan);
         let t_ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
         let progressive = after_progressive.children()[0];
         assert!(

@@ -413,11 +413,24 @@ async fn delta_table_partition_prefix_with_sort_pushdown_disabled_keeps_sort() -
 /// table-wide statistics on every execution partition: no subset of its rows
 /// can have other bounds or a different null count. With the sort pushdown
 /// disabled (or refused, as for column-mapped tables) the scan is not
-/// regrouped, so those aggregate statistics are all `ProgressiveEvalRule`
-/// has to prove the partitions disjoint on `part`; reporting them inexact
-/// would keep the merge.
+/// regrouped, so `DeltaScanExec` still reports exact per-partition statistics
+/// for `part`, while the per-partition `SortExec` keeps `SortPreservingMergeExec`
+/// so all partitions sort in parallel.
 #[tokio::test]
-async fn delta_table_single_partition_value_concatenates_without_pushdown() -> TestResult<()> {
+async fn delta_table_single_partition_value_reports_exact_stats_without_pushdown() -> TestResult<()>
+{
+    use datafusion::common::stats::Precision;
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
+    use deltalake_core::delta_datafusion::DeltaScanExec;
+
+    fn find_delta_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.downcast_ref::<DeltaScanExec>().is_some() {
+            return Some(Arc::clone(plan));
+        }
+        plan.children().into_iter().find_map(find_delta_scan)
+    }
+
     let table = partitioned_delta_table(&[
         ("A", 0, 100),
         ("A", 100, 100),
@@ -426,22 +439,61 @@ async fn delta_table_single_partition_value_concatenates_without_pushdown() -> T
     ])
     .await?;
 
-    let (rendered, batches) = run_query(
-        &table,
-        &[FileSortColumn::asc("timestamp")],
-        &[("datafusion.optimizer.enable_sort_pushdown", "false")],
-        "SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"",
-    )
-    .await?;
+    let ctx = create_session().into_inner();
+    ctx.sql("SET datafusion.optimizer.enable_sort_pushdown = false")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let plan = ctx
+        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
 
     assert!(
-        rendered.contains("ProgressiveEvalExec"),
-        "expected ProgressiveEvalExec in plan:\n{rendered}"
+        rendered.contains("SortExec"),
+        "expected per-partition SortExec in plan:\n{rendered}"
     );
     assert!(
-        !rendered.contains("SortPreservingMergeExec"),
-        "expected no SortPreservingMergeExec in plan:\n{rendered}"
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec over SortExec in plan:\n{rendered}"
     );
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec over SortExec in plan:\n{rendered}"
+    );
+
+    let scan = find_delta_scan(&plan).expect("expected DeltaScanExec in plan");
+    let part_idx = scan.schema().index_of("part")?;
+    let part_count = scan.output_partitioning().partition_count();
+    assert!(part_count > 1, "expected multiple scan partitions");
+    let stats_context = StatisticsContext::new();
+    for partition_idx in 0..part_count {
+        let stats = stats_context.compute(
+            scan.as_ref(),
+            &StatisticsArgs::new().with_partition(Some(partition_idx)),
+        )?;
+        let part_stats = &stats.column_statistics[part_idx];
+        assert_eq!(part_stats.null_count, Precision::Exact(0));
+        assert!(
+            matches!(part_stats.min_value, Precision::Exact(_)),
+            "expected exact min_value on partition {partition_idx}, got {:?}",
+            part_stats.min_value
+        );
+        assert!(
+            matches!(part_stats.max_value, Precision::Exact(_)),
+            "expected exact max_value on partition {partition_idx}, got {:?}",
+            part_stats.max_value
+        );
+        assert_eq!(part_stats.min_value, part_stats.max_value);
+    }
+
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
     let keys = collect_string_i64_keys(&batches, 0, 1)?;
     assert_eq!(keys.len(), 400);
     assert_sorted(&keys, "(part, timestamp)");
@@ -1698,16 +1750,12 @@ async fn nulls_in_last_file_delta_table() -> TestResult<DeltaTable> {
     Ok(table)
 }
 
-/// A declared sort order whose leading column holds nulls declares no
-/// ordering for multi-file groups, so nothing but the scan's own
-/// order-sensitivity keeps DataFusion's file-stream work stealing from
-/// handing a partition's files to a sibling. The file groups are
-/// range-ordered with exact statistics, which is all `ProgressiveEvalRule`
-/// reads, so the concatenation it plans is only correct while every file
-/// stays on its partition: the scan is built order-sensitive and the rule
-/// pins whatever is not. The check needs a multi-threaded runtime: on one
-/// thread the first partition drains the shared queue before the second
-/// starts, and the result is ordered by accident.
+/// Every file scan under a `ProgressiveEvalExec` concatenation must stay
+/// order-sensitive so DataFusion's file-stream work stealing cannot hand a
+/// partition's files to a sibling stream and break the partition boundaries.
+/// The check needs a multi-threaded runtime: on one thread the first partition
+/// drains the shared queue before the second starts, and the result is ordered
+/// by accident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<()> {
     use datafusion::physical_plan::ExecutionPlan;
@@ -1742,13 +1790,18 @@ async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<(
             ),
         ])
         .await?;
-    // Files large enough for the streams to interleave; nulls only in the last.
-    for (start, nulls) in [(0i64, 0usize), (50_000, 0), (100_000, 0), (150_000, 2)] {
+    // Write with a single target partition so each 50,000-row file stays
+    // internally sorted rather than being chunked across worker threads.
+    let write_ctx = create_session().into_inner();
+    write_ctx
+        .sql("SET datafusion.execution.target_partitions = 1")
+        .await?;
+    let write_session: Arc<dyn datafusion::catalog::Session> = Arc::new(write_ctx.state());
+    // Files large enough for the streams to interleave across two 2-file partitions.
+    for start in [0i64, 50_000, 100_000, 150_000] {
         table = table
-            .write(vec![nullable_batch(
-                (start..start + 50_000).collect(),
-                nulls,
-            )?])
+            .write(vec![nullable_batch((start..start + 50_000).collect(), 0)?])
+            .with_session_state(Arc::clone(&write_session))
             .with_save_mode(SaveMode::Append)
             .await?;
     }
@@ -1758,9 +1811,6 @@ async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<(
         let ctx = create_session().into_inner();
         for (key, value) in [
             ("datafusion.execution.target_partitions", "2"),
-            // Keep the sort above the scan so the rule proves the boundaries
-            // from the file groups' statistics alone.
-            ("datafusion.optimizer.enable_sort_pushdown", "false"),
             // Byte-range splitting to even out group sizes would move part of
             // a file into a neighbouring group, depending on the exact file
             // sizes, and the rule would then rightly refuse the concatenation.
@@ -1781,6 +1831,10 @@ async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<(
             .await?;
         let rendered = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
+            !rendered.contains("SortExec"),
+            "expected no SortExec in plan:\n{rendered}"
+        );
+        assert!(
             rendered.contains("ProgressiveEvalExec"),
             "expected ProgressiveEvalExec in plan:\n{rendered}"
         );
@@ -1791,22 +1845,15 @@ async fn delta_table_progressive_eval_pins_files_to_partitions() -> TestResult<(
         );
 
         let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
-        let timestamps: Vec<Option<i64>> = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_primitive::<TimestampMicrosecondType>()
-                    .iter()
-            })
-            .collect();
-        assert_eq!(timestamps.len(), 200_002);
-        // Nulls last: a null key sorts after every value.
-        let keys: Vec<(bool, i64)> = timestamps
-            .iter()
-            .map(|timestamp| (timestamp.is_none(), timestamp.unwrap_or(0)))
-            .collect();
-        assert_sorted(&keys, "timestamp with nulls last");
+        let timestamps = collect_timestamps(&batches);
+        assert_eq!(timestamps.len(), 200_000);
+        if let Some(pos) = timestamps.windows(2).position(|pair| pair[0] > pair[1]) {
+            panic!(
+                "results are not sorted at index {pos}: {} > {}\nplan:\n{rendered}",
+                timestamps[pos] / 1_000_000,
+                timestamps[pos + 1] / 1_000_000,
+            );
+        }
     }
     Ok(())
 }
@@ -3558,5 +3605,167 @@ async fn delta_table_float_order_by_with_nan_without_sort_order_stays_sorted() -
         &[f64::NAN, 5.0, 4.0, 3.0, 2.0, 1.0],
         &rendered,
     );
+    Ok(())
+}
+
+/// When a per-partition `SortExec` remains under the merge (here because a
+/// multi-file group holds a trailing null in the sort column, so the scan
+/// declares no ordering even though the partitions have disjoint exact
+/// statistics), `ProgressiveEvalRule` keeps `SortPreservingMergeExec` for both
+/// unbounded and limited queries so the per-partition sorts run in parallel.
+#[tokio::test]
+async fn delta_table_sort_exec_keeps_merge() -> TestResult<()> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                true,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+    for (index, start) in [0i64, 50, 100, 150, 200, 250, 300, 350]
+        .into_iter()
+        .enumerate()
+    {
+        let nulls = if index == 7 { 2 } else { 0 };
+        table = table
+            .write(vec![nullable_batch((start..start + 50).collect(), nulls)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 8);
+
+    let options = [
+        ("datafusion.execution.target_partitions", "4"),
+        ("datafusion.optimizer.enable_sort_pushdown", "false"),
+        ("datafusion.optimizer.repartition_file_scans", "false"),
+    ];
+
+    // Check unbounded, a limit above the per-partition row count (so `SortExec`
+    // retains exact per-partition statistics), and a small limit.
+    for (sql, expected_len) in [
+        (
+            "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+            402usize,
+        ),
+        (
+            "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" LIMIT 250",
+            250,
+        ),
+        (
+            "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" LIMIT 10",
+            10,
+        ),
+    ] {
+        let (rendered, batches) =
+            run_query(&table, &[FileSortColumn::asc("timestamp")], &options, sql).await?;
+        assert!(
+            rendered.contains("SortExec"),
+            "expected per-partition SortExec for `{sql}`:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("SortPreservingMergeExec"),
+            "expected SortPreservingMergeExec over SortExec for `{sql}`:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ProgressiveEvalExec"),
+            "expected no ProgressiveEvalExec over SortExec for `{sql}`:\n{rendered}"
+        );
+        let timestamps: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .iter()
+            })
+            .collect();
+        assert_eq!(timestamps.len(), expected_len);
+        let keys: Vec<(bool, i64)> = timestamps
+            .iter()
+            .map(|ts| (ts.is_none(), ts.unwrap_or(0)))
+            .collect();
+        assert_sorted(&keys, "timestamp with nulls last");
+    }
+    Ok(())
+}
+
+/// Non-Delta tables registered in a `DeltaSessionContext` (such as a Parquet
+/// listing table declaring a file sort order over range-ordered files, where no
+/// `SortExec` is planned and per-partition statistics are exact and disjoint)
+/// are left untouched by `ProgressiveEvalRule`.
+#[tokio::test]
+async fn non_delta_parquet_table_in_delta_session_keeps_merge() -> TestResult<()> {
+    use datafusion::prelude::{ParquetReadOptions, col};
+    use deltalake_core::parquet::arrow::ArrowWriter;
+
+    let temp_dir = tempfile::tempdir()?;
+    let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
+    for (index, start) in [0i64, 100].into_iter().enumerate() {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(start..start + 100))],
+        )?;
+        let path = temp_dir.path().join(format!("part-{index:05}.parquet"));
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(path)?, Arc::clone(&schema), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    let ctx = create_session().into_inner();
+    for (key, value) in [
+        ("datafusion.execution.target_partitions", "2"),
+        ("datafusion.optimizer.repartition_file_scans", "false"),
+    ] {
+        ctx.sql(&format!("SET {key} = {value}")).await?;
+    }
+    ctx.register_parquet(
+        "pq_table",
+        temp_dir.path().to_str().unwrap(),
+        ParquetReadOptions::default().file_sort_order(vec![vec![col("t").sort(true, false)]]),
+    )
+    .await?;
+
+    for (sql, expected) in [
+        (
+            "SELECT t FROM pq_table ORDER BY t",
+            (0..200).collect::<Vec<_>>(),
+        ),
+        (
+            "SELECT t FROM pq_table ORDER BY t LIMIT 10",
+            (0..10).collect::<Vec<_>>(),
+        ),
+    ] {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let rendered = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            !rendered.contains("SortExec"),
+            "expected streaming Parquet scan without SortExec for `{sql}`:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("SortPreservingMergeExec"),
+            "expected SortPreservingMergeExec for non-Delta Parquet table `{sql}`:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ProgressiveEvalExec"),
+            "expected no ProgressiveEvalExec for non-Delta Parquet table `{sql}`:\n{rendered}"
+        );
+
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| batch.column(0).as_primitive::<Int64Type>().values().iter())
+            .copied()
+            .collect();
+        assert_eq!(values, expected);
+    }
     Ok(())
 }
