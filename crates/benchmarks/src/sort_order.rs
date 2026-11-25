@@ -138,6 +138,9 @@ fn day_batch(schema: SchemaRef, day: usize, params: &SortDataParams) -> DeltaRes
 /// writing, every live file is re-read to verify it is internally sorted and
 /// that no two files have overlapping timestamp ranges.
 pub async fn generate_sorted_table(table_url: &Url, params: &SortDataParams) -> DeltaResult<()> {
+    if params.days == 0 {
+        return Err(DeltaTableError::generic("days must be greater than zero"));
+    }
     if params.rows_per_day == 0 {
         return Err(DeltaTableError::generic(
             "rows_per_day must be greater than zero",
