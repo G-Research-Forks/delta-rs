@@ -15,7 +15,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Result, ScalarValue, Statistics, internal_err};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{Distribution, OrderingRequirements, Partitioning};
+use datafusion::physical_expr::{Distribution, LexOrdering, OrderingRequirements, Partitioning};
 use datafusion::physical_plan::common::spawn_buffered;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
@@ -61,6 +61,13 @@ pub(crate) struct ProgressiveEvalExec {
     /// Input plan
     input: Arc<dyn ExecutionPlan>,
 
+    /// Global ordering proven to hold across the concatenated partitions.
+    /// Only this ordering (and orderings implied by it through input
+    /// non-ordering equivalences) is advertised on the output; other
+    /// partition-local input orderings are not preserved across partition
+    /// boundaries in general.
+    ordering: Option<LexOrdering>,
+
     /// Corresponding value ranges of the input plan.
     /// None if the value ranges are not available.
     value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
@@ -78,16 +85,19 @@ pub(crate) struct ProgressiveEvalExec {
 impl ProgressiveEvalExec {
     /// Create a new progressive-evaluation execution plan.
     ///
-    // Requires that the input partitions are in order with respect to the input ordering,
-    // and non-overlapping.
+    /// When `ordering` is `Some`, the caller guarantees that each input
+    /// partition is sorted by `ordering` and that the partitions are
+    /// non-overlapping and in order with respect to `ordering`.
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
+        ordering: Option<LexOrdering>,
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
     ) -> Self {
-        let cache = Arc::new(Self::compute_properties(&input, fetch));
+        let cache = Arc::new(Self::compute_properties(&input, ordering.as_ref(), fetch));
         Self {
             input,
+            ordering,
             value_ranges,
             metrics: ExecutionPlanMetricsSet::new(),
             fetch,
@@ -95,17 +105,21 @@ impl ProgressiveEvalExec {
         }
     }
 
-    /// Input plan
-    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.input
-    }
-
     /// Creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
-    fn compute_properties(input: &Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> PlanProperties {
-        // Progressive eval does not change the equivalence properties of its input.
-        // This assumes that if the input is ordered, then the input partitions are non-overlapping
-        // with respect to the ordering and in-order.
-        let eq_properties = input.equivalence_properties().clone();
+    fn compute_properties(
+        input: &Arc<dyn ExecutionPlan>,
+        ordering: Option<&LexOrdering>,
+        fetch: Option<usize>,
+    ) -> PlanProperties {
+        // Non-ordering equivalences (column equalities, constants, constraints)
+        // hold per row and therefore survive concatenation, whereas
+        // partition-local orderings do not in general. Retain only the global
+        // ordering validated across partitions.
+        let mut eq_properties = input.equivalence_properties().clone();
+        eq_properties.clear_orderings();
+        if let Some(ordering) = ordering {
+            eq_properties.add_ordering(ordering.iter().cloned());
+        }
 
         // This node serializes all the data to a single partition
         let output_partitioning = Partitioning::UnknownPartitioning(1);
@@ -167,18 +181,13 @@ impl ExecutionPlan for ProgressiveEvalExec {
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
-        let input_ordering = self
-            .input()
-            .properties()
-            .output_ordering()
-            .cloned()
-            .map(OrderingRequirements::from);
-
-        vec![input_ordering]
+        vec![self.ordering.clone().map(OrderingRequirements::from)]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
+        // Concatenating partitions only guarantees `self.ordering` (advertised
+        // via `properties()`), not arbitrary partition-local input orderings.
+        vec![false]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -212,6 +221,7 @@ impl ExecutionPlan for ProgressiveEvalExec {
             })),
             ChildrenPropertiesMode::Recompute => Ok(Arc::new(Self::new(
                 input,
+                self.ordering.clone(),
                 self.value_ranges.clone(),
                 self.fetch,
             ))),
@@ -309,6 +319,7 @@ impl ExecutionPlan for ProgressiveEvalExec {
         // Rebuild rather than clone so the cached plan properties reflect the new fetch
         Some(Arc::new(Self::new(
             Arc::<dyn ExecutionPlan>::clone(&self.input),
+            self.ordering.clone(),
             self.value_ranges.clone(),
             limit,
         )))
@@ -1684,22 +1695,22 @@ mod tests {
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
         // Without a fetch limit the input statistics pass through unchanged
-        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None);
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None, None);
         let stats = plan_statistics(&progressive, Some(0));
         assert_eq!(stats.num_rows, Precision::Exact(5));
 
         // A fetch limit below the input row count caps the reported row count
-        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, Some(3));
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None, Some(3));
         let stats = plan_statistics(&progressive, None);
         assert_eq!(stats.num_rows, Precision::Exact(3));
 
         // A fetch limit above the input row count has no effect
-        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, Some(10));
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None, Some(10));
         let stats = plan_statistics(&progressive, None);
         assert_eq!(stats.num_rows, Precision::Exact(5));
 
         // Setting a fetch limit on an existing plan is reflected in its statistics
-        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None);
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None, None);
         let limited = progressive.with_fetch(Some(2)).unwrap();
         let stats = plan_statistics(limited.as_ref(), None);
         assert_eq!(stats.num_rows, Precision::Exact(2));
@@ -1717,14 +1728,14 @@ mod tests {
         ));
 
         // Without a fetch limit an unbounded input makes the output unbounded
-        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None);
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None, None);
         assert!(matches!(
             progressive.properties().boundedness,
             Boundedness::Unbounded { .. }
         ));
 
         // A fetch limit makes the output finite regardless of the input
-        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, Some(10));
+        let progressive = ProgressiveEvalExec::new(Arc::clone(&input) as _, None, None, Some(10));
         assert!(matches!(
             progressive.properties().boundedness,
             Boundedness::Bounded
@@ -1736,6 +1747,161 @@ mod tests {
             unlimited.properties().boundedness,
             Boundedness::Unbounded { .. }
         ));
+    }
+
+    #[test]
+    fn test_output_ordering_and_equivalences_preserved_on_rebuild() {
+        use arrow_schema::SortOptions;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_expr::{ConstExpr, EquivalenceProperties, PhysicalSortExpr};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("t", DataType::Int32, false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("t_alias", DataType::Int32, false),
+            Field::new("other", DataType::Int32, false),
+            Field::new("const_col", DataType::Int32, false),
+        ]));
+
+        let asc = |idx: usize, name: &str| {
+            PhysicalSortExpr::new(
+                Arc::new(Column::new(name, idx)),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )
+        };
+        let t_order = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        let t_id_order = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+        let t_alias_order = LexOrdering::new(vec![asc(2, "t_alias")]).unwrap();
+        let other_order = LexOrdering::new(vec![asc(3, "other")]).unwrap();
+        let const_then_t_order = LexOrdering::new(vec![asc(4, "const_col"), asc(0, "t")]).unwrap();
+
+        let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
+        eq.add_equal_conditions(
+            Arc::new(Column::new("t", 0)),
+            Arc::new(Column::new("t_alias", 2)),
+        )
+        .unwrap();
+        eq.add_constants([ConstExpr::from(
+            Arc::new(Column::new("const_col", 4)) as Arc<dyn PhysicalExpr>
+        )])
+        .unwrap();
+        eq.add_orderings([t_id_order.clone(), other_order.clone()]);
+
+        #[derive(Debug)]
+        struct EqExec {
+            cache: Arc<PlanProperties>,
+        }
+        impl DisplayAs for EqExec {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result {
+                write!(f, "EqExec")
+            }
+        }
+        impl ExecutionPlan for EqExec {
+            fn name(&self) -> &'static str {
+                "EqExec"
+            }
+            fn properties(&self) -> &Arc<PlanProperties> {
+                &self.cache
+            }
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![]
+            }
+            fn with_new_children(
+                self: Arc<Self>,
+                _children: Vec<Arc<dyn ExecutionPlan>>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(self)
+            }
+            fn apply_expressions(
+                &self,
+                _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+            ) -> Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+            fn execute(
+                &self,
+                _partition: usize,
+                _context: Arc<TaskContext>,
+            ) -> Result<SendableRecordBatchStream> {
+                unimplemented!("EqExec is only used for property checks")
+            }
+        }
+
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EqExec {
+            cache: Arc::new(PlanProperties::new(
+                eq,
+                Partitioning::UnknownPartitioning(2),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        });
+
+        let check_validated_orderings = |plan: &dyn ExecutionPlan| {
+            let eq = plan.equivalence_properties();
+            // Validated ordering and orderings implied via non-ordering
+            // equivalences / constants are preserved.
+            assert!(eq.ordering_satisfy(t_order.iter().cloned()).unwrap());
+            assert!(eq.ordering_satisfy(t_alias_order.iter().cloned()).unwrap());
+            assert!(
+                eq.ordering_satisfy(const_then_t_order.iter().cloned())
+                    .unwrap()
+            );
+            // Partition-local orderings not validated across partitions are dropped.
+            assert!(!eq.ordering_satisfy(t_id_order.iter().cloned()).unwrap());
+            assert!(!eq.ordering_satisfy(other_order.iter().cloned()).unwrap());
+        };
+
+        let progressive = Arc::new(ProgressiveEvalExec::new(
+            Arc::clone(&input),
+            Some(t_order.clone()),
+            None,
+            None,
+        ));
+        check_validated_orderings(progressive.as_ref());
+
+        // Rebuilding via replace_children (both Recompute and Keep) must
+        // preserve the validated ordering without re-exposing input orderings.
+        let rebuilt = Arc::clone(&progressive)
+            .replace_children(
+                vec![Arc::clone(&input)],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        check_validated_orderings(rebuilt.as_ref());
+
+        let kept = Arc::clone(&progressive)
+            .replace_children(
+                vec![Arc::clone(&input)],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+            )
+            .unwrap();
+        check_validated_orderings(kept.as_ref());
+
+        // Rebuilding via with_fetch must likewise preserve the validated ordering.
+        let with_limit = progressive.with_fetch(Some(5)).unwrap();
+        check_validated_orderings(with_limit.as_ref());
+
+        // Without a validated ordering, all partition-local orderings are cleared
+        // while non-ordering equivalences/constants remain intact.
+        let unordered = ProgressiveEvalExec::new(Arc::clone(&input), None, None, None);
+        assert!(unordered.properties().output_ordering().is_none());
+        assert!(
+            unordered
+                .properties()
+                .equivalence_properties()
+                .eq_group()
+                .exprs_equal(
+                    &(Arc::new(Column::new("t", 0)) as Arc<dyn PhysicalExpr>),
+                    &(Arc::new(Column::new("t_alias", 2)) as Arc<dyn PhysicalExpr>),
+                )
+        );
     }
 
     /// Create a task context whose session config sets
@@ -1767,7 +1933,7 @@ mod tests {
         };
 
         let exec = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
-        let progressive = Arc::new(ProgressiveEvalExec::new(exec, value_ranges, fetch));
+        let progressive = Arc::new(ProgressiveEvalExec::new(exec, None, value_ranges, fetch));
 
         let progressive_clone = Arc::clone(&progressive);
 
@@ -1810,7 +1976,7 @@ mod tests {
 
         let schema = b1.schema();
         let exec = MemorySourceConfig::try_new_exec(&[vec![b1], vec![b2]], schema, None).unwrap();
-        let progressive = Arc::new(ProgressiveEvalExec::new(exec, None, None));
+        let progressive = Arc::new(ProgressiveEvalExec::new(exec, None, None, None));
 
         let collected = collect(Arc::<ProgressiveEvalExec>::clone(&progressive), task_ctx)
             .await
@@ -1884,7 +2050,7 @@ mod tests {
         let schema = b1.schema();
         let exec = MemorySourceConfig::try_new_exec(&[vec![b1], vec![b2]], schema, None).unwrap();
         let progressive: Arc<dyn ExecutionPlan> =
-            Arc::new(ProgressiveEvalExec::new(exec, None, None));
+            Arc::new(ProgressiveEvalExec::new(exec, None, None, None));
 
         let count = |value: usize| {
             let count = Count::new();
@@ -1940,7 +2106,7 @@ mod tests {
             Boundedness::Bounded,
         ));
         let refs = blocking_exec.refs();
-        let progressive_exec = Arc::new(ProgressiveEvalExec::new(blocking_exec, None, None));
+        let progressive_exec = Arc::new(ProgressiveEvalExec::new(blocking_exec, None, None, None));
 
         let fut = collect(progressive_exec, task_ctx);
         let mut fut = fut.boxed();
@@ -2073,7 +2239,7 @@ mod tests {
     async fn test_error_in_first_stream_aborts_output() {
         let task_ctx = Arc::new(TaskContext::default());
         let exec = Arc::new(ErrorExec::new(2, 0));
-        let progressive = ProgressiveEvalExec::new(exec, None, None);
+        let progressive = ProgressiveEvalExec::new(exec, None, None, None);
 
         let mut stream = progressive.execute(0, task_ctx).unwrap();
 
@@ -2093,7 +2259,7 @@ mod tests {
     async fn test_error_in_later_stream_propagates() {
         let task_ctx = Arc::new(TaskContext::default());
         let exec = Arc::new(ErrorExec::new(3, 1));
-        let progressive = ProgressiveEvalExec::new(exec, None, None);
+        let progressive = ProgressiveEvalExec::new(exec, None, None, None);
 
         let mut stream = progressive.execute(0, task_ctx).unwrap();
 

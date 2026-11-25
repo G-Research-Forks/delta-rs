@@ -81,7 +81,8 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
                 Some(ranges)
             };
             let input = preserve_input_order(Arc::clone(input))?;
-            let replacement = ProgressiveEvalExec::new(input, ranges, merge.fetch());
+            let replacement =
+                ProgressiveEvalExec::new(input, Some(merge.expr().clone()), ranges, merge.fetch());
             Ok(Transformed::yes(Arc::new(replacement) as _))
         })
         .data()
@@ -1115,5 +1116,178 @@ mod tests {
 
         assert!(pinned.downcast_ref::<CooperativeExec>().is_some());
         assert!(scan_keeps_files_local(pinned.children()[0]));
+    }
+
+    #[tokio::test]
+    async fn progressive_eval_does_not_advertise_unvalidated_partition_local_ordering() {
+        use arrow::array::Int64Array;
+        use arrow::record_batch::RecordBatch;
+        use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+        use datafusion::physical_plan::collect;
+        use datafusion::physical_plan::sorts::sort::SortExec;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        #[derive(Debug)]
+        struct PartitionedDataExec {
+            batches: Vec<RecordBatch>,
+            stats: Vec<Statistics>,
+            cache: Arc<PlanProperties>,
+        }
+
+        impl DisplayAs for PartitionedDataExec {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result {
+                write!(f, "PartitionedDataExec")
+            }
+        }
+
+        impl ExecutionPlan for PartitionedDataExec {
+            fn name(&self) -> &'static str {
+                "PartitionedDataExec"
+            }
+
+            fn properties(&self) -> &Arc<PlanProperties> {
+                &self.cache
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![]
+            }
+
+            fn with_new_children(
+                self: Arc<Self>,
+                _children: Vec<Arc<dyn ExecutionPlan>>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(self)
+            }
+
+            fn apply_expressions(
+                &self,
+                _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+            ) -> Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+
+            fn execute(
+                &self,
+                partition: usize,
+                _context: Arc<TaskContext>,
+            ) -> Result<SendableRecordBatchStream> {
+                let batch = self.batches[partition].clone();
+                let schema = batch.schema();
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter(vec![Ok(batch)]),
+                )))
+            }
+
+            fn statistics_from_inputs(
+                &self,
+                _input_stats: &[Arc<Statistics>],
+                args: &StatisticsArgs,
+            ) -> Result<Arc<Statistics>> {
+                match args.partition() {
+                    Some(idx) => Ok(Arc::new(self.stats[idx].clone())),
+                    None => Ok(Arc::new(Statistics::new_unknown(&self.schema()))),
+                }
+            }
+        }
+
+        let schema = test_schema();
+        let make_batch = |ts: Vec<i64>, ids: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(Int64Array::from(ids)),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Partition 0: [(1, 100), (2, 101)] — locally sorted on (t ASC, id ASC)
+        // Partition 1: [(2, 0),   (3, 1)]   — locally sorted on (t ASC, id ASC)
+        // Concatenating them is ordered on `t ASC` (boundary 2 == 2),
+        // but NOT ordered on `(t ASC, id ASC)` since (2, 101) precedes (2, 0).
+        let local_ordering = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+        let source: Arc<dyn ExecutionPlan> = Arc::new(PartitionedDataExec {
+            batches: vec![
+                make_batch(vec![1, 2], vec![100, 101]),
+                make_batch(vec![2, 3], vec![0, 1]),
+            ],
+            stats: vec![
+                partition(vec![exact_i64(1, 2, 0), exact_i64(100, 101, 0)]),
+                partition(vec![exact_i64(2, 3, 0), exact_i64(0, 1, 0)]),
+            ],
+            cache: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new_with_orderings(
+                    Arc::clone(&schema),
+                    vec![local_ordering.clone()],
+                ),
+                Partitioning::UnknownPartitioning(2),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        });
+
+        // Inner merge only establishes global order on `t ASC`, while an outer
+        // SortExec requires `(t ASC, id ASC)`.
+        let merge = merge_on_t(source);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(local_ordering.clone(), merge));
+
+        // 1. ProgressiveEvalRule replaces SortPreservingMergeExec(t) with ProgressiveEvalExec.
+        let after_progressive = optimize(plan);
+        let t_ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        let progressive = after_progressive.children()[0];
+        assert!(
+            progressive.downcast_ref::<ProgressiveEvalExec>().is_some(),
+            "expected ProgressiveEvalExec under SortExec, got {}",
+            progressive.name()
+        );
+        assert!(
+            progressive
+                .equivalence_properties()
+                .ordering_satisfy(t_ordering.iter().cloned())
+                .unwrap(),
+            "ProgressiveEvalExec must advertise the validated merge ordering (t)"
+        );
+        assert!(
+            !progressive
+                .equivalence_properties()
+                .ordering_satisfy(local_ordering.iter().cloned())
+                .unwrap(),
+            "ProgressiveEvalExec must not advertise unvalidated partition-local ordering (t, id)"
+        );
+
+        // 2. A subsequent DataFusion physical optimization pass must keep the
+        //    outer SortExec([t ASC, id ASC]) and yield globally sorted rows.
+        let config = ConfigOptions::default();
+        let mut after_optimizer = after_progressive;
+        for rule in PhysicalOptimizer::new().rules {
+            after_optimizer = rule.optimize(after_optimizer, &config).unwrap();
+        }
+        assert!(
+            after_optimizer
+                .exists(|node| Ok(node.downcast_ref::<SortExec>().is_some()))
+                .unwrap(),
+            "outer SortExec on (t, id) must be retained"
+        );
+
+        let batches = collect(after_optimizer, Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        let rows: Vec<(i64, i64)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ts = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let ids = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..b.num_rows()).map(move |i| (ts.value(i), ids.value(i)))
+            })
+            .collect();
+
+        assert_eq!(rows, vec![(1, 100), (2, 0), (2, 101), (3, 1)]);
     }
 }
