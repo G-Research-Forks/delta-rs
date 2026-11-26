@@ -10,7 +10,7 @@
 //!
 //! Streaming partitions one after another is only sound when no operator below
 //! the merge needs all of its partitions to be running at once; see
-//! [`contains_hash_join`] for the one that does.
+//! [`only_partition_independent_operators`].
 //!
 //! Because this rule is installed session-wide on
 //! [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext), it is
@@ -29,12 +29,15 @@ use datafusion::physical_expr::{
     EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
 };
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::buffer::BufferExec;
+use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::limit::LocalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
@@ -93,7 +96,7 @@ fn optimize_plan(
         if require_delta_scan && !is_delta_scan_plan(input) {
             return Ok(Transformed::no(plan));
         }
-        if contains_hash_join(input)? {
+        if !only_partition_independent_operators(input) {
             return Ok(Transformed::no(plan));
         }
         if contains_blocking_operator(input)? {
@@ -295,25 +298,31 @@ fn leading_partition_ranges(
         .collect()
 }
 
-/// Whether any node of `plan` is a [`HashJoinExec`].
-///
-/// A [`ProgressiveEvalExec`] executes its input partitions a few at a time,
-/// starting the next one only once an earlier one is exhausted. A hash join
-/// whose dynamic filter was pushed into the probe-side scan cannot be read
-/// that way: every probe partition reports its build-side bounds to a shared
-/// accumulator and then waits until *all* probe partitions have reported, so
-/// the partitions that are running wait for ones that will only be started
-/// after they finish, and the query hangs. The filter is attached by
-/// `FilterPushdown::new_post_optimization`, which runs before this rule, so
-/// it could be detected precisely; but joins over a scan that was regrouped
-/// for a sort are uncommon enough that the merge is simply kept for every
-/// hash join, which also does not depend on how the rules are ordered.
-fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
-    plan.exists(|node| {
-        Ok((node.as_ref() as &dyn ExecutionPlan)
-            .downcast_ref::<HashJoinExec>()
-            .is_some())
-    })
+/// Whether every non-leaf node of `plan` is an operator known to process each
+/// partition independently, so that executing the partitions a few at a time
+/// cannot deadlock. Leaves are governed by [`is_delta_scan_plan`]. Anything
+/// unknown keeps the merge: a missed optimization rather than a possible hang.
+/// For example, a `HashJoinExec` whose dynamic filter was pushed into the
+/// probe-side scan makes every probe partition wait until *all* of them have
+/// reported their build-side bounds, so running them a few at a time hangs.
+fn only_partition_independent_operators(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let children = plan.children();
+    if children.is_empty() {
+        return true;
+    }
+    let node = plan.as_ref() as &dyn ExecutionPlan;
+    let allowed = node.downcast_ref::<FilterExec>().is_some()
+        || node.downcast_ref::<ProjectionExec>().is_some()
+        || node.downcast_ref::<CooperativeExec>().is_some()
+        || node.downcast_ref::<LocalLimitExec>().is_some()
+        || node.downcast_ref::<BufferExec>().is_some()
+        || node.downcast_ref::<UnionExec>().is_some()
+        || node.downcast_ref::<DeltaScanExec>().is_some()
+        || node.downcast_ref::<DataSourceExec>().is_some();
+    allowed
+        && children
+            .into_iter()
+            .all(only_partition_independent_operators)
 }
 
 /// Whether any node of `plan` is a blocking operator (must consume all of its
@@ -500,11 +509,9 @@ mod tests {
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
-    use datafusion::physical_plan::buffer::BufferExec;
     use datafusion::physical_plan::execution_plan::Boundedness;
     use datafusion::physical_plan::filter::FilterExecBuilder;
-    use datafusion::physical_plan::joins::PartitionMode;
-    use datafusion::physical_plan::limit::LocalLimitExec;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
 
@@ -1064,6 +1071,10 @@ mod tests {
             )
             .unwrap(),
         );
+        assert!(
+            !only_partition_independent_operators(&join),
+            "HashJoinExec must not be treated as partition-independent"
+        );
         let ordered_stats = vec![
             partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
             partition(vec![exact_i64(101, 200, 0), exact_i64(11, 20, 0)]),
@@ -1084,6 +1095,62 @@ mod tests {
             "expected SortPreservingMergeExec, got {}",
             optimized.name()
         );
+    }
+
+    #[test]
+    fn merge_over_unknown_non_leaf_operator_is_kept() {
+        // An unknown non-leaf operator (here `StatsExec` wrapping a child)
+        // must keep the merge even when its per-partition statistics look
+        // strictly ordered, so any unrecognized cross-partition synchronizing
+        // operator cannot deadlock under ProgressiveEvalExec.
+        let ordered_stats = vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(101, 200, 0), exact_i64(11, 20, 0)]),
+        ];
+        let plan = StatsExec::over(ordered_stats, Some(ordered_partitions()));
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        assert!(
+            ordered_partition_ranges(&plan, &ordering).is_some(),
+            "the partitions should look replaceable on statistics alone"
+        );
+
+        let optimized = optimize_any(merge_on_t(plan));
+
+        assert!(
+            optimized
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected SortPreservingMergeExec for unknown non-leaf operator, got {}",
+            optimized.name()
+        );
+    }
+
+    #[test]
+    fn partition_independent_operators_are_allowed() {
+        let leaf = ordered_partitions();
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(filter_exec(None));
+        let projection: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new(
+                vec![(
+                    Arc::new(Column::new("t", 0)) as Arc<dyn PhysicalExpr>,
+                    "t".to_string(),
+                )],
+                Arc::clone(&leaf),
+            )
+            .unwrap(),
+        );
+        let coop: Arc<dyn ExecutionPlan> = Arc::new(CooperativeExec::new(Arc::clone(&leaf)));
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(Arc::clone(&leaf), 5));
+        let buffer: Arc<dyn ExecutionPlan> = Arc::new(BufferExec::new(Arc::clone(&leaf), 1024));
+        let union = UnionExec::try_new(vec![Arc::clone(&leaf), Arc::clone(&leaf)]).unwrap();
+
+        for plan in [leaf, filter, projection, coop, limit, buffer, union] {
+            assert!(
+                only_partition_independent_operators(&plan),
+                "expected {} to be allowed as partition-independent",
+                plan.name()
+            );
+        }
     }
 
     /// A filter over ordered partitions, with a projection embedded in it the
@@ -1215,8 +1282,6 @@ mod tests {
     /// themselves.
     #[test]
     fn preserve_input_order_pins_a_scan_through_its_parents() {
-        use datafusion::physical_plan::coop::CooperativeExec;
-
         let scan = parquet_scan(false);
         assert!(!scan_keeps_files_local(&scan));
         let plan: Arc<dyn ExecutionPlan> = Arc::new(CooperativeExec::new(scan));
@@ -1409,7 +1474,6 @@ mod tests {
         use datafusion::physical_plan::collect;
         use datafusion::physical_plan::sorts::sort::SortExec;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-        use datafusion::physical_plan::union::UnionExec;
 
         #[derive(Debug)]
         struct ConstLeafExec {
