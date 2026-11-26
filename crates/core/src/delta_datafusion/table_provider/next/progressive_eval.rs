@@ -540,35 +540,38 @@ impl Stream for ProgressiveEvalStream {
 
     // Return the next record batch until reaching the fetch limit or the end of all input streams
     // Return pending if the next record batch is not ready
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let _timer = this.baseline_metrics.elapsed_compute().timer();
+
         // Error in previous poll
-        if self.aborted {
+        if this.aborted {
             return Poll::Ready(None);
         }
 
         // Have reached the fetch limit
-        if self.produced >= self.fetch.unwrap_or(usize::MAX) {
+        if this.produced >= this.fetch.unwrap_or(usize::MAX) {
             return Poll::Ready(None);
         }
 
-        let poll = self.input_streams.poll_next(cx);
+        let poll = this.input_streams.poll_next(cx);
 
         let poll = match ready!(poll) {
             // This input stream has data, return its next record batch,
             // truncated to the remaining fetch budget
             Some(Ok(batch)) => {
-                let remaining = self.fetch.unwrap_or(usize::MAX) - self.produced;
+                let remaining = this.fetch.unwrap_or(usize::MAX) - this.produced;
                 let batch = if batch.num_rows() > remaining {
                     batch.slice(0, remaining)
                 } else {
                     batch
                 };
-                self.produced += batch.num_rows();
+                this.produced += batch.num_rows();
                 Poll::Ready(Some(Ok(batch)))
             }
             // This input stream has an error, return the error and set aborted to true to stop polling next round
             Some(Err(e)) => {
-                self.aborted = true;
+                this.aborted = true;
                 Poll::Ready(Some(Err(e)))
             }
             // This input stream has no more data, return None (aka finished)
@@ -578,7 +581,7 @@ impl Stream for ProgressiveEvalStream {
             }
         };
 
-        self.baseline_metrics.record_poll(poll)
+        this.baseline_metrics.record_poll(poll)
     }
 }
 
@@ -2021,6 +2024,7 @@ mod tests {
 
         let mut saw_start = false;
         let mut saw_end = false;
+        let mut saw_elapsed = false;
         metrics.iter().for_each(|m| match m.value() {
             MetricValue::StartTimestamp(ts) => {
                 saw_start = true;
@@ -2030,11 +2034,16 @@ mod tests {
                 saw_end = true;
                 assert!(nanos_from_timestamp(ts) > 0);
             }
+            MetricValue::ElapsedCompute(time) => {
+                saw_elapsed = true;
+                assert!(time.value() > 0);
+            }
             _ => {}
         });
 
         assert!(saw_start);
         assert!(saw_end);
+        assert!(saw_elapsed);
     }
 
     /// `reset_state` rebuilds the node so that a plan can be executed again,
