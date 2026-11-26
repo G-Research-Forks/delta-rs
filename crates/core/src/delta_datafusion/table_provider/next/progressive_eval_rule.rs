@@ -1399,4 +1399,197 @@ mod tests {
 
         assert_eq!(rows, vec![(1, 100), (2, 0), (2, 101), (3, 1)]);
     }
+
+    #[tokio::test]
+    async fn progressive_eval_clears_per_partition_constants() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::physical_expr::{AcrossPartitions, ConstExpr};
+        use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+        use datafusion::physical_plan::collect;
+        use datafusion::physical_plan::sorts::sort::SortExec;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::physical_plan::union::UnionExec;
+
+        #[derive(Debug)]
+        struct ConstLeafExec {
+            batch: RecordBatch,
+            stats: Statistics,
+            cache: Arc<PlanProperties>,
+        }
+
+        impl DisplayAs for ConstLeafExec {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result {
+                write!(f, "ConstLeafExec")
+            }
+        }
+
+        impl ExecutionPlan for ConstLeafExec {
+            fn name(&self) -> &'static str {
+                "ConstLeafExec"
+            }
+
+            fn properties(&self) -> &Arc<PlanProperties> {
+                &self.cache
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![]
+            }
+
+            fn with_new_children(
+                self: Arc<Self>,
+                _children: Vec<Arc<dyn ExecutionPlan>>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(self)
+            }
+
+            fn apply_expressions(
+                &self,
+                _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+            ) -> Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+
+            fn execute(
+                &self,
+                partition: usize,
+                _context: Arc<TaskContext>,
+            ) -> Result<SendableRecordBatchStream> {
+                assert_eq!(partition, 0);
+                let batch = self.batch.clone();
+                let schema = batch.schema();
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter(vec![Ok(batch)]),
+                )))
+            }
+
+            fn statistics_from_inputs(
+                &self,
+                _input_stats: &[Arc<Statistics>],
+                _args: &StatisticsArgs,
+            ) -> Result<Arc<Statistics>> {
+                Ok(Arc::new(self.stats.clone()))
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("t", DataType::Int64, false),
+            Field::new("p", DataType::Utf8, false),
+        ]));
+        let t_ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+
+        let make_leaf = |ts: Vec<i64>, p_val: &str| -> Arc<dyn ExecutionPlan> {
+            let min_t = *ts.first().unwrap();
+            let max_t = *ts.last().unwrap();
+            let p_scalar = ScalarValue::Utf8(Some(p_val.to_string()));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ts.clone())),
+                    Arc::new(StringArray::from(vec![p_val; ts.len()])),
+                ],
+            )
+            .unwrap();
+            let stats = Statistics {
+                num_rows: Precision::Exact(ts.len()),
+                total_byte_size: Precision::Exact(100),
+                column_statistics: vec![
+                    exact_i64(min_t, max_t, 0),
+                    ColumnStatistics {
+                        null_count: Precision::Exact(0),
+                        min_value: Precision::Exact(p_scalar.clone()),
+                        max_value: Precision::Exact(p_scalar.clone()),
+                        ..Default::default()
+                    },
+                ],
+            };
+            let mut eq = EquivalenceProperties::new_with_orderings(
+                Arc::clone(&schema),
+                vec![t_ordering.clone()],
+            );
+            eq.add_constants([ConstExpr::new(
+                Arc::new(Column::new("p", 1)),
+                AcrossPartitions::Uniform(Some(p_scalar)),
+            )])
+            .unwrap();
+            Arc::new(ConstLeafExec {
+                batch,
+                stats,
+                cache: Arc::new(PlanProperties::new(
+                    eq,
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                )),
+            })
+        };
+
+        // Two single-partition leaves with disjoint `t` ranges and distinct
+        // constant values of `p`. `UnionExec` marks `p` as a per-partition
+        // (heterogeneous) constant across its 2 partitions.
+        let union =
+            UnionExec::try_new(vec![make_leaf(vec![1, 2], "a"), make_leaf(vec![3, 4], "b")])
+                .unwrap();
+        let merge = merge_on_t(union);
+        let p_desc_t_asc = LexOrdering::new(vec![desc(1, "p"), asc(0, "t")]).unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(p_desc_t_asc.clone(), merge));
+
+        // 1. ProgressiveEvalRule rewrites SortPreservingMergeExec(t) to ProgressiveEvalExec.
+        let after_progressive = optimize_any(plan);
+        let progressive = after_progressive.children()[0];
+        assert!(
+            progressive.downcast_ref::<ProgressiveEvalExec>().is_some(),
+            "expected ProgressiveEvalExec under SortExec, got {}",
+            progressive.name()
+        );
+        assert!(
+            !progressive
+                .equivalence_properties()
+                .ordering_satisfy(p_desc_t_asc.iter().cloned())
+                .unwrap(),
+            "ProgressiveEvalExec must clear per-partition constants so (p DESC, t ASC) is not satisfied"
+        );
+
+        // 2. Subsequent physical optimization must keep the outer SortExec([p DESC, t ASC])
+        //    so 'b' rows sort before 'a' rows.
+        let config = ConfigOptions::default();
+        let mut after_optimizer = after_progressive;
+        for rule in PhysicalOptimizer::new().rules {
+            after_optimizer = rule.optimize(after_optimizer, &config).unwrap();
+        }
+        assert!(
+            after_optimizer
+                .exists(|node| Ok(node.downcast_ref::<SortExec>().is_some()))
+                .unwrap(),
+            "outer SortExec on (p DESC, t ASC) must be retained"
+        );
+
+        let batches = collect(after_optimizer, Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        let rows: Vec<(i64, String)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ts = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let ps = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..b.num_rows()).map(move |i| (ts.value(i), ps.value(i).to_string()))
+            })
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                (3, "b".to_string()),
+                (4, "b".to_string()),
+                (1, "a".to_string()),
+                (2, "a".to_string()),
+            ]
+        );
+    }
 }

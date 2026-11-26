@@ -111,12 +111,15 @@ impl ProgressiveEvalExec {
         ordering: Option<&LexOrdering>,
         fetch: Option<usize>,
     ) -> PlanProperties {
-        // Non-ordering equivalences (column equalities, constants, constraints)
-        // hold per row and therefore survive concatenation, whereas
-        // partition-local orderings do not in general. Retain only the global
-        // ordering validated across partitions.
+        // Non-ordering equivalences (column equalities, uniform constants,
+        // constraints) hold across all partitions and therefore survive
+        // concatenation, whereas partition-local orderings and per-partition
+        // (heterogeneous) constants only hold within each partition and must
+        // be cleared. Retain only the global ordering validated across
+        // partitions.
         let mut eq_properties = input.equivalence_properties().clone();
         eq_properties.clear_orderings();
+        eq_properties.clear_per_partition_constants();
         if let Some(ordering) = ordering {
             eq_properties.add_ordering(ordering.iter().cloned());
         }
@@ -1756,7 +1759,9 @@ mod tests {
     fn test_output_ordering_and_equivalences_preserved_on_rebuild() {
         use arrow_schema::SortOptions;
         use datafusion::physical_expr::expressions::Column;
-        use datafusion::physical_expr::{ConstExpr, EquivalenceProperties, PhysicalSortExpr};
+        use datafusion::physical_expr::{
+            AcrossPartitions, ConstExpr, EquivalenceProperties, PhysicalSortExpr,
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("t", DataType::Int32, false),
@@ -1764,6 +1769,7 @@ mod tests {
             Field::new("t_alias", DataType::Int32, false),
             Field::new("other", DataType::Int32, false),
             Field::new("const_col", DataType::Int32, false),
+            Field::new("per_part_const_col", DataType::Int32, false),
         ]));
 
         let asc = |idx: usize, name: &str| {
@@ -1780,6 +1786,8 @@ mod tests {
         let t_alias_order = LexOrdering::new(vec![asc(2, "t_alias")]).unwrap();
         let other_order = LexOrdering::new(vec![asc(3, "other")]).unwrap();
         let const_then_t_order = LexOrdering::new(vec![asc(4, "const_col"), asc(0, "t")]).unwrap();
+        let per_part_const_then_t_order =
+            LexOrdering::new(vec![asc(5, "per_part_const_col"), asc(0, "t")]).unwrap();
 
         let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
         eq.add_equal_conditions(
@@ -1787,9 +1795,15 @@ mod tests {
             Arc::new(Column::new("t_alias", 2)),
         )
         .unwrap();
-        eq.add_constants([ConstExpr::from(
-            Arc::new(Column::new("const_col", 4)) as Arc<dyn PhysicalExpr>
-        )])
+        eq.add_constants([
+            ConstExpr::new(
+                Arc::new(Column::new("const_col", 4)) as Arc<dyn PhysicalExpr>,
+                AcrossPartitions::Uniform(Some(ScalarValue::Int32(Some(7)))),
+            ),
+            ConstExpr::from(
+                Arc::new(Column::new("per_part_const_col", 5)) as Arc<dyn PhysicalExpr>,
+            ),
+        ])
         .unwrap();
         eq.add_orderings([t_id_order.clone(), other_order.clone()]);
 
@@ -1856,9 +1870,14 @@ mod tests {
                 eq.ordering_satisfy(const_then_t_order.iter().cloned())
                     .unwrap()
             );
-            // Partition-local orderings not validated across partitions are dropped.
+            // Partition-local orderings and per-partition constants not
+            // validated across partitions are dropped.
             assert!(!eq.ordering_satisfy(t_id_order.iter().cloned()).unwrap());
             assert!(!eq.ordering_satisfy(other_order.iter().cloned()).unwrap());
+            assert!(
+                !eq.ordering_satisfy(per_part_const_then_t_order.iter().cloned())
+                    .unwrap()
+            );
         };
 
         let progressive = Arc::new(ProgressiveEvalExec::new(
