@@ -61,8 +61,8 @@ use crate::{open_table, open_table_with_storage_options};
 
 pub(crate) use self::session::DeltaSessionExt;
 pub use self::session::{
-    DeltaParserOptions, DeltaRuntimeEnvBuilder, DeltaSessionConfig, DeltaSessionContext,
-    create_session, create_session_state_with_spill_config,
+    DeltaConfigOptions, DeltaParserOptions, DeltaRuntimeEnvBuilder, DeltaSessionConfig,
+    DeltaSessionContext, create_session, create_session_state_with_spill_config,
 };
 pub use self::table_provider::next::{
     DeletionVectorSelection, DeltaScan as DeltaScanNext, FileSelection, MissingSelectedFilePolicy,
@@ -77,7 +77,8 @@ pub(crate) use find_files::*;
 pub(crate) use table_provider::next::RuntimeFileFilter;
 pub(crate) use table_provider::next::normalize_path_as_file_id;
 pub use table_provider::{
-    DeltaScanConfig, DeltaScanConfigBuilder, TableProviderBuilder, next::DeltaScanExec,
+    DeltaScanConfig, DeltaScanConfigBuilder, FileSortColumn, TableProviderBuilder,
+    next::{DeltaScanExec, ProgressiveEvalRule},
 };
 pub(crate) use table_provider::{
     next::FILE_ID_COLUMN_DEFAULT, resolve_file_column_name, update_datafusion_session,

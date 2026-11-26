@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::common::extensions_options;
+use datafusion::config::ConfigExtension;
 use datafusion::{
     catalog::Session as DataFusionSession,
     execution::{
@@ -14,10 +16,37 @@ use datafusion::{
 };
 use url::Url;
 
+use crate::delta_datafusion::ProgressiveEvalRule;
 use crate::delta_datafusion::engine::AsObjectStoreUrl;
 use crate::delta_datafusion::planner::DeltaPlanner;
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::logstore::LogStore;
+
+extensions_options! {
+    /// Delta-specific DataFusion session options, registered under the
+    /// `delta.` prefix (e.g. `SET delta.progressive_eval_num_prefetch_input_streams = 4`).
+    ///
+    /// Registered by default on sessions created through
+    /// [`DeltaSessionContext`](crate::delta_datafusion::DeltaSessionContext);
+    /// other sessions can register it via
+    /// `SessionConfig::with_option_extension(DeltaConfigOptions::default())`.
+    pub struct DeltaConfigOptions {
+        /// Number of input streams to prefetch before they are required for ProgressiveEvalExec.
+        /// Since ProgressiveEvalExec only polls one stream at a time in order,
+        /// we do not need to prefetch all streams at once, saving resources. However, if the
+        /// streams' IO time is much greater than their CPU/processing time, prefetching them will
+        /// help improve performance.
+        /// Default is 1 which means we will prefetch one extra stream before it is polled.
+        /// 0 means streams are only fetched immediately before they are required.
+        /// Increase this value if IO time to read a stream is often much more than CPU time to
+        /// process the previous one.
+        pub progressive_eval_num_prefetch_input_streams: usize, default = 1
+    }
+}
+
+impl ConfigExtension for DeltaConfigOptions {
+    const PREFIX: &'static str = "delta";
+}
 
 /// Create a default [`DeltaSessionContext`], a DataFusion session pre-configured with the
 /// settings delta-rs relies on (custom planner, object-store registration, etc.).
@@ -231,9 +260,19 @@ fn derive_session_state_from_trait(
         "Derived SessionState from Session trait (catalogs/planners/optimizers not transferable)"
     );
 
+    let mut config = session.config().clone();
+    if config
+        .options()
+        .extensions
+        .get::<DeltaConfigOptions>()
+        .is_none()
+    {
+        config = config.with_option_extension(DeltaConfigOptions::default());
+    }
+
     SessionStateBuilder::new()
         .with_default_features()
-        .with_config(session.config().clone())
+        .with_config(config)
         .with_runtime_env(Arc::clone(session.runtime_env()))
         .with_execution_props(session.execution_props().clone())
         .with_table_options(session.table_options().clone())
@@ -241,6 +280,7 @@ fn derive_session_state_from_trait(
         .with_aggregate_functions(aggregate_fns)
         .with_window_functions(window_fns)
         .with_query_planner(DeltaPlanner::new())
+        .with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()))
         .build()
 }
 
@@ -275,6 +315,7 @@ impl Default for DeltaSessionConfig {
     fn default() -> Self {
         DeltaSessionConfig {
             inner: SessionConfig::default()
+                .with_option_extension(DeltaConfigOptions::default())
                 .set_bool("datafusion.sql_parser.enable_ident_normalization", false)
                 .set_bool("datafusion.execution.parquet.schema_force_view_types", true)
                 // Workaround: hash-join dynamic filtering (IN-list pushdown) can panic when join
@@ -371,6 +412,7 @@ impl DeltaSessionContext {
             .with_config(config)
             .with_runtime_env(runtime_env)
             .with_query_planner(planner)
+            .with_physical_optimizer_rule(Arc::new(ProgressiveEvalRule::new()))
             .build();
 
         let inner = SessionContext::new_with_state(state);
@@ -407,6 +449,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::test_utils::datafusion::{WrapperSession, make_test_scalar_udf};
+
+    #[tokio::test]
+    async fn test_delta_config_options_settable_via_sql() {
+        let ctx = create_session().into_inner();
+        let prefetch = |ctx: &SessionContext| {
+            ctx.state()
+                .config()
+                .options()
+                .extensions
+                .get::<DeltaConfigOptions>()
+                .map(|options| options.progressive_eval_num_prefetch_input_streams)
+        };
+        assert_eq!(prefetch(&ctx), Some(1));
+
+        ctx.sql("SET delta.progressive_eval_num_prefetch_input_streams = 4")
+            .await
+            .unwrap();
+        assert_eq!(prefetch(&ctx), Some(4));
+    }
 
     const TEST_UDF_NAME: &str = "delta_rs_test_udf";
 
@@ -483,6 +544,44 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(Arc::ptr_eq(&original_udf, &derived_udf));
+
+        // Derived sessions without `DeltaConfigOptions` receive defaults.
+        assert_eq!(
+            derived
+                .config()
+                .options()
+                .extensions
+                .get::<DeltaConfigOptions>()
+                .map(|opts| opts.progressive_eval_num_prefetch_input_streams),
+            Some(DeltaConfigOptions::default().progressive_eval_num_prefetch_input_streams)
+        );
+
+        // Existing caller `DeltaConfigOptions` are preserved, not overwritten.
+        let custom_config = SessionConfig::new().with_option_extension(DeltaConfigOptions {
+            progressive_eval_num_prefetch_input_streams: 4,
+        });
+        let custom_wrapper = WrapperSession::new(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(custom_config)
+                .build(),
+        );
+        let (derived_custom, _) = resolve_session_state(
+            Some(&custom_wrapper),
+            SessionFallbackPolicy::DeriveFromTrait,
+            || create_session().state(),
+            ctx("test"),
+        )
+        .unwrap();
+        assert_eq!(
+            derived_custom
+                .config()
+                .options()
+                .extensions
+                .get::<DeltaConfigOptions>()
+                .map(|opts| opts.progressive_eval_num_prefetch_input_streams),
+            Some(4)
+        );
     }
 
     #[test]

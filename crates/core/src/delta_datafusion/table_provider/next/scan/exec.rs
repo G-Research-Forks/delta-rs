@@ -15,6 +15,7 @@ use arrow_array::StringViewArray;
 use arrow_array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::error::{DataFusionError, Result};
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{
     ColumnStatistics, HashMap, exec_err, internal_datafusion_err, internal_err, plan_err,
@@ -22,19 +23,27 @@ use datafusion::common::{
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::utils::collect_columns;
-use datafusion::physical_expr::{Distribution, EquivalenceProperties};
+use datafusion::physical_expr::{
+    Distribution, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
+};
+use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
-    InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions, Statistics,
-    coalesce_partitions::CoalescePartitionsExec, stream::RecordBatchStreamAdapter,
+    InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions, SortOrderPushdownResult,
+    Statistics, coalesce_partitions::CoalescePartitionsExec, stream::RecordBatchStreamAdapter,
     union::UnionExec,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
+use datafusion_datasource::{
+    PartitionedFile, compute_all_files_statistics,
+    file_scan_config::{FileScanConfig, FileScanConfigBuilder},
+    source::DataSourceExec,
+};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::table_features::TableFeature;
@@ -42,7 +51,10 @@ use delta_kernel::{EvaluationHandler, ExpressionRef};
 use deltalake_kernel_executor::query::scan::expr_adapter::DeltaPhysicalExprAdapterFactory;
 use futures::TryStreamExt as _;
 use futures::stream::{Stream, StreamExt};
+use indexmap::IndexMap;
+use object_store::path::Path as ObjectStorePath;
 
+use super::OverlapPolicy;
 use super::plan::KernelScanPlan;
 use super::runtime_filter::RuntimeScanFilePruner;
 use crate::delta_datafusion::file_id::file_id_field;
@@ -133,6 +145,26 @@ pub struct DeltaScanExec {
     partition_stats: HashMap<String, ColumnStatistics>,
     /// Selects the files to read when the scan starts, see [`super::RuntimeFileFilter`].
     file_pruner: Option<Arc<RuntimeScanFilePruner>>,
+    /// Resolved per-file sort order over the parquet read schema, when the table
+    /// declares one (`DeltaScanConfig::file_sort_order`).
+    file_sort_order: Option<LexOrdering>,
+    /// Result of a successful sort pushdown, or `None` without one. Valid only
+    /// for the file grouping it was computed against.
+    pushed: Option<Arc<PushedSort>>,
+    /// Whether the table asserts that its files never overlap on the file sort
+    /// order (`DeltaScanConfig::assume_no_overlap_on_sort`) or leaves that to
+    /// be proven from their statistics.
+    overlap: OverlapPolicy,
+    /// Ordering over the logical output schema that this exec's execution
+    /// partitions follow *by assumption*, set when the input's file groups were
+    /// arranged under [`OverlapPolicy::Assume`] instead of being proven
+    /// non-overlapping.
+    ///
+    /// DataFusion validates a file scan's declared ordering against per-group
+    /// min/max statistics and drops it for any group of several files that
+    /// cannot be proven sorted - which is exactly the case the assumption
+    /// exists to cover - so this exec re-declares it.
+    assumed_ordering: Option<LexOrdering>,
 }
 
 impl DisplayAs for DeltaScanExec {
@@ -155,12 +187,229 @@ impl DisplayAs for DeltaScanExec {
     }
 }
 
+/// Map a physical parquet column name used by the inner scan back to the
+/// logical column name exposed by [`DeltaScanExec`].
+fn input_to_logical_column_name(scan_plan: &KernelScanPlan, physical_name: &str) -> Option<String> {
+    let table_config = scan_plan.table_configuration();
+    if table_config.is_feature_enabled(&TableFeature::ColumnMapping) {
+        let mode = table_config.column_mapping_mode();
+        scan_plan.scan.logical_schema().fields().find_map(|field| {
+            let physical = field.make_physical(mode).ok()?;
+            (physical.name() == physical_name).then(|| field.name().to_string())
+        })
+    } else {
+        Some(physical_name.to_string())
+    }
+}
+
+/// Derive the orderings this exec's output satisfies from the orderings of its
+/// input. The per-file kernel transforms (partition value injection, column
+/// mapping, deletion vector filtering) preserve row order, so any input
+/// ordering whose columns survive into the output schema carries over,
+/// possibly truncated to a prefix.
+fn derive_output_orderings(
+    scan_plan: &KernelScanPlan,
+    input: &Arc<dyn ExecutionPlan>,
+) -> Vec<LexOrdering> {
+    input
+        .properties()
+        .equivalence_properties()
+        .oeq_class()
+        .iter()
+        .filter_map(|ordering| map_ordering_to_output(scan_plan, ordering))
+        .collect()
+}
+
+/// Rewrite an ordering over the input's physical columns as one over this
+/// exec's logical output schema, truncating at the first sort column that does
+/// not survive into the output. Returns `None` when nothing survives.
+fn map_ordering_to_output(
+    scan_plan: &KernelScanPlan,
+    ordering: &LexOrdering,
+) -> Option<LexOrdering> {
+    let output_schema = &scan_plan.contract.output_schema;
+    let mut mapped = Vec::new();
+    for sort_expr in ordering.iter() {
+        let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
+            break;
+        };
+        let Some(logical_name) = input_to_logical_column_name(scan_plan, column.name()) else {
+            break;
+        };
+        let Ok(index) = output_schema.index_of(&logical_name) else {
+            break;
+        };
+        mapped.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(&logical_name, index)),
+            sort_expr.options,
+        ));
+    }
+    LexOrdering::new(mapped)
+}
+
+/// Whether `stat` describes a column holding exactly one non-null value:
+/// a singleton in DataFusion's sense, with no nulls beside it.
+fn is_single_valued(stat: &ColumnStatistics) -> bool {
+    stat.null_count == Precision::Exact(0) && stat.is_singleton()
+}
+
+/// Descend through wrappers that hand their input's partitions on untouched -
+/// same rows, same partition, same order - to whatever they wrap.
+fn pass_through_leaf(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
+    let mut plan = plan;
+    while let Some(cooperative) = plan.downcast_ref::<CooperativeExec>() {
+        plan = cooperative.input();
+    }
+    plan
+}
+
+/// A file's path and the byte range of it that a scan reads.
+type FileExtent<'a> = (&'a ObjectStorePath, (u64, u64));
+
+/// The ordered file extents of each of a parquet scan's file groups, or `None`
+/// when the plan is not a single parquet scan (possibly behind pass-through
+/// wrappers) whose grouping can be read.
+fn file_group_extents(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<FileExtent<'_>>>> {
+    let file_scan = pass_through_leaf(plan)
+        .downcast_ref::<DataSourceExec>()?
+        .data_source()
+        .as_ref()
+        .downcast_ref::<FileScanConfig>()?;
+    Some(
+        file_scan
+            .file_groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|file| (&file.object_meta.location, file.range()))
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// Whether `new` reads exactly the file groups `old` did, in the same order.
+///
+/// Required for a [`PushedSort`] to remain compatible when the input changes:
+/// it publishes statistics per execution partition, so the partitions have to
+/// be the very ones it was computed against.
+fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
+    match (file_group_extents(old), file_group_extents(new)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
+}
+
+/// What a plan reads, flattened across its groups in partition order, with
+/// pieces of one file that sit back to back merged into the range they cover
+/// together.
+///
+/// This is the row sequence the plan hands on when its partitions are read in
+/// index order, with the partition boundaries deliberately dropped: two plans
+/// agreeing here read the same rows in the same order and differ only in
+/// where they cut.
+fn coalesced_extents(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<FileExtent<'_>>> {
+    let mut merged: Vec<FileExtent<'_>> = Vec::new();
+    for (path, (start, end)) in file_group_extents(plan)?.into_iter().flatten() {
+        match merged.last_mut() {
+            Some((last_path, (_, last_end))) if *last_path == path && *last_end == start => {
+                *last_end = end;
+            }
+            _ => merged.push((path, (start, end))),
+        }
+    }
+    Some(merged)
+}
+
+/// Whether `new` reads the same rows as `old` in the same order, independent
+/// of how partitions are cut.
+fn grouping_retains_row_order(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
+    match (coalesced_extents(old), coalesced_extents(new)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
+}
+
+/// See through a round-robin repartition to the plan that actually reads files.
+fn file_reading_input(input: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    match input.downcast_ref::<RepartitionExec>() {
+        Some(repartition) => matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
+            .then(|| repartition.input()),
+        None => Some(input),
+    }
+}
+
+/// Put byte-range pieces of the same file back together, keeping first-appearance
+/// order. Returns `None` if any files are only partially read.
+///
+/// This is required to restore correct min/max stats and be able to prove files
+/// are non-overlapping, because chunks from a split file inherit the min/max stats
+/// of the full file.
+///
+/// Each file is represented by its first piece, borrowed as it came: nothing
+/// is copied for a pushdown that is then refused, and the piece's range is
+/// cleared when the file is materialized (see `plan_sort_pushdown`).
+fn coalesce_file_ranges<'a>(pieces: &[&'a PartitionedFile]) -> Option<Vec<&'a PartitionedFile>> {
+    let mut by_path: IndexMap<&ObjectStorePath, Vec<&'a PartitionedFile>> = IndexMap::new();
+    for &piece in pieces {
+        by_path
+            .entry(&piece.object_meta.location)
+            .or_default()
+            .push(piece);
+    }
+
+    by_path
+        .into_values()
+        .map(|group| {
+            let mut ranges: Vec<(u64, u64)> = group.iter().map(|piece| piece.range()).collect();
+            ranges.sort_unstable();
+            let mut covered = 0;
+            for (start, end) in ranges {
+                if start != covered {
+                    return None;
+                }
+                covered = end;
+            }
+            (covered == group[0].object_meta.size).then_some(group[0])
+        })
+        .collect()
+}
+
+/// Result of a successful sort pushdown, which regroups files to achieve
+/// an ordered output.
+#[derive(Debug)]
+struct PushedSort {
+    /// `[partition prefix…, file sort order prefix…]`. The file groups are
+    /// mutually non-overlapping and range-ordered on it.
+    ordering: LexOrdering,
+    /// Statistics for the ordering's leading partition columns, keyed by logical
+    /// column name and indexed by execution partition.
+    per_partition_stats: Vec<HashMap<String, ColumnStatistics>>,
+}
+
+/// Build [`PlanProperties`], advertising a pushed-down output ordering and an
+/// ordering assumed from the table's no-overlap assertion (if any) ahead of
+/// the orderings derived from the input.
 fn plan_properties(
     scan_plan: &KernelScanPlan,
     input: &Arc<dyn ExecutionPlan>,
+    pushed: Option<&PushedSort>,
+    assumed_ordering: Option<&LexOrdering>,
 ) -> Arc<PlanProperties> {
+    let mut orderings = Vec::new();
+    if let Some(pushed) = pushed {
+        orderings.push(pushed.ordering.clone());
+    }
+    if let Some(assumed) = assumed_ordering {
+        orderings.push(assumed.clone());
+    }
+    orderings.extend(derive_output_orderings(scan_plan, input));
     Arc::new(PlanProperties::new(
-        EquivalenceProperties::new(Arc::clone(&scan_plan.contract.output_schema)),
+        EquivalenceProperties::new_with_orderings(
+            Arc::clone(&scan_plan.contract.output_schema),
+            orderings,
+        ),
         input.properties().partitioning.clone(),
         input.properties().emission_type,
         input.properties().boundedness,
@@ -182,7 +431,7 @@ impl DeltaScanExec {
             .contract
             .retain_file_id
             .then(|| scan_plan.contract.file_id_field.name().to_owned());
-        let properties = plan_properties(&scan_plan, &input);
+        let properties = plan_properties(&scan_plan, &input, None, None);
         Self {
             scan_plan,
             input,
@@ -195,6 +444,66 @@ impl DeltaScanExec {
             file_id_column,
             properties,
             file_pruner: None,
+            file_sort_order: None,
+            pushed: None,
+            overlap: OverlapPolicy::Prove,
+            assumed_ordering: None,
+        }
+    }
+
+    /// Declare the resolved per-file sort order (over the parquet read schema).
+    ///
+    /// This is the table's full declaration, kept for
+    /// [`Self::try_pushdown_sort`], which discards the current file grouping and
+    /// builds its own. It is deliberately not narrowed the way
+    /// [`Self::with_no_overlap_assumption`] narrows its argument.
+    pub(super) fn with_file_sort_order(mut self, file_sort_order: Option<LexOrdering>) -> Self {
+        self.file_sort_order = file_sort_order;
+        self
+    }
+
+    /// Record the table's no-overlap assertion and the arrangement it produced.
+    ///
+    /// `overlap` is the table's declaration, which holds whatever became of the
+    /// current file grouping: [`Self::try_pushdown_sort`] regroups from scratch
+    /// and may use the assertion even when this grouping could not.
+    ///
+    /// `arrangement` is the ordering (over the parquet read schema) the input's
+    /// file groups were *actually* arranged under - absent when the assertion
+    /// could not be applied, and narrowed to the null-free prefix the groups
+    /// really uphold. Declaring it is what recovers the ordering DataFusion
+    /// drops.
+    pub(super) fn with_no_overlap_assumption(
+        mut self,
+        overlap: OverlapPolicy,
+        arrangement: Option<LexOrdering>,
+    ) -> Self {
+        self.overlap = overlap;
+        self.assumed_ordering = arrangement
+            .as_ref()
+            .and_then(|ordering| map_ordering_to_output(&self.scan_plan, ordering));
+        self.properties = plan_properties(
+            &self.scan_plan,
+            &self.input,
+            self.pushed.as_deref(),
+            self.assumed_ordering.as_ref(),
+        );
+        self
+    }
+
+    /// The ordering on which this exec's execution partitions are known to be
+    /// mutually disjoint and arranged in range order other than through the
+    /// statistics they publish, or `None` when no such claim is made.
+    ///
+    /// After a sort pushdown the regrouped file groups are disjoint and ordered
+    /// on the pushed ordering by construction, under either overlap policy:
+    /// group boundaries fall on partition-prefix key changes or on cuts within
+    /// one already-ordered bucket. Without one, the claim is the table's
+    /// assertion, when the file groups could be arranged on it.
+    pub(crate) fn disjoint_ordering(&self) -> Option<&LexOrdering> {
+        match &self.pushed {
+            Some(pushed) => Some(&pushed.ordering),
+            None => self.assumed_ordering.as_ref(),
         }
     }
 
@@ -214,11 +523,120 @@ impl DeltaScanExec {
     }
 
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Self {
+        // The assumed arrangement rides on the order the rows come out in, not
+        // on where the partition boundaries fall, so it survives a replacement
+        // that re-cuts the same ordered stream.
+        //
+        // Withdrawing rather than failing, as the pushed sort does, because
+        // this claim is advertised to rules that have not committed to it yet:
+        // it is set at plan construction and DataFusion's optimizer rebuilds
+        // the parquet scan underneath well before any sort is removed on its
+        // strength. Failing there would refuse plans that are merely losing an
+        // optimization.
+        //
+        // A pushed sort that got this far has already shown the grouping to
+        // be unchanged (see `check_pushed_sort_grouping`), which retains the
+        // row order too.
+        let same_input = Arc::ptr_eq(&self.input, &input);
+        let assumed_ordering = self.assumed_ordering.clone().filter(|_| {
+            same_input || self.pushed.is_some() || grouping_retains_row_order(&self.input, &input)
+        });
         Self {
-            properties: plan_properties(&self.scan_plan, &input),
+            properties: plan_properties(
+                &self.scan_plan,
+                &input,
+                self.pushed.as_deref(),
+                assumed_ordering.as_ref(),
+            ),
             input,
+            assumed_ordering,
             ..Self::clone(self)
         }
+    }
+
+    /// Rebuild this exec around `input`, claiming `pushed` as the sort its
+    /// file grouping serves and dropping any assumed arrangement, which
+    /// described the previous input's file groups.
+    fn with_input_and_pushed_sort(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        pushed: Option<Arc<PushedSort>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(Self {
+            properties: plan_properties(&self.scan_plan, &input, pushed.as_deref(), None),
+            input,
+            pushed,
+            assumed_ordering: None,
+            ..Self::clone(self)
+        })
+    }
+
+    /// Check that a replacement input still reads the file grouping a pushed
+    /// sort was computed against.
+    fn check_pushed_sort_grouping(&self, input: &Arc<dyn ExecutionPlan>) -> Result<()> {
+        if let Some(pushed) = &self.pushed
+            && !Arc::ptr_eq(&self.input, input)
+            && !grouping_is_unchanged(&self.input, input)
+        {
+            // The file grouping used for sort-pushdown is no longer valid, so the removal
+            // of the `SortExec` may be unsafe and lead to out-of-order results.
+            return internal_err!(
+                "DeltaScanExec: the input was replaced by a plan whose file grouping \
+                 does not match the regrouping made for the pushed-down sort `{}`; the \
+                 sort above it has already been removed, so the ordering can no longer \
+                 be guaranteed. Physical optimizer rules that run after `PushdownSort` \
+                 must leave the parquet scan's file groups unchanged",
+                pushed.ordering
+            );
+        }
+        Ok(())
+    }
+
+    /// Offer an ordering this exec cannot serve itself to the scan underneath.
+    ///
+    /// The per-file work done here - partition values and column transforms -
+    /// keeps rows in the order they arrive, so this node is transparent to
+    /// ordering and the trait asks it to delegate and re-wrap. That reaches
+    /// DataFusion's own file regrouping and its `Inexact` row-group
+    /// reordering, which a reversed request can use to read the interesting
+    /// end of each file first.
+    ///
+    /// This is not free. `PushdownSort` offers every `SortExec` to its input,
+    /// and the parquet scan answers `Inexact` for any ordering that leads with
+    /// a file column, rebuilding its `FileScanConfig` - a copy of every
+    /// `PartitionedFile` - and ranking the files by statistics to do so. The
+    /// reordering only pays off under a `LIMIT`, where the TopK sort above can
+    /// finish early; a full sort gains nothing from it. The fetch is not
+    /// visible here (the rule applies it to the answer), so the cost cannot be
+    /// gated on it and is accepted as plan time proportional to the file count.
+    fn delegate_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // A column this exec materialises is not the child's to order by, even
+        // when the child has one of the same name: the child's file id column
+        // holds compact ids rather than the paths this exec reports under it,
+        // and they do not sort alike.
+        if order
+            .iter()
+            .any(|sort_expr| self.references_delta_materialized_column(&sort_expr.expr))
+        {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        // Nor can a column that does not survive the crossing into the child's
+        // schema for any other reason be asked of it.
+        let Some(child_order) = super::sort_pushdown::rebind_ordering(
+            order,
+            &self.scan_plan.contract.output_schema,
+            &self.input.schema(),
+        ) else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        // Push down the sort to the child, rebuilding this exec's input with the re-ordered result
+        Ok(self
+            .input
+            .try_pushdown_sort(&child_order)?
+            .map(|inner| self.with_input_and_pushed_sort(inner, None)))
     }
 
     fn has_deletion_vectors(&self) -> bool {
@@ -350,7 +768,11 @@ impl DeltaScanExec {
     /// schema we expose via the table provider. We do not attempt to provide meaningful
     /// statistics for metadata columns as we do not expect these to be useful in planning.
     /// - predicates on metadata columns (like file id) are not really useful (random etc.)
-    fn map_statistics(&self, mut stats: Statistics) -> Result<Statistics> {
+    fn map_statistics(
+        &self,
+        mut stats: Statistics,
+        partition: Option<usize>,
+    ) -> Result<Statistics> {
         // Column statistics include stats for the added file id column, so we expect the
         // number of physical schema fields + 1 to match the number of column statistics.
         // We validate this to en sure we can safely remap the statistics below.
@@ -365,6 +787,29 @@ impl DeltaScanExec {
         let config = self.scan_plan.table_configuration();
         let mut new_stats = Vec::with_capacity(self.schema().fields().len());
 
+        // After a sort pushdown, prefer the exact per-execution-partition
+        // partition-column statistics computed while regrouping the files.
+        let per_partition = partition
+            .zip(self.pushed.as_ref())
+            .and_then(|(idx, pushed)| pushed.per_partition_stats.get(idx));
+        // The aggregated stats span every scanned file: valid bounds for a
+        // single execution partition, but exact only when there is just one -
+        // or when the column holds a single value, so that no partition can
+        // differ from the whole.
+        let aggregate_is_exact =
+            partition.is_none() || self.properties.partitioning.partition_count() == 1;
+        let partition_stat = |name: &str| -> Option<ColumnStatistics> {
+            if let Some(stat) = per_partition.and_then(|map| map.get(name)) {
+                return Some(stat.clone());
+            }
+            let stat = self.partition_stats.get(name).cloned()?;
+            Some(if aggregate_is_exact || is_single_valued(&stat) {
+                stat
+            } else {
+                stat.to_inexact()
+            })
+        };
+
         if config.is_feature_enabled(&TableFeature::ColumnMapping) {
             let get_index = |name| {
                 if let Some(logical) = self.scan_plan.scan.logical_schema().field(name) {
@@ -378,8 +823,8 @@ impl DeltaScanExec {
             for field in self.schema().fields() {
                 if let Some(index) = get_index(field.name()) {
                     new_stats.push(stats.column_statistics[index].clone());
-                } else if let Some(part_stat) = self.partition_stats.get(field.name()) {
-                    new_stats.push(part_stat.clone());
+                } else if let Some(part_stat) = partition_stat(field.name()) {
+                    new_stats.push(part_stat);
                 } else {
                     new_stats.push(Default::default());
                 }
@@ -393,8 +838,8 @@ impl DeltaScanExec {
                     .field_with_index(field.name())
                 {
                     new_stats.push(stats.column_statistics[index].clone());
-                } else if let Some(part_stat) = self.partition_stats.get(field.name()) {
-                    new_stats.push(part_stat.clone());
+                } else if let Some(part_stat) = partition_stat(field.name()) {
+                    new_stats.push(part_stat);
                 } else {
                     new_stats.push(Default::default());
                 }
@@ -469,6 +914,21 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // When this scan declares an output ordering, partitioning the input further
+        // is not desirable as this loses exact statistics and ordering information,
+        // which can prevent certain optimizations such as using a sort-preserving
+        // merge or progressive evaluation to handle sorted reads.
+        // Unordered scans keep the default behaviour and benefit from the added
+        // parallelism of round-robin repartitioning.
+        let has_ordering = !self
+            .properties
+            .equivalence_properties()
+            .oeq_class()
+            .is_empty();
+        vec![!has_ordering]
+    }
+
     // TODO: setting this will fail certain tests, but why
     // fn maintains_input_order(&self) -> Vec<bool> {
     //     vec![true]
@@ -486,11 +946,19 @@ impl ExecutionPlan for DeltaScanExec {
         if self.has_deletion_vectors() {
             self.validate_dv_child_topology(&input)?;
         }
+        self.check_pushed_sort_grouping(&input)?;
+        // An assumed arrangement has to be re-checked against any new input,
+        // which keeping the properties would skip.
+        let keep_assumed = self.assumed_ordering.is_none()
+            || Arc::ptr_eq(&self.input, &input)
+            || grouping_retains_row_order(&self.input, &input);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => {
+            ChildrenPropertiesMode::Keep if keep_assumed => {
                 Ok(Arc::new(self.with_new_input_same_properties(input)))
             }
-            ChildrenPropertiesMode::Recompute => Ok(Arc::new(self.with_new_input(input))),
+            ChildrenPropertiesMode::Keep | ChildrenPropertiesMode::Recompute => {
+                Ok(Arc::new(self.with_new_input(input)))
+            }
         }
     }
 
@@ -514,6 +982,24 @@ impl ExecutionPlan for DeltaScanExec {
         {
             // A DeltaScanStream stores row ordinals for one execution partition.
             // DataFusion can split a file across streams after repartitioning.
+            return Ok(None);
+        }
+
+        if self.pushed.is_some() {
+            // The file groups were formed to be non-overlapping and range-ordered
+            // for a pushed-down sort; re-splitting them would break that.
+            return Ok(None);
+        }
+
+        if self.assumed_ordering.is_some() {
+            // Repartitioning would interleave files and invalidate an
+            // assumed order.
+            //
+            // Refusing here does not on its own keep the files whole:
+            // DataFusion's optimizer still calls `repartitioned` on the
+            // parquet scan directly, which this cannot intercept.
+            // If that partitions files, `with_new_input` verifies whether
+            // the assumed ordering is still valid.
             return Ok(None);
         }
 
@@ -612,6 +1098,9 @@ impl ExecutionPlan for DeltaScanExec {
             return None;
         }
         let new_input = self.input.with_fetch(limit)?;
+        // A child that took the fetch keeps its file groups; should one ever
+        // not, refusing the fetch here leaves the limit above the scan.
+        self.check_pushed_sort_grouping(&new_input).ok()?;
         Some(Arc::new(self.with_new_input_same_properties(new_input)))
     }
 
@@ -624,12 +1113,171 @@ impl ExecutionPlan for DeltaScanExec {
     fn statistics_from_inputs(
         &self,
         input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
+        args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>> {
         let stats = input_stats.first().ok_or_else(|| {
             internal_datafusion_err!("DeltaScanExec expects statistics for exactly one child")
         })?;
-        self.map_statistics(Statistics::clone(stats)).map(Arc::new)
+        self.map_statistics(Statistics::clone(stats), args.partition())
+            .map(Arc::new)
+    }
+
+    /// Satisfy `ORDER BY <partition columns…>, <declared file sort order…>` by
+    /// regrouping the underlying parquet files: bucket them by partition-column
+    /// value, order each bucket on the file sort order, and concatenate the
+    /// buckets in partition-column order. The resulting groups are mutually
+    /// non-overlapping and range-ordered on the requested ordering, so the
+    /// `SortExec` can be removed. See [`super::sort_pushdown`].
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // Neither regrouping nor delegation can serve these tables.
+        // Scans with deletion vectors or retained row indexes must read through
+        // a single stream, so there is no regrouping to do, and a reordering
+        // of the scan below is not worth the risk for them. Column mapping
+        // renames columns between this exec's schema and the child's; neither
+        // the file-sort-order columns nor the ordering handed down are
+        // translated yet.
+        if self.has_deletion_vectors()
+            || self.scan_plan.contract.retained_row_index_field().is_some()
+            || self
+                .scan_plan
+                .table_configuration()
+                .is_feature_enabled(&TableFeature::ColumnMapping)
+        {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+
+        // Whatever this exec cannot serve by regrouping, the parquet scan below
+        // may still be able to optimise for.
+        let unsupported = || self.delegate_pushdown_sort(order);
+
+        let Some(ordering) = LexOrdering::new(order.to_vec()) else {
+            return unsupported();
+        };
+
+        // Check whether the requested ordering starts with partition columns
+        // and can be handled by a regrouping.
+        let Some(shape) = super::sort_pushdown::analyze_order(
+            &ordering,
+            &self.scan_plan.contract.output_schema,
+            &self.scan_plan.parquet_read_schema,
+            self.scan_plan
+                .table_configuration()
+                .metadata()
+                .partition_columns(),
+            self.file_sort_order.as_ref(),
+        ) else {
+            return unsupported();
+        };
+
+        // Only a single-store parquet scan is handled; multi-store unions and
+        // any other wrapper are left alone.
+        let Some(source) = file_reading_input(&self.input)
+            .and_then(|input| input.downcast_ref::<DataSourceExec>())
+        else {
+            return unsupported();
+        };
+        let Some(file_scan) = source
+            .data_source()
+            .as_ref()
+            .downcast_ref::<FileScanConfig>()
+        else {
+            return unsupported();
+        };
+        // A declared output partitioning describes the current file groups,
+        // which the regrouping would invalidate.
+        if file_scan.output_partitioning.is_some() {
+            return unsupported();
+        }
+
+        let pieces: Vec<&PartitionedFile> = file_scan
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .collect();
+        // A byte-range piece stands in for its whole file until the files are
+        // materialized: nothing in between reads the range.
+        let files: Vec<&PartitionedFile> = if pieces.iter().any(|piece| piece.range.is_some()) {
+            match coalesce_file_ranges(&pieces) {
+                Some(files) => files,
+                None => return unsupported(),
+            }
+        } else {
+            pieces
+        };
+        let parquet_table_schema = file_scan
+            .file_source()
+            .table_schema()
+            .table_schema()
+            .clone();
+        let target_groups = self.input.properties().partitioning.partition_count();
+
+        // Try to form new groups ordered by the partition columns.
+        // Try to avoid expensive metadata copying before this point.
+        let Some(plan) = super::sort_pushdown::plan_sort_pushdown(
+            &shape,
+            &self.scan_plan.parquet_read_schema,
+            &files,
+            target_groups,
+            self.overlap,
+        )?
+        else {
+            return unsupported();
+        };
+
+        let table_width = parquet_table_schema.fields().len();
+        let (file_groups, mut statistics) =
+            compute_all_files_statistics(plan.file_groups, parquet_table_schema, true, false)?;
+        // Per-file column stats are omitted when there's no predicate (#4522); the merged
+        // stat then has an empty column vector. Rebuild it as all-unknown full width so the
+        // file source sees the expected column count, as the original scan did.
+        if statistics.column_statistics.is_empty() && table_width > 0 {
+            statistics.column_statistics = vec![ColumnStatistics::new_unknown(); table_width];
+        }
+        // Rebuild the FileScanConfig field by field rather than through
+        // `FileScanConfigBuilder::from(file_scan.clone())`: cloning the config
+        // deep-copies every `PartitionedFile` only for `with_file_groups` to
+        // drop them again. This code needs to be updated if a new field is added.
+        let new_file_scan = FileScanConfigBuilder::new(
+            file_scan.object_store_url.clone(),
+            Arc::clone(file_scan.file_source()),
+        )
+        .with_limit(file_scan.limit)
+        .with_constraints(file_scan.constraints.clone())
+        .with_file_compression_type(file_scan.file_compression_type)
+        .with_batch_size(file_scan.batch_size)
+        .with_expr_adapter(file_scan.expr_adapter_factory.clone())
+        .with_file_groups(file_groups)
+        .with_statistics(statistics)
+        // The original input may have carried a sort order, but the files
+        // are now grouped so that they are ordered based on the partition columns.
+        // The partition columns are not part of the input schema, so we don't
+        // declare an ordering here.
+        // Because no order is declared, the scan is not considered order-sensitive
+        // by default, so we have to explicitly request the order to be preserved.
+        //
+        // Note: This comes with a trade-off as under some scenarios it's possible that
+        // a sort is still required even after the sort pushdown, so some performance
+        // might be lost by disabling work stealing and file range balancing.
+        // That happens with `repartition_sorts` off: `CoalescePartitionsExec` delegates
+        // the pushdown here, downgrades the `Exact` answer to `Inexact` because
+        // its input had several partitions, and `PushdownSort` keeps the
+        // `SortExec` over the regrouped scan.
+        .with_preserve_order(true)
+        .build();
+        let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;
+
+        let pushed = Arc::new(PushedSort {
+            ordering,
+            per_partition_stats: plan.per_partition_stats,
+        });
+        Ok(SortOrderPushdownResult::Exact {
+            // The regrouped input supersedes any no-overlap arrangement of the
+            // original file groups; the pushed ordering describes it instead.
+            inner: self.with_input_and_pushed_sort(new_input, Some(pushed)),
+        })
     }
 
     fn gather_filters_for_pushdown(
@@ -1118,6 +1766,41 @@ mod tests {
         ];
         assert_batches_sorted_eq!(&expected, &batches);
 
+        Ok(())
+    }
+
+    /// The file column is materialised by this exec from the child's compact
+    /// file ids, which share its name but not its values or their order, so an
+    /// ordering on it must not be handed to the child.
+    #[tokio::test]
+    async fn test_sort_on_file_id_is_not_pushed_to_child() -> TestResult {
+        let table = open_fs_path("../test/tests/data/multi_partitioned");
+        let provider = table.table_provider().with_file_column("file_id").await?;
+        let session = Arc::new(create_session().into_inner());
+        let scan = provider.scan(&session.state(), None, &[], None).await?;
+        let exec = scan.downcast_ref::<DeltaScanExec>().unwrap();
+
+        let schema = scan.schema();
+        let sort_on = |name: &str| {
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                name,
+                schema.index_of(name).unwrap(),
+            )))
+        };
+        for order in [
+            vec![sort_on("file_id")],
+            vec![sort_on("number"), sort_on("file_id")],
+        ] {
+            assert!(matches!(
+                exec.try_pushdown_sort(&order)?,
+                SortOrderPushdownResult::Unsupported
+            ));
+        }
+        // A data column alone is still offered to the child.
+        assert!(!matches!(
+            exec.try_pushdown_sort(&[sort_on("number")])?,
+            SortOrderPushdownResult::Unsupported
+        ));
         Ok(())
     }
 
@@ -2050,7 +2733,7 @@ mod tests {
         first_column.byte_size = Precision::Exact(128);
         first_column.sum_value = Precision::Exact(ScalarValue::Int64(Some(42)));
 
-        let logical = exec.map_statistics(physical)?;
+        let logical = exec.map_statistics(physical, None)?;
         assert_eq!(logical.num_rows, Precision::Inexact(5));
         assert_eq!(logical.total_byte_size, Precision::Inexact(1_006));
         assert_eq!(
@@ -3617,5 +4300,117 @@ mod tests {
         let batches = datafusion::physical_plan::collect(scan, session.task_ctx()).await?;
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
         Ok(())
+    }
+
+    /// Create a PartitionedFile with a specified range
+    fn piece(path: &str, size: u64, range: Option<(i64, i64)>) -> PartitionedFile {
+        let mut file = PartitionedFile::new(path.to_string(), size);
+        file.range = range.map(|(start, end)| datafusion_datasource::FileRange { start, end });
+        file
+    }
+
+    /// Wrapper around [`coalesce_file_ranges`] for testing: the path and byte
+    /// range of each representative piece.
+    fn coalesced_paths(pieces: &[PartitionedFile]) -> Option<Vec<(String, (u64, u64))>> {
+        let refs: Vec<&PartitionedFile> = pieces.iter().collect();
+
+        coalesce_file_ranges(&refs).map(|coalesced| {
+            coalesced
+                .into_iter()
+                .map(|file| (file.object_meta.location.to_string(), file.range()))
+                .collect()
+        })
+    }
+
+    /// Pieces that tile their file are represented by the first of them,
+    /// keeping the order the first piece of each file appeared in.
+    #[test]
+    fn test_coalesce_file_ranges_reassembles_tiling_pieces() {
+        let pieces = vec![
+            piece("a", 100, Some((0, 40))),
+            piece("b", 60, Some((0, 60))),
+            piece("a", 100, Some((40, 100))),
+        ];
+        assert_eq!(
+            coalesced_paths(&pieces),
+            Some(vec![("a".to_string(), (0, 40)), ("b".to_string(), (0, 60))])
+        );
+    }
+
+    /// Coalescing file ranges should fail if any file is not fully covered
+    #[test]
+    fn test_coalesce_file_ranges_refuses_a_partial_file() {
+        assert_eq!(coalesced_paths(&[piece("a", 100, Some((0, 40)))]), None);
+        assert_eq!(
+            coalesced_paths(&[
+                piece("a", 100, Some((0, 40))),
+                piece("a", 100, Some((60, 100))),
+            ]),
+            None
+        );
+        // A whole-file entry alongside pieces of the same file should also be rejected,
+        // otherwise this would be read twice over.
+        assert_eq!(
+            coalesced_paths(&[piece("a", 100, None), piece("a", 100, Some((0, 100)))]),
+            None
+        );
+    }
+
+    /// `(path, size, byte range)` of one file in a test scan.
+    type FileSpec<'a> = (&'a str, u64, Option<(i64, i64)>);
+
+    /// A parquet scan over `groups`.
+    fn parquet_scan(groups: &[&[FileSpec<'_>]]) -> Arc<dyn ExecutionPlan> {
+        use datafusion::datasource::physical_plan::ParquetSource;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion_datasource::TableSchema;
+        use datafusion_datasource::file_groups::FileGroup;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let source = Arc::new(ParquetSource::new(TableSchema::from(schema)));
+        let file_groups = groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|(path, size, range)| piece(path, *size, *range))
+                    .collect::<FileGroup>()
+            })
+            .collect();
+        let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file_groups(file_groups)
+            .build();
+        DataSourceExec::from_data_source(config)
+    }
+
+    /// A pushed sort describes an arrangement of whole files: the same paths
+    /// split into byte ranges, or regrouped, are a different arrangement.
+    #[test]
+    fn test_grouping_is_unchanged_compares_paths_and_ranges() {
+        let whole = parquet_scan(&[&[("a", 100, None)], &[("b", 100, None)]]);
+        let same = parquet_scan(&[&[("a", 100, None)], &[("b", 100, None)]]);
+        let split = parquet_scan(&[
+            &[("a", 100, Some((0, 50))), ("a", 100, Some((50, 100)))],
+            &[("b", 100, None)],
+        ]);
+        let regrouped = parquet_scan(&[&[("a", 100, None), ("b", 100, None)]]);
+
+        assert!(grouping_is_unchanged(&whole, &same));
+        assert!(!grouping_is_unchanged(&whole, &split));
+        assert!(!grouping_is_unchanged(&whole, &regrouped));
+    }
+
+    /// Wrappers that pass partitions through untouched do not hide the
+    /// grouping. Any unknown wrappers are assumed to possibly change the grouping.
+    #[test]
+    fn test_grouping_is_unchanged_looks_through_pass_through_wrappers() {
+        let scan = parquet_scan(&[&[("a", 100, None)], &[("b", 100, None)]]);
+        let wrapped: Arc<dyn ExecutionPlan> = Arc::new(CooperativeExec::new(Arc::clone(&scan)));
+        let repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(Arc::clone(&scan), Partitioning::RoundRobinBatch(2)).unwrap(),
+        );
+
+        assert!(grouping_is_unchanged(&scan, &wrapped));
+        assert!(!grouping_is_unchanged(&scan, &repartitioned));
     }
 }
